@@ -43,13 +43,13 @@ def build_softmax_module(M: int, N: int, dtype_str: str = "f32"):
     arch = get_hip_arch()
     USE_HW_CVT_PK_BF16_F32 = (arch == "gfx950") or str(arch).startswith("gfx95")
 
-    tile_cols = BLOCK_THREADS * VEC_WIDTH
-    RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE)
+    tile_cols = BLOCK_THREADS * VEC_WIDTH # block_size * witdh.
+    RED_SLOTS = max(1, (BLOCK_THREADS + WARP_SIZE - 1) // WARP_SIZE) # DIV_UP(256, 64)
     elem_bits = 32 if dtype_str == "f32" else 16
 
     allocator = SmemAllocator(None, arch=arch)
     f32_bytes = 4
-    red_offset = allocator._align(allocator.ptr, 16)
+    red_offset = allocator._align(allocator.ptr, 16) # 向上对齐
     allocator.ptr = red_offset + RED_SLOTS * f32_bytes
 
     @flyc.kernel

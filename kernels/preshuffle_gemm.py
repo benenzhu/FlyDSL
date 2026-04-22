@@ -187,7 +187,7 @@ def compile_preshuffle_gemm_a8(
     elem_bytes = 1 if (in_dtype in ("fp8", "int8", "int4", "fp4")) else 2
     a_elem_vec_pack = 2 if is_fp4 else 1
     b_elem_vec_pack = 2 if is_fp4 else 1
-
+    print(f"{dsrd_preload=} {dvmem_preload=}")
     tile_k_bytes = int(tile_k) * int(elem_bytes)
 
     if (tile_k_bytes % 64) != 0:
@@ -327,7 +327,7 @@ def compile_preshuffle_gemm_a8(
         )
 
         # ---- Layouts ----
-        _k_div4_factor = (K * elem_bytes) // 4 // a_elem_vec_pack
+        _k_div4_factor = (K * elem_bytes) // 4 // a_elem_vec_pack  # in fp32 types.
 
         kpack_bytes = 8 if is_int4 else 16
         kpack_elems = kpack_bytes if elem_bytes == 1 else kpack_bytes // elem_bytes
@@ -421,14 +421,13 @@ def compile_preshuffle_gemm_a8(
             col_offset_base if elem_bytes == 1 else col_offset_base * elem_bytes
         )
 
-        m_repeat = tile_m // 16
-        k_unroll = tile_k_bytes // a_elem_vec_pack // 64
+        m_repeat = tile_m // 16 # 128 // 16 = 8 TODO: why 16? mfma长度? 然后对着m 做 for
+        k_unroll = tile_k_bytes // a_elem_vec_pack // 64 # 128*2 // 1 // 64 = 4
 
         num_waves = 4
-        n_per_wave = tile_n // num_waves
+        n_per_wave = tile_n // num_waves # 256 // 4 = 64, ok 所以分出来是 [128, 64] 的小块了直接
         num_acc_n = n_per_wave // 16
 
-        n_tile_base = wave_id * n_per_wave
 
         n_intra_list = []
         n_blk_list = []

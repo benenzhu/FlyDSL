@@ -20,7 +20,7 @@ def vectorAddKernel(
 
     A = fx.rocdl.make_buffer_tensor(A)
 
-    tA = fx.logical_divide(A, fx.make_layout(block_dim, 1))
+    tA = fx.logical_divide(A, fx.make_layout(block_dim, 1)) # N (block_dim, 1) -> (block_dim, N/block_dim)
     tB = fx.logical_divide(B, fx.make_layout(block_dim, 1))
     tC = fx.logical_divide(C, fx.make_layout(block_dim, 1))
 
