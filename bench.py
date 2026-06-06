@@ -218,8 +218,8 @@ def bench_cudagraph(fn, warmup=5, iters=60, measure=5):
         torch.profiler.ProfilerActivity.CUDA,
     ]
     from contextlib import nullcontext
-    # with nullcontext() as prof:
-    with torch.profiler.profile(activities=activities, record_shapes=False) as prof:
+    with nullcontext() as prof:
+    # with torch.profiler.profile(activities=activities, record_shapes=False) as prof:
         g.replay()
         g.replay()
         for _ in range(measure):
@@ -234,7 +234,8 @@ def bench_cudagraph(fn, warmup=5, iters=60, measure=5):
     tag += 1
     out = f"{tag}.json.gz"
     print(f"dump to: {out}")
-    prof.export_chrome_trace(out)
+    if prof is not None:
+        prof.export_chrome_trace(out)
     
     return totals[len(totals) // 2] / iters  # median per-call us
 
