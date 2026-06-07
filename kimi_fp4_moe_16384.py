@@ -21,9 +21,15 @@ from flydsl.expr.typing import T
 from flydsl.expr import arith, buffer_ops, const_expr, gpu, rocdl, vector
 from flydsl._mlir.dialects import llvm, memref, scf
 from flydsl._mlir.dialects.arith import CmpIPredicate
-from .layout_utils import crd2idx, idx2crd, get as layout_get
-from .mfma_epilogues import c_shuffle_epilog
-from .mfma_preshuffle_pipeline import _buffer_load_vec, make_preshuffle_b_layout, make_preshuffle_scale_layout, swizzle_xor16, tile_chunk_coord_i32
+from aiter.ops.flydsl.kernels.layout_utils import crd2idx, idx2crd, get as layout_get
+from aiter.ops.flydsl.kernels.mfma_epilogues import c_shuffle_epilog
+from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import (
+    _buffer_load_vec,
+    make_preshuffle_b_layout,
+    make_preshuffle_scale_layout,
+    swizzle_xor16,
+    tile_chunk_coord_i32,
+)
 from dataclasses import dataclass
 from typing import Optional
 import torch
@@ -1138,7 +1144,7 @@ def compile_kimi_fp4_stage2_16384():
         m_in = tokens_in * topk_idx
         c_n_total = arith.constant(experts * model_dim, index=True)
         kpack_bytes = 16
-        from .layout_utils import _div_pow2, _mod_pow2
+        from aiter.ops.flydsl.kernels.layout_utils import _div_pow2, _mod_pow2
 
         def check_c_n_valid_gate(base_n):
             return arith.cmpi(CmpIPredicate.ult, base_n, model_dim - model_dim_pad)

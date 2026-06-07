@@ -6,12 +6,17 @@ from pathlib import Path
 import torch
 
 
+THIS_DIR = Path(__file__).resolve().parent
 UP_AITER = Path("/root/up-aiter")
 sys.path.insert(0, str(UP_AITER))
+sys.path.insert(0, str(THIS_DIR))
 
 import aiter  # noqa: E402
-from aiter import QuantType, dtypes  # noqa: E402
-from aiter.ops.flydsl.kernels.kimi_fp4_moe_16384 import (  # noqa: E402
+from aiter import ActivationType, QuantType, dtypes  # noqa: E402
+from aiter.fused_moe import fused_moe  # noqa: E402
+from aiter.ops.shuffle import shuffle_scale, shuffle_weight  # noqa: E402
+from aiter.utility.fp4_utils import e8m0_shuffle  # noqa: E402
+from kimi_fp4_moe_16384 import (  # noqa: E402
     EXPERTS,
     INTER_DIM,
     MODEL_DIM,
@@ -21,8 +26,6 @@ from aiter.ops.flydsl.kernels.kimi_fp4_moe_16384 import (  # noqa: E402
     TOPK,
     run_kimi_fp4_flydsl_moe_16384,
 )
-from aiter.ops.shuffle import shuffle_weight  # noqa: E402
-from aiter.utility.fp4_utils import e8m0_shuffle  # noqa: E402
 
 
 M = TOKEN
@@ -39,34 +42,68 @@ class KimiShape:
 SHAPE = KimiShape()
 
 
-def build_flydsl_weights(shape: KimiShape, device: torch.device, seed: int = 0):
+def _mark_flydsl_shuffled(weights):
+    for t in weights.values():
+        t.is_shuffled = True
+    return weights
+
+
+def _mark_mxfp4_shuffled(weights):
+    for t in weights.values():
+        t.is_shuffled = True
+        t.shuffle_kind = "mxfp4_moe"
+    return weights
+
+
+def build_weights(shape: KimiShape, device: torch.device, seed: int = 0):
     torch.manual_seed(seed)
     quant = aiter.get_torch_quant(QuantType.per_1x32)
+    ne, h, inter = shape.experts, shape.model_dim, shape.inter_dim
 
-    w1 = torch.randn(
-        (shape.experts, 2 * shape.inter_dim, shape.model_dim),
-        dtype=dtypes.bf16,
-        device=device,
-    ) / 10
-    w2 = torch.randn(
-        (shape.experts, shape.model_dim, shape.inter_dim),
-        dtype=dtypes.bf16,
-        device=device,
-    ) / 10
-
+    w1 = torch.randn((ne, 2 * inter, h), dtype=dtypes.bf16, device=device) / 10
+    w2 = torch.randn((ne, h, inter), dtype=dtypes.bf16, device=device) / 10
     w1_q, w1_scale = quant(w1, quant_dtype=dtypes.fp4x2)
     w2_q, w2_scale = quant(w2, quant_dtype=dtypes.fp4x2)
 
-    return {
-        "w1": shuffle_weight(w1_q.view(torch.float4_e2m1fn_x2)).view(w1_q.dtype),
-        "w2": shuffle_weight(w2_q.view(torch.float4_e2m1fn_x2)).view(w2_q.dtype),
-        "w1_scale": e8m0_shuffle(w1_scale).view(
-            shape.experts, 2 * shape.inter_dim, shape.model_dim // 32
-        ),
-        "w2_scale": e8m0_shuffle(w2_scale).view(
-            shape.experts, shape.model_dim, shape.inter_dim // 32
-        ),
-    }
+    flydsl = _mark_flydsl_shuffled(
+        {
+            "w1": shuffle_weight(w1_q.view(torch.float4_e2m1fn_x2)).view(w1_q.dtype),
+            "w2": shuffle_weight(w2_q.view(torch.float4_e2m1fn_x2)).view(w2_q.dtype),
+            "w1_scale": e8m0_shuffle(w1_scale).view(ne, 2 * inter, h // 32),
+            "w2_scale": e8m0_shuffle(w2_scale).view(ne, h, inter // 32),
+        }
+    )
+
+    mxfp4 = _mark_mxfp4_shuffled(
+        {
+            "w1": shuffle_weight(
+                w1_q,
+                layout=(16, 16),
+                is_guinterleave=True,
+                gate_up=True,
+            ).view(w1_q.dtype),
+            "w2": shuffle_weight(
+                w2_q,
+                layout=(16, 16),
+                is_guinterleave=True,
+                gate_up=False,
+            ).view(w2_q.dtype),
+            "w1_scale": shuffle_scale(
+                w1_scale.view(ne * 2 * inter, h // 32),
+                experts_cnt=ne,
+                is_guinterleave=True,
+                gate_up=True,
+            ).view(ne, 2 * inter, h // 32),
+            "w2_scale": shuffle_scale(
+                w2_scale.view(ne * h, inter // 32),
+                experts_cnt=ne,
+                is_guinterleave=True,
+                gate_up=False,
+            ).view(ne, h, inter // 32),
+        }
+    )
+
+    return {"flydsl": flydsl, "mxfp4": mxfp4}
 
 
 def build_inputs(shape: KimiShape, device: torch.device, seed: int = 1):
@@ -84,13 +121,26 @@ def build_inputs(shape: KimiShape, device: torch.device, seed: int = 1):
 
     shared_ids = torch.full((M, 1), shared_id, device=device, dtype=routed_ids.dtype)
     shared_weight = torch.ones((M, 1), device=device, dtype=routed_weight.dtype)
-
     topk_ids = torch.cat([shared_ids, routed_ids], dim=1).to(torch.int32)
     topk_weight = torch.cat([shared_weight, routed_weight], dim=1).to(torch.float32)
     return hidden, topk_ids, topk_weight
 
 
-def run_flydsl_16384(hidden, topk_ids, topk_weight, weights):
+def run_aiter_moe(hidden, topk_ids, topk_weight, weights):
+    return fused_moe(
+        hidden,
+        weights["w1"],
+        weights["w2"],
+        topk_weight,
+        topk_ids,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,
+        w1_scale=weights["w1_scale"],
+        w2_scale=weights["w2_scale"],
+    )
+
+
+def run_local_kimi(hidden, topk_ids, topk_weight, weights):
     return run_kimi_fp4_flydsl_moe_16384(
         hidden,
         weights["w1"],
@@ -98,7 +148,7 @@ def run_flydsl_16384(hidden, topk_ids, topk_weight, weights):
         topk_ids=topk_ids,
         topk_weight=topk_weight,
         w1_scale=weights["w1_scale"],
-        w2_scale=weights["w2_scale"].view(dtypes.fp8_e8m0),
+        w2_scale=weights["w2_scale"],
     )
 
 
@@ -131,6 +181,18 @@ def bench_cudagraph(fn, warmup: int, graph_iters: int, measure: int):
     return totals[len(totals) // 2] / graph_iters
 
 
+def cosine(a, b):
+    return torch.nn.functional.cosine_similarity(
+        a.float().reshape(-1),
+        b.float().reshape(-1),
+        dim=0,
+    ).item()
+
+
+def max_abs(a, b):
+    return (a.float() - b.float()).abs().max().item()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--warmup", type=int, default=5)
@@ -140,23 +202,57 @@ def main():
 
     device = torch.device("cuda")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"M={M} NE={SHAPE.experts} H={SHAPE.model_dim} INTER={SHAPE.inter_dim} TOPK={SHAPE.topk}")
+    print(
+        f"M={M} NE={SHAPE.experts} H={SHAPE.model_dim} "
+        f"INTER={SHAPE.inter_dim} TOPK={SHAPE.topk}"
+    )
     print(f"stage1={STAGE1_KERNEL}")
     print(f"stage2={STAGE2_KERNEL}")
 
-    weights = build_flydsl_weights(SHAPE, device)
+    weights = build_weights(SHAPE, device)
     hidden, topk_ids, topk_weight = build_inputs(SHAPE, device)
 
-    def fn():
-        return run_flydsl_16384(hidden, topk_ids, topk_weight, weights)
+    runners = {
+        "aiter_moe": lambda: run_aiter_moe(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["flydsl"],
+        ),
+        "aiter_mxfp4_moe": lambda: run_aiter_moe(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["mxfp4"],
+        ),
+        "local_kimi_fp4": lambda: run_local_kimi(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["flydsl"],
+        ),
+    }
 
-    out = fn()
-    torch.cuda.synchronize()
-    if not torch.isfinite(out).all().item():
-        raise RuntimeError("FlyDSL output has non-finite values")
+    outputs = {}
+    for name, fn in runners.items():
+        out = fn()
+        torch.cuda.synchronize()
+        if not torch.isfinite(out).all().item():
+            raise RuntimeError(f"{name} output has non-finite values")
+        outputs[name] = out
 
-    us = bench_cudagraph(fn, args.warmup, args.graph_iters, args.measure)
-    print(f"flydsl_us={us:.1f}")
+    ref = outputs["aiter_moe"]
+    print(
+        "checks: "
+        f"mxfp4_vs_aiter_cos={cosine(outputs['aiter_mxfp4_moe'], ref):.6f} "
+        f"mxfp4_vs_aiter_max_abs={max_abs(outputs['aiter_mxfp4_moe'], ref):.6f} "
+        f"local_vs_aiter_cos={cosine(outputs['local_kimi_fp4'], ref):.6f} "
+        f"local_vs_aiter_max_abs={max_abs(outputs['local_kimi_fp4'], ref):.6f}"
+    )
+
+    for name, fn in runners.items():
+        us = bench_cudagraph(fn, args.warmup, args.graph_iters, args.measure)
+        print(f"{name}_us={us:.1f}")
 
 
 if __name__ == "__main__":
