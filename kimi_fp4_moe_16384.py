@@ -48,7 +48,7 @@ STAGE2_KERNEL = 'flydsl_moe2_afp4_wfp4_bf16_t64x256x256_reduce_xcd4'
 
 @dataclass(frozen=True)
 class Stage1Config:
-    tile_m: int = 64
+    tile_m__64: int = 64
     tile_n: int = 128
     tile_k: int = 256
     waves_per_eu: int = 4
@@ -127,7 +127,7 @@ def compile_kimi_fp4_stage1_16384():
     inter_dim = INTER_DIM
     experts = EXPERTS
     topk = TOPK
-    tile_m = S1.tile_m
+    tile_m = S1.tile_m__64
     tile_n = S1.tile_n
     tile_k = S1.tile_k
     model_dim_pad = 0
@@ -1766,7 +1766,7 @@ def kimi_fp4_stage1_16384(a: torch.Tensor, w1: torch.Tensor, w1_scale: torch.Ten
     dev = a.device
     if out is None:
         out = torch.empty((TOKEN, TOPK, INTER_DIM), dtype=dtypes.bf16, device=dev)
-    sort_block_m = S1.tile_m
+    sort_block_m = S1.tile_m__64
     dense_blocks = min(TOKEN * TOPK * sort_block_m, sorted_token_ids.shape[0]) // sort_block_m
     grid_y = min(dense_blocks, sorted_expert_ids.shape[0])
     args = (_ptr_view_safe(out.view(-1)), _ptr_view_safe(a.view(-1)), _ptr_view_safe(w1.view(-1)), _ptr_view_safe(a1_scale.view(-1)), _ptr_view_safe(w1_scale.view(-1)), _ptr_view_safe(sorted_token_ids), _ptr_view_safe(sorted_expert_ids), _ptr_view_safe(num_valid_ids), TOKEN, INTER_DIM * 2, MODEL_DIM, grid_y, torch.cuda.current_stream())

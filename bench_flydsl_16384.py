@@ -26,6 +26,13 @@ from kimi_fp4_moe_16384 import (  # noqa: E402
     TOPK,
     run_kimi_fp4_flydsl_moe_16384,
 )
+from kimi_fp4_moe_16384_opt import (  # noqa: E402
+    MXFP4_STAGE1_KERNEL,
+    MXFP4_STAGE2_KERNEL,
+    run_kimi_fp4_flydsl_atomic_stage2_16384,
+    run_kimi_fp4_flydsl_mxfp4_sort_16384,
+    run_kimi_fp4_mxfp4_moe_16384_opt,
+)
 
 
 M = TOKEN
@@ -152,6 +159,83 @@ def run_local_kimi(hidden, topk_ids, topk_weight, weights):
     )
 
 
+def run_local_kimi_mxfp4_sort(hidden, topk_ids, topk_weight, weights):
+    return run_kimi_fp4_flydsl_mxfp4_sort_16384(
+        hidden,
+        weights["w1"],
+        w2=weights["w2"],
+        topk_ids=topk_ids,
+        topk_weight=topk_weight,
+        w1_scale=weights["w1_scale"],
+        w2_scale=weights["w2_scale"],
+    )
+
+
+def run_local_kimi_atomic_stage2(hidden, topk_ids, topk_weight, weights):
+    return run_kimi_fp4_flydsl_atomic_stage2_16384(
+        hidden,
+        weights["w1"],
+        w2=weights["w2"],
+        topk_ids=topk_ids,
+        topk_weight=topk_weight,
+        w1_scale=weights["w1_scale"],
+        w2_scale=weights["w2_scale"],
+    )
+
+
+def run_local_mxfp4_opt(hidden, topk_ids, topk_weight, weights):
+    return run_kimi_fp4_mxfp4_moe_16384_opt(
+        hidden,
+        weights["w1"],
+        w2=weights["w2"],
+        topk_ids=topk_ids,
+        topk_weight=topk_weight,
+        w1_scale=weights["w1_scale"],
+        w2_scale=weights["w2_scale"],
+    )
+
+
+def make_runners(hidden, topk_ids, topk_weight, weights):
+    return {
+        "aiter_moe": lambda: run_aiter_moe(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["flydsl"],
+        ),
+        "aiter_mxfp4_moe": lambda: run_aiter_moe(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["mxfp4"],
+        ),
+        "local_kimi_fp4": lambda: run_local_kimi(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["flydsl"],
+        ),
+        "local_kimi_fp4_mxfp4_sort": lambda: run_local_kimi_mxfp4_sort(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["flydsl"],
+        ),
+        "local_kimi_fp4_atomic_stage2": lambda: run_local_kimi_atomic_stage2(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["flydsl"],
+        ),
+        "local_mxfp4_opt": lambda: run_local_mxfp4_opt(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["mxfp4"],
+        ),
+    }
+
+
 def bench_cudagraph(fn, warmup: int, graph_iters: int, measure: int):
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
@@ -208,30 +292,13 @@ def main():
     )
     print(f"stage1={STAGE1_KERNEL}")
     print(f"stage2={STAGE2_KERNEL}")
+    print(f"mxfp4_stage1={MXFP4_STAGE1_KERNEL}")
+    print(f"mxfp4_stage2={MXFP4_STAGE2_KERNEL}")
 
     weights = build_weights(SHAPE, device)
     hidden, topk_ids, topk_weight = build_inputs(SHAPE, device)
 
-    runners = {
-        "aiter_moe": lambda: run_aiter_moe(
-            hidden,
-            topk_ids,
-            topk_weight,
-            weights["flydsl"],
-        ),
-        "aiter_mxfp4_moe": lambda: run_aiter_moe(
-            hidden,
-            topk_ids,
-            topk_weight,
-            weights["mxfp4"],
-        ),
-        "local_kimi_fp4": lambda: run_local_kimi(
-            hidden,
-            topk_ids,
-            topk_weight,
-            weights["flydsl"],
-        ),
-    }
+    runners = make_runners(hidden, topk_ids, topk_weight, weights)
 
     outputs = {}
     for name, fn in runners.items():
@@ -241,14 +308,30 @@ def main():
             raise RuntimeError(f"{name} output has non-finite values")
         outputs[name] = out
 
-    ref = outputs["aiter_moe"]
-    print(
-        "checks: "
-        f"mxfp4_vs_aiter_cos={cosine(outputs['aiter_mxfp4_moe'], ref):.6f} "
-        f"mxfp4_vs_aiter_max_abs={max_abs(outputs['aiter_mxfp4_moe'], ref):.6f} "
-        f"local_vs_aiter_cos={cosine(outputs['local_kimi_fp4'], ref):.6f} "
-        f"local_vs_aiter_max_abs={max_abs(outputs['local_kimi_fp4'], ref):.6f}"
-    )
+    check_pairs = [
+        ("aiter_mxfp4_vs_aiter", outputs["aiter_mxfp4_moe"], outputs["aiter_moe"]),
+        ("local_vs_aiter", outputs["local_kimi_fp4"], outputs["aiter_moe"]),
+        (
+            "local_mxfp4_sort_vs_aiter",
+            outputs["local_kimi_fp4_mxfp4_sort"],
+            outputs["aiter_moe"],
+        ),
+        (
+            "local_atomic_stage2_vs_aiter",
+            outputs["local_kimi_fp4_atomic_stage2"],
+            outputs["aiter_moe"],
+        ),
+        (
+            "local_mxfp4_opt_vs_aiter_mxfp4",
+            outputs["local_mxfp4_opt"],
+            outputs["aiter_mxfp4_moe"],
+        ),
+    ]
+    for name, lhs, rhs in check_pairs:
+        print(
+            f"{name}_cos={cosine(lhs, rhs):.6f} "
+            f"{name}_max_abs={max_abs(lhs, rhs):.6f}"
+        )
 
     for name, fn in runners.items():
         us = bench_cudagraph(fn, args.warmup, args.graph_iters, args.measure)
