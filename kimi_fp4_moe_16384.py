@@ -123,17 +123,17 @@ def kimi_moe_sorting_16384(topk_ids: torch.Tensor, topk_weight: torch.Tensor, mo
 @functools.lru_cache(maxsize=1)
 def compile_kimi_fp4_stage1_16384():
     """Compile the fixed Kimi fp4 stage1 kernel selected for M=16384."""
-    model_dim = MODEL_DIM
-    inter_dim = INTER_DIM
-    experts = EXPERTS
-    topk = TOPK
-    tile_m = S1.tile_m # 64
-    tile_n = S1.tile_n # 128
-    tile_k = S1.tile_k # 256
+    model_dim__7168 = MODEL_DIM
+    inter_dim__512 = INTER_DIM
+    experts__385 = EXPERTS
+    topk__9 = TOPK
+    tile_m__64 = S1.tile_m # 64
+    tile_n__128 = S1.tile_n # 128
+    tile_k__256 = S1.tile_k # 256
     model_dim_pad = 0
     inter_dim_pad = 0
     persist_m = 1
-    use_async_copy = True
+    use_async_copy__True = True
     waves_per_eu = S1.waves_per_eu
     k_batch = 1
     b_nt = S1.b_nt
@@ -141,18 +141,18 @@ def compile_kimi_fp4_stage1_16384():
     gpu_arch = get_hip_arch()
     allocator_pong = SmemAllocator(None, arch=gpu_arch, global_sym_name='smem0')
     allocator_ping = SmemAllocator(None, arch=gpu_arch, global_sym_name='smem1')
-    sort_block_m = max(32, tile_m)
-    num_waves = min(4, tile_n // 32) # 4
-    total_threads = num_waves * 64
-    pack_M = 1 if tile_m < 32 else 2
-    n_per_wave = tile_n // num_waves
-    pack_N = min(2, n_per_wave // 16)
-    pack_K = 2
+    sort_block_m = max(32, tile_m__64)
+    num_waves__4 = min(4, tile_n__128 // 32) # 4
+    total_threads = num_waves__4 * 64
+    pack_M__2 = 1 if tile_m__64 < 32 else 2
+    n_per_wave__32 = tile_n__128 // num_waves__4
+    pack_N__2 = min(2, n_per_wave__32 // 16)
+    pack_K__2 = 2
     scale_mn_pack = 2
     elem_bytes = 1
     a_elem_bytes = 1
     b_elem_bytes = 1
-    tile_k_bytes = int(tile_k) * int(a_elem_bytes) # 256
+    tile_k_bytes = int(tile_k__256) * int(a_elem_bytes) # 256
     a_elem_vec_pack = 2
     cbsz = 4
     blgp = 4
@@ -167,22 +167,22 @@ def compile_kimi_fp4_stage1_16384():
 
     def out_elem():
         return T.bf16
-    _k_per_batch = model_dim
-    _k_dim = model_dim
-    bytes_x_per_tile = int(tile_m) * int(tile_k) * int(a_elem_bytes)
+    _k_per_batch = model_dim__7168
+    _k_dim__7168 = model_dim__7168
+    bytes_x_per_tile = int(tile_m__64) * int(tile_k__256) * int(a_elem_bytes)
     if bytes_x_per_tile % total_threads != 0:
         raise ValueError(f'tile_m*tile_k*elem_bytes must be divisible by {total_threads}')
     bytes_per_thread_x = bytes_x_per_tile // total_threads
     _use_lds128 = os.environ.get('FLIR_CK_LDS128', '1') in ('1', 'true', 'True', 'YES', 'yes')
     pad_k = 0 if _use_lds128 else 8
-    lds_stride = tile_k + pad_k # 256 + 0 = 256
+    lds_stride = tile_k__256 + pad_k # 256 + 0 = 256
     _use_cshuffle_epilog = True
     _xcd_tag = f'_xcd{xcd_swizzle}' if xcd_swizzle > 0 else ''
-    module_name = f'mfma_moe1_silu_mul_afp4_wfp4_bf16_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}_async{_xcd_tag}_v32'
+    module_name = f'mfma_moe1_silu_mul_afp4_wfp4_bf16_t{tile_m__64}x{tile_n__128}x{tile_k__256}_pm{persist_m}_async{_xcd_tag}_v32'
     _cshuffle_elem_bytes = 2
-    _single_x_bytes = int(tile_m) * int(lds_stride) * int(a_elem_bytes) # 16k = 64 * 256 * 1
-    lds_out_bytes = _cshuffle_elem_bytes * int(tile_m) * int(tile_n) if _use_cshuffle_epilog else 0 # 16k = 2 * 64 * 128
-    lds_tid_bytes = int(tile_m) * 4 # 256 = 64 * 4
+    _single_x_bytes = int(tile_m__64) * int(lds_stride) * int(a_elem_bytes) # 16k = 64 * 256 * 1
+    lds_out_bytes = _cshuffle_elem_bytes * int(tile_m__64) * int(tile_n__128) if _use_cshuffle_epilog else 0 # 16k = 2 * 64 * 128
+    lds_tid_bytes = int(tile_m__64) * 4 # 256 = 64 * 4
     _input_elems = _single_x_bytes if a_elem_bytes == 1 else _single_x_bytes // 2
     _GLOBAL_ALIGN = 1024
     _std_pong = max(_single_x_bytes, lds_out_bytes) + lds_tid_bytes # 16k + 256
@@ -190,10 +190,10 @@ def compile_kimi_fp4_stage1_16384():
     _std_pong_aligned = allocator_pong._align(_std_pong, 128) # 256
     _std_total = allocator_pong._align(_std_pong_aligned, _GLOBAL_ALIGN) + allocator_pong._align(_std_ping, 128) # 
     _lds_limit = {'gfx950': 163840, 'gfx942': 65536}.get(gpu_arch, 0)
-    _split_lds_out = _lds_limit > 0 and lds_out_bytes > 0 and (_std_total > _lds_limit) and (num_waves >= 2) # #False = 160k > 0 and 16k > 0 and ()
-    print(f"{_split_lds_out=}, {_std_total=}, {_lds_limit=}, {num_waves=}, {_std_pong=}, {_std_ping=}, {_std_pong_aligned=}, {_std_total=}")
+    _split_lds_out = _lds_limit > 0 and lds_out_bytes > 0 and (_std_total > _lds_limit) and (num_waves__4 >= 2) # #False = 160k > 0 and 16k > 0 and ()
+    print(f"{_split_lds_out=}, {_std_total=}, {_lds_limit=}, {num_waves__4=}, {_std_pong=}, {_std_ping=}, {_std_pong_aligned=}, {_std_total=}")
     if _split_lds_out: # False
-        _half_out_bytes = _cshuffle_elem_bytes * int(tile_m) * (int(tile_n) // 2)
+        _half_out_bytes = _cshuffle_elem_bytes * int(tile_m__64) * (int(tile_n__128) // 2)
         _pong_buffer_bytes = max(_single_x_bytes, _half_out_bytes)
         _ping_buffer_bytes = max(_single_x_bytes, _half_out_bytes)
     else:
@@ -220,13 +220,13 @@ def compile_kimi_fp4_stage1_16384():
     out_elem_bytes = 2
     w_elem_bytes = 1
     w_elem_pack = 2
-    w_nbytes = experts * (2 * inter_dim) * model_dim * w_elem_bytes // w_elem_pack
-    _e_vec_s1 = min(tile_n // 32, 8)
-    _pipe_m_repeat = tile_m // 16
+    w_nbytes = experts__385 * (2 * inter_dim__512) * model_dim__7168 * w_elem_bytes // w_elem_pack
+    _e_vec_s1 = min(tile_n__128 // 32, 8)
+    _pipe_m_repeat = tile_m__64 // 16
     _pipe_k_unroll = tile_k_bytes // 128
-    _pipe_k_unroll_packed = _pipe_k_unroll // pack_K
-    _pipe_m_repeat_packed = _pipe_m_repeat // pack_M
-    _pipe_num_acc_n = n_per_wave // 16
+    _pipe_k_unroll_packed = _pipe_k_unroll // pack_K__2
+    _pipe_m_repeat_packed = _pipe_m_repeat // pack_M__2
+    _pipe_num_acc_n = n_per_wave__32 // 16
     _pipe_a_groups = []
     for _mi in range(_pipe_m_repeat):
         _grp = []
@@ -242,22 +242,22 @@ def compile_kimi_fp4_stage1_16384():
         for ni in range(_pipe_num_acc_n):
             _pipe_b_loads.append(('gate', ku, ni))
             _pipe_b_loads.append(('up', ku, ni))
-    _pipe_num_acc_n_packed = _pipe_num_acc_n // pack_N
+    _pipe_num_acc_n_packed = _pipe_num_acc_n // pack_N__2
     _pipe_all_mfma = []
     for _ku128 in range(_pipe_k_unroll_packed):
         for _ni_packed in range(_pipe_num_acc_n_packed):
-            for _ikxdl in range(pack_K):
-                for _inxdl in range(pack_N):
-                    _k_idx = _ku128 * pack_K + _ikxdl
-                    _ni_idx = _ni_packed * pack_N + _inxdl
+            for _ikxdl in range(pack_K__2):
+                for _inxdl in range(pack_N__2):
+                    _k_idx = _ku128 * pack_K__2 + _ikxdl
+                    _ni_idx = _ni_packed * pack_N__2 + _inxdl
                     _pipe_all_mfma.append((_k_idx, _ni_idx, _ikxdl, _inxdl, _ku128))
     _pipe_mfma_per_phase = max(1, len(_pipe_all_mfma) // 4)
-    _pipe_n_phases = len(_pipe_all_mfma) // _pipe_mfma_per_phase
-    _a_groups_per_phase = (len(_pipe_a_groups) + _pipe_n_phases - 1) // _pipe_n_phases
+    _pipe_n_phases__4 = len(_pipe_all_mfma) // _pipe_mfma_per_phase
+    _a_groups_per_phase = (len(_pipe_a_groups) + _pipe_n_phases__4 - 1) // _pipe_n_phases__4
     _pipe_phases = []
     _mfma_i = 0
     _a_i = 0
-    for _p in range(_pipe_n_phases):
+    for _p in range(_pipe_n_phases__4):
         _a_reads = []
         for _ in range(_a_groups_per_phase):
             if _a_i < len(_pipe_a_groups):
@@ -267,9 +267,9 @@ def compile_kimi_fp4_stage1_16384():
         _mfma_i += _pipe_mfma_per_phase
         _pipe_phases.append(_phase)
     _bi = 0
-    for _p in range(1, _pipe_n_phases):
+    for _p in range(1, _pipe_n_phases__4):
         _rem_b = len(_pipe_b_loads) - _bi
-        _rem_p = _pipe_n_phases - _p
+        _rem_p = _pipe_n_phases__4 - _p
         _n_b = (_rem_b + _rem_p - 1) // _rem_p if _rem_p > 0 else 0
         for _ in range(_n_b):
             if _bi < len(_pipe_b_loads):
@@ -281,7 +281,7 @@ def compile_kimi_fp4_stage1_16384():
     _pp_has_scale = [p['has_scale'] for p in _pipe_phases]
     fp4_ratio = 2
     gui_ratio = 2
-    _vmcnt_before_barrier = tile_m // 32 // fp4_ratio + tile_n // 32 * gui_ratio
+    _vmcnt_before_barrier__9 = tile_m__64 // 32 // fp4_ratio + tile_n__128 // 32 * gui_ratio # 8 = 64/32/2 + 128/32 * 2
 
     @flyc.kernel(name=module_name)
     def moe_gemm1(arg_out: fx.Pointer, arg_x: fx.Pointer, arg_w: fx.Pointer, arg_scale_x: fx.Pointer, arg_scale_w: fx.Pointer, arg_sorted_token_ids: fx.Pointer, arg_expert_ids: fx.Pointer, arg_num_valid_ids: fx.Pointer, i32_tokens_in: fx.Int32, i32_n_in: fx.Int32, i32_k_in: fx.Int32, i32_size_expert_ids_in: fx.Int32):
@@ -303,18 +303,18 @@ def compile_kimi_fp4_stage1_16384():
             addr_i64 = arith.index_cast(T.i64, addr)
             return buffer_ops.create_buffer_resource_from_addr(addr_i64, num_records_bytes=num_records_bytes)
         acc_init = arith.constant_vector(0.0, vec4_f32) # 这个可以优化到mfma第一次直接初始化掉.
-        c_n_total = arith.constant(experts * (2 * inter_dim), index=True) # 385 * 2 * 512.
-        b_layout = make_preshuffle_b_layout(arith, c_n=c_n_total, c_k=k_in // pack_K, kpack_bytes=kpack_bytes, elem_bytes=b_elem_bytes) # B的layout. 这里我猜测 和我之前想得应该是一样的？TODO(zty): 
+        c_n_total = arith.constant(experts__385 * (2 * inter_dim__512), index=True) # 385 * 2 * 512.
+        b_layout = make_preshuffle_b_layout(arith, c_n=c_n_total, c_k=k_in // pack_K__2, kpack_bytes=kpack_bytes, elem_bytes=b_elem_bytes) # B的layout. 这里我猜测 和我之前想得应该是一样的？TODO(zty): 
         layout_b = b_layout.layout_b
         sorted_m = size_expert_ids_in * arith.constant(sort_block_m, index=True) # 64.
-        layout_a_scale = make_preshuffle_scale_layout(arith, c_mn=sorted_m, c_k=arith.constant(model_dim, index=True))
-        layout_b_scale = make_preshuffle_scale_layout(arith, c_mn=c_n_total, c_k=arith.constant(model_dim, index=True))
+        layout_a_scale = make_preshuffle_scale_layout(arith, c_mn=sorted_m, c_k=arith.constant(model_dim__7168, index=True))
+        layout_b_scale = make_preshuffle_scale_layout(arith, c_mn=c_n_total, c_k=arith.constant(model_dim__7168, index=True))
         _eff_lds_stride = lds_stride # 256.
         _eff_tile_k_bytes = tile_k_bytes
-        if const_expr(use_async_copy and a_elem_vec_pack > 1): # 2
+        if const_expr(use_async_copy__True and a_elem_vec_pack > 1): # 2
             _eff_lds_stride = lds_stride // a_elem_vec_pack # 128 = 256 // 2
             _eff_tile_k_bytes = tile_k_bytes // a_elem_vec_pack # 128 = 256 // 2
-        shape_lds = fx.make_shape(tile_m, _eff_lds_stride) # 64, 128
+        shape_lds = fx.make_shape(tile_m__64, _eff_lds_stride) # 64, 128
         stride_lds = fx.make_stride(_eff_lds_stride, 1) # 128, 1
         layout_lds = fx.make_layout(shape_lds, stride_lds) # 64, 128
         tx = gpu.thread_id('x')
@@ -323,7 +323,7 @@ def compile_kimi_fp4_stage1_16384():
         if const_expr(xcd_swizzle > 0):
             _NUM_XCDS_S1 = 8
             _c1_sw = arith.constant(1, index=True) # 1
-            _c_tn_sw = arith.constant(tile_n, index=True) # 128
+            _c_tn_sw = arith.constant(tile_n__128, index=True) # 128
             _c_idp_sw = arith.constant(2 * inter_dim_pad, index=True) # 0
             _c2_sw = arith.constant(2, index=True)
             _gx = (n_in - _c_idp_sw + _c2_sw * _c_tn_sw - _c1_sw) / _c_tn_sw / _c2_sw
@@ -345,10 +345,10 @@ def compile_kimi_fp4_stage1_16384():
             _wgid_in_group = _wgid % _num_wgid_in_group
             bx_persist = _first_pid_m + _wgid_in_group % _group_size_m
             by = _wgid_in_group / _group_size_m
-        by_n = by * arith.constant(tile_n, index=True) # by * 128
-        k_base_idx = arith.index(0)
+        by_n = by * arith.constant(tile_n__128, index=True) # by * 128
+        k_base_idx__0 = arith.index(0)
         k_blocks16 = arith.constant(_eff_tile_k_bytes // 16, index=True) # 8 = 128 / 16. 
-        layout_tx_wave_lane = fx.make_layout((num_waves, 64), stride=(64, 1)) # (4,64):(64,1)
+        layout_tx_wave_lane = fx.make_layout((num_waves__4, 64), stride=(64, 1)) # (4,64):(64,1)
         layout_lane16 = fx.make_layout((4, 16), stride=(16, 1)) # (4,16):(16,1)
         base_ptr_pong = allocator_pong.get_base()
         base_ptr_ping = allocator_ping.get_base()
@@ -356,13 +356,13 @@ def compile_kimi_fp4_stage1_16384():
         lds_x_ping = SmemPtr(base_ptr_ping, lds_ping_offset, x_lds_elem(), shape=(_input_elems,)).get()
         _lds_out_elem_type = T.bf16
         if const_expr(_split_lds_out and _use_cshuffle_epilog): # False
-            _half_out_elems = int(tile_m) * (int(tile_n) // 2)
+            _half_out_elems = int(tile_m__64) * (int(tile_n__128) // 2)
             lds_out = SmemPtr(base_ptr_pong, lds_pong_offset, _lds_out_elem_type, shape=(_half_out_elems,)).get()
             lds_out_B = SmemPtr(base_ptr_ping, lds_ping_offset, _lds_out_elem_type, shape=(_half_out_elems,)).get()
         else:
-            lds_out = SmemPtr(base_ptr_pong, lds_pong_offset, _lds_out_elem_type, shape=(tile_m * tile_n,)).get() if _use_cshuffle_epilog else None # True (64 * 128)
+            lds_out = SmemPtr(base_ptr_pong, lds_pong_offset, _lds_out_elem_type, shape=(tile_m__64 * tile_n__128,)).get() if _use_cshuffle_epilog else None # True (64 * 128)
             lds_out_B = None
-        lds_tid = SmemPtr(base_ptr_pong, _lds_tid_offset_pong, T.i32, shape=(tile_m,)).get()
+        lds_tid = SmemPtr(base_ptr_pong, _lds_tid_offset_pong, T.i32, shape=(tile_m__64,)).get()
         c_a_pack = arith.constant(int(a_elem_vec_pack), index=True)
         c_elem_bytes = arith.constant(int(a_elem_bytes), index=True)
         x_nbytes_idx = tokens_in * k_in * c_elem_bytes / c_a_pack
@@ -380,7 +380,7 @@ def compile_kimi_fp4_stage1_16384():
         sx_rsrc = _ptr_buffer_resource(arg_scale_x, sx_nbytes_i32)
         c32 = arith.constant(32, index=True)
         kblk_w = k_in / c32
-        mn_w = arith.constant(experts * (2 * inter_dim), index=True)
+        mn_w = arith.constant(experts__385 * (2 * inter_dim__512), index=True)
         sw_nbytes_idx = mn_w * kblk_w
         sw_nbytes_i32 = arith.index_cast(T.i32, sw_nbytes_idx)
         sw_rsrc = _ptr_buffer_resource(arg_scale_w, sw_nbytes_i32)
@@ -404,19 +404,19 @@ def compile_kimi_fp4_stage1_16384():
         blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
         expert_i32 = buffer_ops.buffer_load(expert_rsrc, bx, vec_width=1, dtype=T.i32)
         expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
-        exp_valid = arith.cmpi(CmpIPredicate.ult, expert_i32, arith.constant(experts, type=T.i32))
+        exp_valid = arith.cmpi(CmpIPredicate.ult, expert_i32, arith.constant(experts__385, type=T.i32))
 
         def _moe_gemm1_body():
-            expert_off_idx = expert_idx * arith.constant(2 * inter_dim, index=True)
+            expert_off_idx = expert_idx * arith.constant(2 * inter_dim__512, index=True)
             x_load_bytes = 16
             num_x_loads = bytes_per_thread_x // x_load_bytes
             chunk_i32 = x_load_bytes // 4
             c_k_div4 = k_in / c_a_pack * arith.constant(int(a_elem_bytes), index=True) / arith.index(4)
-            tile_k_dwords = int(tile_k) * int(a_elem_bytes) // (4 * int(a_elem_vec_pack))
-            layout_x_tile_div4 = fx.make_layout((tile_m, tile_k_dwords), stride=(tile_k_dwords, 1))
+            tile_k_dwords = int(tile_k__256) * int(a_elem_bytes) // (4 * int(a_elem_vec_pack))
+            layout_x_tile_div4 = fx.make_layout((tile_m__64, tile_k_dwords), stride=(tile_k_dwords, 1))
             c_chunk_i32 = arith.constant(chunk_i32, index=True)
             tx_i32_base = tx * c_chunk_i32
-            topk_i32 = arith.constant(topk)
+            topk_i32 = arith.constant(topk__9)
             mask24 = arith.constant(16777215)
             tokens_i32 = arith.index_cast(T.i32, tokens_in)
 
@@ -448,19 +448,19 @@ def compile_kimi_fp4_stage1_16384():
             lane_mod_16 = layout_get(coord_l16, 1)
             row_a_lds = lane_mod_16
             col_offset_base = lane_div_16 * arith.constant(16, index=True)
-            num_acc_n = n_per_wave // 16
-            c_n_per_wave = arith.constant(n_per_wave, index=True)
-            wave_n_id = wave_id % arith.constant(num_waves, index=True)
+            num_acc_n__2 = n_per_wave__32 // 16
+            c_n_per_wave = arith.constant(n_per_wave__32, index=True)
+            wave_n_id = wave_id % arith.constant(num_waves__4, index=True)
             n_tile_base = wave_n_id * c_n_per_wave
             gate_n_intra_list = []
             gate_n_blk_list = []
             up_n_intra_list = []
             up_n_blk_list = []
             col_g_list = []
-            c_n0_static = experts * (2 * inter_dim) // 16
+            c_n0_static = experts__385 * (2 * inter_dim__512) // 16
             layout_n_blk_intra = fx.make_layout((c_n0_static, 16), stride=(16, 1))
-            inter_idx = arith.constant(inter_dim, index=True)
-            for i in range_constexpr(num_acc_n):
+            inter_idx = arith.constant(inter_dim__512, index=True)
+            for i in range_constexpr(num_acc_n__2):
                 offset = i * 16
                 c_offset = arith.constant(offset, index=True)
                 col_g = by_n + n_tile_base + c_offset + lane_mod_16
@@ -474,16 +474,16 @@ def compile_kimi_fp4_stage1_16384():
                 up_coord = idx2crd(up_row_w, layout_n_blk_intra)
                 up_n_blk_list.append(layout_get(up_coord, 0))
                 up_n_intra_list.append(layout_get(up_coord, 1))
-            m_repeat = tile_m // 16
+            m_repeat__4 = tile_m__64 // 16
             k_unroll = tile_k_bytes // 128
-            k_unroll_packed = k_unroll // pack_K
-            m_repeat_packed = m_repeat // pack_M
-            num_acc_n_packed = num_acc_n // pack_N
-            _K_per_ku = tile_k // k_unroll
-            _pad_k_elems = model_dim_pad % tile_k if model_dim_pad > 0 else 0
+            k_unroll_packed = k_unroll // pack_K__2
+            m_repeat_packed__2 = m_repeat__4 // pack_M__2
+            num_acc_n_packed__1 = num_acc_n__2 // pack_N__2
+            _K_per_ku = tile_k__256 // k_unroll
+            _pad_k_elems = model_dim_pad % tile_k__256 if model_dim_pad > 0 else 0
             _pad_ku_skip = _pad_k_elems // _K_per_ku
             _tail_ku = k_unroll - _pad_ku_skip
-            _tail_ku_packed = (_tail_ku + pack_K - 1) // pack_K if _pad_ku_skip > 0 else None
+            _tail_ku_packed = (_tail_ku + pack_K__2 - 1) // pack_K__2 if _pad_ku_skip > 0 else None
 
             def load_b_packs_k64(base_k, ku: int, n_blk, n_intra): # B g2r?
                 c64 = arith.constant(64, index=True)
@@ -506,7 +506,7 @@ def compile_kimi_fp4_stage1_16384():
                 for ku in range_constexpr(ku_limit):
                     g_packs0, g_packs1 = ([], [])
                     u_packs0, u_packs1 = ([], [])
-                    for ni in range_constexpr(num_acc_n):
+                    for ni in range_constexpr(num_acc_n__2):
                         gb0, gb1 = load_b_packs_k64(base_k, ku, gate_n_blk_list[ni], gate_n_intra_list[ni])
                         g_packs0.append(gb0)
                         g_packs1.append(gb1)
@@ -519,14 +519,14 @@ def compile_kimi_fp4_stage1_16384():
             _scale_lane_elem = lane_div_16 * layout_b_scale.stride_klane + lane_mod_16
             _gate_scale_bases = []
             _up_scale_bases = []
-            for _ni in range_constexpr(num_acc_n_packed):
-                _col_base = by_n + n_tile_base + arith.constant(_ni * 16 * pack_N, index=True)
+            for _ni in range_constexpr(num_acc_n_packed__1):
+                _col_base = by_n + n_tile_base + arith.constant(_ni * 16 * pack_N__2, index=True)
                 _gate_mni = (expert_off_idx + _col_base) // arith.constant(32, index=True)
                 _gate_scale_bases.append(_gate_mni * layout_b_scale.stride_n0 + _scale_lane_elem)
                 _up_mni = (expert_off_idx + inter_idx + _col_base) // arith.constant(32, index=True)
                 _up_scale_bases.append(_up_mni * layout_b_scale.stride_n0 + _scale_lane_elem)
             _a_scale_bases = []
-            for _mi in range_constexpr(m_repeat_packed):
+            for _mi in range_constexpr(m_repeat_packed__2):
                 _a_mni = _mi + bx_m // scale_mn_pack // 16
                 _a_scale_bases.append(_a_mni * layout_a_scale.stride_n0 + _scale_lane_elem)
             _c16_idx = arith.constant(16, index=True)
@@ -540,12 +540,12 @@ def compile_kimi_fp4_stage1_16384():
             _n_half_i32 = arith.constant(0, type=T.i32)
             _bscale_shift = arith.constant(0, type=T.i32)
             _bscale_shift_hi = arith.constant(0, type=T.i32)
-            if const_expr(pack_M < scale_mn_pack):
+            if const_expr(pack_M__2 < scale_mn_pack):
                 _m_half_idx = bx_m // _c16_idx % _c2_idx
                 _m_half_i32 = arith.index_cast(T.i32, _m_half_idx)
                 _scale_shift = _m_half_i32 * arith.constant(8, type=T.i32)
                 _scale_shift_hi = _scale_shift + arith.constant(16, type=T.i32)
-            if const_expr(pack_N < scale_mn_pack):
+            if const_expr(pack_N__2 < scale_mn_pack):
                 _n_half_idx = n_tile_base // _c16_idx % _c2_idx
                 _n_half_i32 = arith.index_cast(T.i32, _n_half_idx)
                 _bscale_shift = _n_half_i32 * arith.constant(8, type=T.i32)
@@ -553,7 +553,7 @@ def compile_kimi_fp4_stage1_16384():
 
             def _rearrange_a_scale(raw_i32):
                 """Rearrange scale bytes for pack_M=1: extract m_half's k0,k1 bytes."""
-                if const_expr(pack_M >= scale_mn_pack):
+                if const_expr(pack_M__2 >= scale_mn_pack):
                     return raw_i32
                 b_k0 = arith.andi(arith.shrui(raw_i32, _scale_shift), _scale_mask_lo)
                 b_k1 = arith.andi(arith.shrui(raw_i32, _scale_shift_hi), _scale_mask_lo)
@@ -561,7 +561,7 @@ def compile_kimi_fp4_stage1_16384():
 
             def _rearrange_b_scale(raw_i32):
                 """Rearrange scale bytes for pack_N=1: extract n_half's k0,k1 bytes."""
-                if const_expr(pack_N >= scale_mn_pack):
+                if const_expr(pack_N__2 >= scale_mn_pack):
                     return raw_i32
                 b_k0 = arith.andi(arith.shrui(raw_i32, _bscale_shift), _scale_mask_lo)
                 b_k1 = arith.andi(arith.shrui(raw_i32, _bscale_shift_hi), _scale_mask_lo)
@@ -573,11 +573,11 @@ def compile_kimi_fp4_stage1_16384():
                 up_b_scale = []
                 for ku in range_constexpr(ku_packed_limit):
                     k_off = (ku + base_k) * layout_b_scale.stride_k0
-                    for mi in range_constexpr(m_repeat_packed):
+                    for mi in range_constexpr(m_repeat_packed__2):
                         s = buffer_ops.buffer_load(sx_rsrc, _a_scale_bases[mi] + k_off, vec_width=1, dtype=T.i32, cache_modifier=0)
                         s = _rearrange_a_scale(s)
                         a_scale_tile.append(vector.from_elements(T.vec(1, T.i32), [s]))
-                    for ni in range_constexpr(num_acc_n_packed):
+                    for ni in range_constexpr(num_acc_n_packed__1):
                         gs = buffer_ops.buffer_load(sw_rsrc, _gate_scale_bases[ni] + k_off, vec_width=1, dtype=T.i32, cache_modifier=0)
                         gs = _rearrange_b_scale(gs)
                         gate_b_scale.append(vector.from_elements(T.vec(1, T.i32), [gs]))
@@ -587,7 +587,7 @@ def compile_kimi_fp4_stage1_16384():
                 return [a_scale_tile, gate_b_scale, up_b_scale]
             _dma_bytes = 16
             _wave_size = 64
-            _eff_bytes_per_buffer = int(tile_m) * int(_eff_lds_stride) * int(a_elem_bytes)
+            _eff_bytes_per_buffer = int(tile_m__64) * int(_eff_lds_stride) * int(a_elem_bytes)
             _num_dma_loads = max(1, _eff_bytes_per_buffer // (total_threads * _dma_bytes))
 
             def dma_x_tile_to_lds(base_k, lds_buffer): # A g2s 
@@ -628,7 +628,7 @@ def compile_kimi_fp4_stage1_16384():
                 a_regs = []
                 for k_idx in range_constexpr(ku_limit):
                     col_base = col_offset_base + k_idx * 128 // a_elem_vec_pack
-                    for mi_idx in range_constexpr(m_repeat):
+                    for mi_idx in range_constexpr(m_repeat__4):
                         mi_val = arith.constant(mi_idx * 16, index=True)
                         curr_row = row_a_lds + mi_val
                         a0, a1 = lds_load_packs_k64(curr_row, col_base, lds_buffer)
@@ -647,37 +647,37 @@ def compile_kimi_fp4_stage1_16384():
                 def pack_i64x4_to_i32x8(x0, x1, x2, x3):
                     v4 = vector.from_elements(vec4_i64, [x0, x1, x2, x3])
                     return vector.bitcast(vec8_i32, v4)
-                _eff_packed = (ku_count + pack_K - 1) // pack_K
+                _eff_packed = (ku_count + pack_K__2 - 1) // pack_K__2
                 for ku128 in range_constexpr(_eff_packed):
-                    for ni in range_constexpr(num_acc_n_packed):
-                        gate_bs_i32 = gate_b_scale[ku128 * num_acc_n_packed + ni]
+                    for ni in range_constexpr(num_acc_n_packed__1):
+                        gate_bs_i32 = gate_b_scale[ku128 * num_acc_n_packed__1 + ni]
                         gate_bs_val = vector.extract(gate_bs_i32, static_position=[0], dynamic_position=[])
-                        up_bs_i32 = up_b_scale[ku128 * num_acc_n_packed + ni]
+                        up_bs_i32 = up_b_scale[ku128 * num_acc_n_packed__1 + ni]
                         up_bs_val = vector.extract(up_bs_i32, static_position=[0], dynamic_position=[])
-                        for ikxdl in range_constexpr(pack_K):
-                            k_idx = ku128 * pack_K + ikxdl
+                        for ikxdl in range_constexpr(pack_K__2):
+                            k_idx = ku128 * pack_K__2 + ikxdl
                             if const_expr(k_idx < ku_count):
                                 gate_bp0, gate_bp1 = gate_b_tile_in[k_idx]
                                 up_bp0, up_bp1 = up_b_tile_in[k_idx]
-                                for inxdl in range_constexpr(pack_N):
-                                    ni_idx = ni * pack_N + inxdl
+                                for inxdl in range_constexpr(pack_N__2):
+                                    ni_idx = ni * pack_N__2 + inxdl
                                     gb0 = gate_bp0[ni_idx]
                                     gb1 = gate_bp1[ni_idx]
                                     gb128 = pack_i64x4_to_i32x8(gb0, gb1, c0_i64, c0_i64)
                                     ub0 = up_bp0[ni_idx]
                                     ub1 = up_bp1[ni_idx]
                                     ub128 = pack_i64x4_to_i32x8(ub0, ub1, c0_i64, c0_i64)
-                                    for mi in range_constexpr(m_repeat_packed):
-                                        a_scale_i32 = a_scale[ku128 * m_repeat_packed + mi]
+                                    for mi in range_constexpr(m_repeat_packed__2):
+                                        a_scale_i32 = a_scale[ku128 * m_repeat_packed__2 + mi]
                                         a_scale_val = vector.extract(a_scale_i32, static_position=[0], dynamic_position=[])
-                                        for imxdl in range_constexpr(pack_M):
-                                            mi_idx = mi * pack_M + imxdl
-                                            _a_reg_idx = k_idx * m_repeat + mi_idx
+                                        for imxdl in range_constexpr(pack_M__2):
+                                            mi_idx = mi * pack_M__2 + imxdl
+                                            _a_reg_idx = k_idx * m_repeat__4 + mi_idx
                                             a0, a1 = a_tile_regs[_a_reg_idx]
                                             a128 = pack_i64x4_to_i32x8(a0, a1, c0_i64, c0_i64)
-                                            acc_idx = mi_idx * num_acc_n + ni_idx
-                                            gate_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, gb128, gate_list[acc_idx], cbsz, blgp, ikxdl * pack_M + imxdl, a_scale_val, ikxdl * pack_N + inxdl, gate_bs_val])
-                                            up_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, ub128, up_list[acc_idx], cbsz, blgp, ikxdl * pack_M + imxdl, a_scale_val, ikxdl * pack_N + inxdl, up_bs_val])
+                                            acc_idx = mi_idx * num_acc_n__2 + ni_idx
+                                            gate_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, gb128, gate_list[acc_idx], cbsz, blgp, ikxdl * pack_M__2 + imxdl, a_scale_val, ikxdl * pack_N__2 + inxdl, gate_bs_val])
+                                            up_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, ub128, up_list[acc_idx], cbsz, blgp, ikxdl * pack_M__2 + imxdl, a_scale_val, ikxdl * pack_N__2 + inxdl, up_bs_val])
                 return (gate_list, up_list, epilogue_pf)
 
             def load_a_subtile(k_idx, mi_idx, lds_buffer): 
@@ -688,7 +688,19 @@ def compile_kimi_fp4_stage1_16384():
                 a0, a1 = lds_load_packs_k64(curr_row, col_base, lds_buffer)
                 return (a0, a1)
 
-            def compute_bmajor_mfma_phase(all_a_tiles, gate_b_single, up_b_single, a_scale_vals, gate_bs_val, up_bs_val, gate_list, up_list, k_idx, ni_idx, ikxdl, inxdl):
+            def compute_bmajor_mfma_phase(all_a_tiles,  # 8 个 (ArithValue(type=i64, op=vector.extract), ArithValue(type=i64, op=vector.extract))
+                                                        # # A regs: indexed by [k_idx * m_repeat + mi_idx]
+                                          gate_b_single,  # 2 个
+                                          up_b_single, # 2
+                                          a_scale_vals, # 2
+                                          gate_bs_val, # 
+                                          up_bs_val, 
+                                          gate_list, 
+                                          up_list, 
+                                          k_idx, 
+                                          ni_idx, 
+                                          ikxdl, 
+                                          inxdl):
                 """B-major MFMA: fix one B (ni), cycle all A tiles (mi).
 
                     Packs B once and reuses across all mi iterations.
@@ -708,17 +720,17 @@ def compile_kimi_fp4_stage1_16384():
                 mfma_res_ty = vec4_f32
                 gb128 = _pack(gate_b_single[0], gate_b_single[1], c0_i64, c0_i64)
                 ub128 = _pack(up_b_single[0], up_b_single[1], c0_i64, c0_i64)
-                for mi_p in range_constexpr(m_repeat_packed):
+                for mi_p in range_constexpr(m_repeat_packed__2):
                     a_scale_val = a_scale_vals[mi_p]
-                    for imxdl in range_constexpr(pack_M):
-                        mi_idx = mi_p * pack_M + imxdl
-                        a_reg = all_a_tiles[k_idx * m_repeat + mi_idx]
+                    for imxdl in range_constexpr(pack_M__2):
+                        mi_idx = mi_p * pack_M__2 + imxdl
+                        a_reg = all_a_tiles[k_idx * m_repeat__4 + mi_idx]
                         a128 = _pack(a_reg[0], a_reg[1], c0_i64, c0_i64)
-                        acc_idx = mi_idx * num_acc_n + ni_idx
-                        gate_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, gb128, gate_list[acc_idx], cbsz, blgp, ikxdl * pack_M + imxdl, a_scale_val, ikxdl * pack_N + inxdl, gate_bs_val])
-                        up_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, ub128, up_list[acc_idx], cbsz, blgp, ikxdl * pack_M + imxdl, a_scale_val, ikxdl * pack_N + inxdl, up_bs_val])
+                        acc_idx = mi_idx * num_acc_n__2 + ni_idx
+                        gate_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, gb128, gate_list[acc_idx], cbsz, blgp, ikxdl * pack_M__2 + imxdl, a_scale_val, ikxdl * pack_N__2 + inxdl, gate_bs_val])
+                        up_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(mfma_res_ty, [a128, ub128, up_list[acc_idx], cbsz, blgp, ikxdl * pack_M__2 + imxdl, a_scale_val, ikxdl * pack_N__2 + inxdl, up_bs_val])
 
-            def _interleaved_half(lds_read, lds_write, next_k_dma_py, next_k_load, prev_a_tile, prev_gate_w, prev_up_w, prev_a_scale, prev_gate_bs, prev_up_bs, acc_gate, acc_up): # 核心调度.
+            def _interleaved_half(lds_read, lds_write, next_k_dma_py__todo, next_k_load___256_0, prev_a_tile, prev_gate_w, prev_up_w, prev_a_scale, prev_gate_bs, prev_up_bs, acc_gate, acc_up): # 核心调度.
                 """One flatmm-style interleaved half-iteration (deep pipeline).
 
                     Generalized for arbitrary m_repeat (block_m=32, 64, ...).
@@ -730,41 +742,43 @@ def compile_kimi_fp4_stage1_16384():
                       Phase 1..N: B VMEM(distributed) + 2 ds_read(A, if avail) -> 4 MFMA(prev)
                       Phase N+1..: remaining B VMEM -> 4 MFMA(prev)
                     """
-                _abs_k = k_base_idx + arith.constant(next_k_load, index=True)
+                _abs_k = k_base_idx__0 + arith.constant(next_k_load___256_0, index=True)
                 _bk = _abs_k // arith.constant(2, index=True)
-                _sk = _abs_k // arith.constant(pack_K * 128, index=True)
+                _sk = _abs_k // arith.constant(pack_K__2 * 128, index=True)
                 _k_off = _sk * layout_b_scale.stride_k0
+                print(f"{_abs_k=} {_bk=}, f{_sk=}, f{_k_off=}")
                 rocdl.sched_barrier(0)
-                rocdl.s_waitcnt(_vmcnt_before_barrier)
+                rocdl.s_waitcnt(_vmcnt_before_barrier__9)
                 _barrier()
                 rocdl.sched_barrier(0)
-                _abs_k_dma = k_base_idx + arith.constant(next_k_dma_py, index=True)
-                if const_expr(use_async_copy and next_k_dma_py < int(_k_dim)):
-                    prefetch_x_to_lds(_abs_k_dma, lds_write)
+                _abs_k_dma__gloc = k_base_idx__0 + arith.constant(next_k_dma_py__todo, index=True)
+                if const_expr(use_async_copy__True and next_k_dma_py__todo < int(_k_dim__7168)):
+                    prefetch_x_to_lds(_abs_k_dma__gloc, lds_write) # g2s_dma
                 _prev_asvs = []
-                for _mi_p in range_constexpr(m_repeat_packed):
+                for _mi_p in range_constexpr(m_repeat_packed__2):
                     _prev_asvs.append(vector.extract(prev_a_scale[_mi_p], static_position=[0], dynamic_position=[]))
-                _prev_gsv_list = []
-                for _gs_ni in range_constexpr(num_acc_n_packed):
+                _prev_gsv_list = [] # gate_scale_value
+                for _gs_ni in range_constexpr(num_acc_n_packed__1):
                     _prev_gsv_list.append(vector.extract(prev_gate_bs[_gs_ni], static_position=[0], dynamic_position=[]))
                 _prev_usv_list = []
-                for _us_ni in range_constexpr(num_acc_n_packed):
+                for _us_ni in range_constexpr(num_acc_n_packed__1):
                     _prev_usv_list.append(vector.extract(prev_up_bs[_us_ni], static_position=[0], dynamic_position=[]))
                 _a_all = {}
                 _b_gate_all = {}
                 _b_up_all = {}
-                for _p in range_constexpr(_pipe_n_phases):
+                for _p in range_constexpr(_pipe_n_phases__4):
+                    print(f'_pipe_n_phases={_pipe_n_phases__4}, _p={_p}')
                     if const_expr(_pp_has_scale[_p]):
                         _new_as_list = []
-                        for _mi_p in range_constexpr(m_repeat_packed):
+                        for _mi_p in range_constexpr(m_repeat_packed__2):
                             _raw_as = buffer_ops.buffer_load(sx_rsrc, _a_scale_bases[_mi_p] + _k_off, vec_width=1, dtype=T.i32, cache_modifier=0)
                             _new_as_list.append(_rearrange_a_scale(_raw_as))
                         _new_gs_list = []
-                        for _gs_ni in range_constexpr(num_acc_n_packed):
+                        for _gs_ni in range_constexpr(num_acc_n_packed__1):
                             _gs_raw = buffer_ops.buffer_load(sw_rsrc, _gate_scale_bases[_gs_ni] + _k_off, vec_width=1, dtype=T.i32, cache_modifier=0)
                             _new_gs_list.append(_rearrange_b_scale(_gs_raw))
                         _new_us_list = []
-                        for _us_ni in range_constexpr(num_acc_n_packed):
+                        for _us_ni in range_constexpr(num_acc_n_packed__1):
                             _us_raw = buffer_ops.buffer_load(sw_rsrc, _up_scale_bases[_us_ni] + _k_off, vec_width=1, dtype=T.i32, cache_modifier=0)
                             _new_us_list.append(_rearrange_b_scale(_us_raw))
                     for _b_j in range_constexpr(len(_pp_b_loads[_p])):
@@ -781,21 +795,21 @@ def compile_kimi_fp4_stage1_16384():
                     rocdl.s_setprio(1) # 4个warp，还用设置这个么... 好像也没有interleave是吧.
                     for _m_j in range_constexpr(len(_pp_mfma[_p])):
                         _k_idx, _ni_idx, _ikxdl, _inxdl, _ku128 = _pp_mfma[_p][_m_j]
-                        _ni_packed_idx = _ni_idx // pack_N
+                        _ni_packed_idx = _ni_idx // pack_N__2
                         _up_b_single = (prev_up_w[_k_idx][0][_ni_idx], prev_up_w[_k_idx][1][_ni_idx])
                         compute_bmajor_mfma_phase(prev_a_tile, (prev_gate_w[_k_idx][0][_ni_idx], prev_gate_w[_k_idx][1][_ni_idx]), _up_b_single, _prev_asvs, _prev_gsv_list[_ni_packed_idx], _prev_usv_list[_ni_packed_idx], acc_gate, acc_up, _k_idx, _ni_idx, _ikxdl, _inxdl) # MFMA. 输出到 gate_list 和 up_list 里面来.
                     rocdl.s_setprio(0)
                     rocdl.sched_barrier(0)
                 cur_a_tile = []
                 for _k in range_constexpr(k_unroll):
-                    for _mi in range_constexpr(m_repeat):
+                    for _mi in range_constexpr(m_repeat__4):
                         cur_a_tile.append(_a_all[_k, _mi])
                 cur_gate_w = []
                 cur_up_w = []
                 for ku in range_constexpr(k_unroll):
                     g_packs0, g_packs1 = ([], [])
                     u_packs0, u_packs1 = ([], [])
-                    for ni in range_constexpr(num_acc_n):
+                    for ni in range_constexpr(num_acc_n__2):
                         g = _b_gate_all[ku, ni]
                         g_packs0.append(g[0])
                         g_packs1.append(g[1])
@@ -805,22 +819,22 @@ def compile_kimi_fp4_stage1_16384():
                     cur_gate_w.append((g_packs0, g_packs1))
                     cur_up_w.append((u_packs0, u_packs1))
                 cur_a_scale = []
-                for _mi_p in range_constexpr(m_repeat_packed):
+                for _mi_p in range_constexpr(m_repeat_packed__2):
                     cur_a_scale.append(vector.from_elements(T.vec(1, T.i32), [_new_as_list[_mi_p]]))
                 cur_gate_bs = []
-                for _gs_ni in range_constexpr(num_acc_n_packed):
+                for _gs_ni in range_constexpr(num_acc_n_packed__1):
                     cur_gate_bs.append(vector.from_elements(T.vec(1, T.i32), [_new_gs_list[_gs_ni]]))
                 cur_up_bs = []
-                for _us_ni in range_constexpr(num_acc_n_packed):
+                for _us_ni in range_constexpr(num_acc_n_packed__1):
                     cur_up_bs.append(vector.from_elements(T.vec(1, T.i32), [_new_us_list[_us_ni]]))
                 return (cur_a_tile, cur_gate_w, cur_up_w, cur_a_scale, cur_gate_bs, cur_up_bs, acc_gate, acc_up)
             rocdl.sched_barrier(0)
-            k0 = k_base_idx
+            k0 = k_base_idx__0
             prefetch_x_to_lds(k0, lds_x_pong) # TODO(zty) K0是什么意思？ pong? 应该是说的 for开始前吧.
             rocdl.sched_barrier(0)
-            _k0_scale = k_base_idx // arith.constant(pack_K * 128, index=True)
+            _k0_scale = k_base_idx__0 // arith.constant(pack_K__2 * 128, index=True)
             a_scale_pong, gate_bs_pong, up_bs_pong = prefetch_ab_scale_tile(_k0_scale)
-            _c_tile_m_idx = arith.constant(tile_m, index=True)
+            _c_tile_m_idx = arith.constant(tile_m__64, index=True)
             _tid_in_range = arith.cmpi(CmpIPredicate.ult, tx, _c_tile_m_idx)
             _if_tid = scf.IfOp(_tid_in_range)
             with ir.InsertionPoint(_if_tid.then_block):
@@ -829,75 +843,73 @@ def compile_kimi_fp4_stage1_16384():
                 _tid_vec1 = vector.from_elements(T.vec(1, T.i32), [_tid_val])
                 vector.store(_tid_vec1, lds_tid, [tx])
                 scf.YieldOp([])
-            acc_gate = [acc_init] * num_acc_n * m_repeat
-            acc_up = [acc_init] * num_acc_n * m_repeat
-            _k1 = k_base_idx + arith.constant(tile_k, index=True)
+            acc_gate = [acc_init] * num_acc_n__2 * m_repeat__4
+            acc_up = [acc_init] * num_acc_n__2 * m_repeat__4 # 这个算是声明了寄存器 C 是吧..
+            _k1 = k_base_idx__0 + arith.constant(tile_k__256, index=True)
             rocdl.sched_barrier(0)
             prefetch_x_to_lds(_k1, lds_x_ping) # TODO(zty) K1是什么意思？ ping? 应该是说的 for开始前吧.
-            _k0_b = k_base_idx // arith.constant(2, index=True)
-            gate_w0, up_w0 = load_b_tile(_k0_b)
+            _k0_b = k_base_idx__0 // arith.constant(2, index=True)
+            gate_w0__64_256, up_w0__64_256 = load_b_tile(_k0_b)
             rocdl.s_waitcnt(0)
             gpu.barrier()
             rocdl.sched_barrier(0)
             a_tile_pong = prefetch_full_a_from_lds(lds_x_pong)
             rocdl.sched_barrier(0)
             rocdl.s_waitcnt(6)
-            num_k_tiles_py = int(_k_dim) // int(tile_k)
-            odd_k_tiles = num_k_tiles_py % 2 == 1
-            tail_tiles = 1 if odd_k_tiles else 2
-            k_main2_py = (num_k_tiles_py - tail_tiles) * int(tile_k)
-            if const_expr(k_main2_py < 0):
-                k_main2_py = 0
-            gate_w_pong = gate_w0
-            up_w_pong = up_w0
+            num_k_tiles_py__28 = int(_k_dim__7168) // int(tile_k__256)
+            odd_k_tiles__False = False
+            tail_tiles__2 = 2
+            k_main2_py__6656 = (num_k_tiles_py__28 - 2) * int(tile_k__256)
+            print(f"k_main2_py: {k_main2_py__6656}", f"num_k_tiles_py: {num_k_tiles_py__28}", f"tail_tiles: {tail_tiles__2}", f"odd_k_tiles: {odd_k_tiles__False}")
+            gate_w_pong = gate_w0__64_256 # [64, 256) 相当于pong初始成了 gate_w0.
+            up_w_pong = up_w0__64_256 # [64,256)
             rocdl.sched_barrier(0)
-            if const_expr(k_main2_py > 0):
-                for k_iv_py in range_constexpr(0, k_main2_py, tile_k * 2):
-                    next_k_load_1 = k_iv_py + tile_k
-                    next_k_load_2 = k_iv_py + tile_k * 2
-                    next_k_dma_1 = k_iv_py + tile_k * 2
-                    next_k_dma_2 = k_iv_py + tile_k * 3
-                    a_tile_ping, gate_w_ping, up_w_ping, a_scale_ping, gate_bs_ping, up_bs_ping, acc_gate, acc_up = _interleaved_half(
-                        lds_x_ping,
-                        lds_x_pong,
-                        next_k_dma_1,
-                        next_k_load_1,
-                        a_tile_pong,
-                        gate_w_pong,
-                        up_w_pong,
-                        a_scale_pong,
-                        gate_bs_pong,
-                        up_bs_pong,
-                        acc_gate,
-                        acc_up,
-                    )
-                    a_tile_pong, gate_w_pong, up_w_pong, a_scale_pong, gate_bs_pong, up_bs_pong, acc_gate, acc_up = _interleaved_half(
-                        lds_x_pong,
-                        lds_x_ping,
-                        next_k_dma_2,
-                        next_k_load_2,
-                        a_tile_ping,
-                        gate_w_ping,
-                        up_w_ping,
-                        a_scale_ping,
-                        gate_bs_ping,
-                        up_bs_ping,
-                        acc_gate,
-                        acc_up,
-                    )
-            if const_expr(odd_k_tiles):
+            for k_iv_py in range_constexpr(0, k_main2_py__6656, tile_k__256 * 2): # (0,K - tile*2, 2*tile).
+                next_k_load_1 = k_iv_py + tile_k__256
+                next_k_load_2 = k_iv_py + tile_k__256 * 2
+                next_k_dma_1 = k_iv_py + tile_k__256 * 2
+                next_k_dma_2 = k_iv_py + tile_k__256 * 3
+                a_tile_ping, gate_w_ping, up_w_ping, a_scale_ping, gate_bs_ping, up_bs_ping, acc_gate, acc_up = _interleaved_half(
+                    lds_x_ping, # lds_read
+                    lds_x_pong, # lds_write
+                    next_k_dma_1, # next_k_dma_py
+                    next_k_load_1, # next_k_load
+                    a_tile_pong, # prev_a_tile
+                    gate_w_pong, # prev_gate_w
+                    up_w_pong, # prev_up_w
+                    a_scale_pong, # prev_a_scale
+                    gate_bs_pong, # prev_gate_bs
+                    up_bs_pong, # prev_up_bs
+                    acc_gate, # acc_gate
+                    acc_up, # acc_up
+                ) # 我现在起码知道了 interleave_half要做的事情了... 这么多参数. 
+                a_tile_pong, gate_w_pong, up_w_pong, a_scale_pong, gate_bs_pong, up_bs_pong, acc_gate, acc_up = _interleaved_half(
+                    lds_x_pong,
+                    lds_x_ping,
+                    next_k_dma_2,
+                    next_k_load_2,
+                    a_tile_ping,
+                    gate_w_ping,
+                    up_w_ping,
+                    a_scale_ping,
+                    gate_bs_ping,
+                    up_bs_ping,
+                    acc_gate,
+                    acc_up,
+                )
+            if const_expr(odd_k_tiles__False):
                 acc_gate, acc_up, epilogue_pf = compute_tile(acc_gate, acc_up, gate_w_pong, up_w_pong, a_tile_pong, a_scale_pong, gate_bs_pong, up_bs_pong, prefetch_epilogue=True, ku_count=_tail_ku if _pad_ku_skip > 0 else k_unroll)
             else:
-                _k_tail_rel = arith.constant(_k_dim - tile_k, index=True)
-                k_tail1 = k_base_idx + _k_tail_rel
+                _k_tail_rel = arith.constant(_k_dim__7168 - tile_k__256, index=True)
+                k_tail1 = k_base_idx__0 + _k_tail_rel
                 x_regs_ping = []
                 prefetch_x_to_lds(k_tail1, lds_x_ping)
                 if const_expr(_pad_ku_skip > 0):
                     gate_w_ping, up_w_ping = load_b_tile(k_tail1 // arith.constant(2, index=True), ku_limit=_tail_ku)
-                    a_scale_ping, gate_bs_ping, up_bs_ping = prefetch_ab_scale_tile(k_tail1 // arith.constant(pack_K * 128, index=True), ku_packed_limit=_tail_ku_packed)
+                    a_scale_ping, gate_bs_ping, up_bs_ping = prefetch_ab_scale_tile(k_tail1 // arith.constant(pack_K__2 * 128, index=True), ku_packed_limit=_tail_ku_packed)
                 else:
                     gate_w_ping, up_w_ping = load_b_tile(k_tail1 // arith.constant(2, index=True))
-                    a_scale_ping, gate_bs_ping, up_bs_ping = prefetch_ab_scale_tile(k_tail1 // arith.constant(pack_K * 128, index=True))
+                    a_scale_ping, gate_bs_ping, up_bs_ping = prefetch_ab_scale_tile(k_tail1 // arith.constant(pack_K__2 * 128, index=True))
                 acc_gate, acc_up, _ = compute_tile(acc_gate, acc_up, gate_w_pong, up_w_pong, a_tile_pong, a_scale_pong, gate_bs_pong, up_bs_pong)
                 rocdl.s_waitcnt(0)
                 _barrier()
@@ -927,10 +939,10 @@ def compile_kimi_fp4_stage1_16384():
 
             def _act_vec4(gate_v4, up_v4):
                 return _silu_mul_vec4(gate_v4, up_v4)
-            acc = [None] * (int(num_acc_n) * int(m_repeat))
-            for _mi in range_constexpr(m_repeat):
-                for _ni in range_constexpr(num_acc_n):
-                    _aidx = _mi * num_acc_n + _ni
+            acc = [None] * (int(num_acc_n__2) * int(m_repeat__4))
+            for _mi in range_constexpr(m_repeat__4):
+                for _ni in range_constexpr(num_acc_n__2):
+                    _aidx = _mi * num_acc_n__2 + _ni
                     acc[_aidx] = _act_vec4(acc_gate[_aidx], acc_up[_aidx])
             mask24_i32 = arith.constant(16777215)
             topk_i32_v = topk_i32
@@ -949,7 +961,7 @@ def compile_kimi_fp4_stage1_16384():
                     vec1_out = T.vec(1, out_elem())
                     v1 = vector.from_elements(vec1_out, [v_out])
                     vector.store(v1, lds_out, [lds_idx], alignment=2)
-            _out_row_stride = inter_dim * out_elem_bytes
+            _out_row_stride = inter_dim__512 * out_elem_bytes
 
             def precompute_row(*, row_local, row):
                 fused2 = memref.load(lds_tid, [row_local])
@@ -962,7 +974,7 @@ def compile_kimi_fp4_stage1_16384():
                 row_valid = arith.andi(row_valid0, arith.andi(t_ok, s_ok))
                 t_idx = arith.index_cast(ir.IndexType.get(), t)
                 s_idx = arith.index_cast(ir.IndexType.get(), s)
-                ts_idx = t_idx * arith.constant(topk, index=True) + s_idx
+                ts_idx = t_idx * arith.constant(topk__9, index=True) + s_idx
                 row_byte_base = out_base_idx + ts_idx * arith.constant(_out_row_stride, index=True)
                 return ((fused2, row_byte_base), row_valid)
 
@@ -973,7 +985,7 @@ def compile_kimi_fp4_stage1_16384():
                 ptr_ty = ir.Type.parse(f'!llvm.ptr<{addr_space}>')
                 return llvm.inttoptr(ptr_ty, i64_raw)
             _e_vec = _e_vec_s1
-            _cshuffle_nlane = min(32, tile_n // _e_vec)
+            _cshuffle_nlane = min(32, tile_n__128 // _e_vec)
 
             def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
                 fused, row_byte_base = row_ctx
@@ -984,7 +996,7 @@ def compile_kimi_fp4_stage1_16384():
                 frag_v = frag._value if hasattr(frag, '_value') else frag
                 llvm.StoreOp(frag_v, out_ptr_v, alignment=_e_vec * out_elem_bytes, nontemporal=True)
             _frag_elem = ir.BF16Type.get()
-            c_shuffle_epilog(arith=arith, vector=vector, gpu=gpu, scf=scf, range_constexpr=range_constexpr, tile_m=tile_m, tile_n=tile_n, e_vec=_e_vec, cshuffle_nlane=_cshuffle_nlane, block_size=total_threads, m_repeat=m_repeat, num_acc_n=num_acc_n, tx=tx, lane_div_16=lane_div_16, lane_mod_16=lane_mod_16, bx_m=bx_m, by_n=by_n, n_tile_base=n_tile_base, lds_out=lds_out, frag_elem_type=_frag_elem, write_row_to_lds=write_row_to_lds, precompute_row=precompute_row, store_pair=store_pair, lds_out_split=lds_out_B)
+            c_shuffle_epilog(arith=arith, vector=vector, gpu=gpu, scf=scf, range_constexpr=range_constexpr, tile_m=tile_m__64, tile_n=tile_n__128, e_vec=_e_vec, cshuffle_nlane=_cshuffle_nlane, block_size=total_threads, m_repeat=m_repeat__4, num_acc_n=num_acc_n__2, tx=tx, lane_div_16=lane_div_16, lane_mod_16=lane_mod_16, bx_m=bx_m, by_n=by_n, n_tile_base=n_tile_base, lds_out=lds_out, frag_elem_type=_frag_elem, write_row_to_lds=write_row_to_lds, precompute_row=precompute_row, store_pair=store_pair, lds_out_split=lds_out_B)
         _if_blk = scf.IfOp(blk_valid)
         with ir.InsertionPoint(_if_blk.then_block):
             _ifexpert_of = scf.IfOp(exp_valid)
@@ -995,7 +1007,7 @@ def compile_kimi_fp4_stage1_16384():
         gpu.barrier()
         scf.YieldOp([])
         _for_ip.__exit__(None, None, None)
-    _cache_tag = (module_name, tile_m, tile_n, tile_k, model_dim_pad, inter_dim_pad, persist_m, use_async_copy, waves_per_eu, k_batch, xcd_swizzle)
+    _cache_tag = (module_name, tile_m__64, tile_n__128, tile_k__256, model_dim_pad, inter_dim_pad, persist_m, use_async_copy__True, waves_per_eu, k_batch, xcd_swizzle)
 
     @flyc.jit
     def launch_kimi_fp4_stage1_16384(arg_out: fx.Pointer, arg_x: fx.Pointer, arg_w: fx.Pointer, arg_scale_x: fx.Pointer, arg_scale_w: fx.Pointer, arg_sorted_token_ids: fx.Pointer, arg_expert_ids: fx.Pointer, arg_max_token_ids: fx.Pointer, i32_tokens_in: fx.Int32, i32_inter_in: fx.Int32, i32_k_in: fx.Int32, i32_size_expert_ids_in: fx.Int32, stream: fx.Stream):
@@ -1007,10 +1019,10 @@ def compile_kimi_fp4_stage1_16384():
             allocator_pong.finalize()
             allocator_ping.finalize()
         inter_dim_pad_total = arith.constant(2 * inter_dim_pad, index=True) # 0 如果存在，*2, gemm1 
-        tile_k_stage2 = tile_k // 2 # 128 = 256 // 2
-        tile2_pad = (tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2) % tile_k_stage2 # 0 = div_up(pad, tile_k_stage2)
+        tile_k_stage2 = tile_k__256 // 2 # 128 = 256 // 2
+        tile2_pad = (tile_k_stage2 - (inter_dim__512 - inter_dim_pad) % tile_k_stage2) % tile_k_stage2 # 0 = div_up(pad, tile_k_stage2)
         inter_in = arith.index_cast(ir.IndexType.get(), i32_inter_in.ir_value()) # 1024
-        tile_n_index = arith.constant(tile_n, index=True) # 128
+        tile_n_index = arith.constant(tile_n__128, index=True) # 128
         gx = (inter_in - inter_dim_pad_total + tile2_pad + 2 * tile_n_index - 1) / tile_n_index / arith.constant(2, index=True) # 4 = div_up(1024, 2*128) # 成对处理tile_n
         _c_pm_l = arith.constant(persist_m, index=True) # 这里是1.
         gy = (arith.index_cast(ir.IndexType.get(), i32_size_expert_ids_in.ir_value()) + _c_pm_l - arith.constant(1, index=True)) / _c_pm_l # div_up(expert_ids_in, 1)

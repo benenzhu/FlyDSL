@@ -1,3 +1,5 @@
+import os
+os.system("rm -rf ~/.flydsl")
 import argparse
 import sys
 from dataclasses import dataclass
@@ -8,6 +10,9 @@ import torch
 
 THIS_DIR = Path(__file__).resolve().parent
 UP_AITER = Path("/root/up-aiter")
+BUILD_PYTHON_PACKAGES = THIS_DIR / "build-fly" / "python_packages"
+if BUILD_PYTHON_PACKAGES.exists():
+    sys.path.insert(0, str(BUILD_PYTHON_PACKAGES))
 sys.path.insert(0, str(UP_AITER))
 sys.path.insert(0, str(THIS_DIR))
 
