@@ -1505,6 +1505,81 @@ remaining low-level differences worth checking next are the output store form
 (`global_store_* nt` in aiter versus `buffer_store_*` in FlyDSL) and the
 FlyDSL scatter_reduce kernel.
 
+## Scatter Reduce v4 Route Vector
+
+The saved scatter kernel in `kimi_fp4_moe_16384_opt.py` is now:
+
+```text
+flydsl_kimi_mxfp4_scatter_reduce_q_NE385_H7168_E512_M16384_TOPK9_v4_routevec
+```
+
+The v4 change keeps the v3 raw global I/O path and adds one vector preload for
+the first eight `reverse_sorted[token, topk]` route ids:
+
+- routes 0..7: one `vector<8xi32>` load, lowering to `s_load_dwordx8`
+- route 8: one scalar `s_load_dword`
+
+Correctness remains exact against aiter for the fixed test input:
+
+```text
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+```
+
+Profiler snapshot:
+
+```text
+/opt/venv/bin/python profile_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 5 --iters 30 --top 30
+```
+
+| stage | aiter | FlyDSL v4 | delta |
+| --- | ---: | ---: | ---: |
+| sort_count | 6.3 us | 6.7 us | +0.4 us |
+| sort_cumsum | 10.4 us | 15.6 us | +5.2 us |
+| sort_place_pad | 32.3 us | 35.9 us | +3.6 us |
+| quant | 58.4 us | 58.9 us | +0.5 us |
+| sort_scales | 55.8 us | 54.3 us | -1.5 us |
+| GEMM1 | 706.8 us | 718.8 us | +12.0 us |
+| GEMM2 | 875.5 us | 865.8 us | -9.7 us |
+| scatter_reduce | 134.5 us | 140.0 us | +5.5 us |
+| total | 1880.0 us | 1896.1 us | +16.1 us |
+
+CUDAGraph end-to-end timing:
+
+```text
+/opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 5 --graph-iters 20 --measure 20
+
+aiter_mxfp4_moe_us=1859.5
+local_mxfp4_all_flydsl_us=1883.3
+```
+
+Scatter ISA/resource comparison:
+
+| instruction/resource | aiter NT | FlyDSL v3 globalio | FlyDSL v4 routevec |
+| --- | ---: | ---: | ---: |
+| `v_pk_fma_f32` | 36 | 36 | 36 |
+| `v_cvt_scalef32_pk_f32_fp4` | 36 | 36 | 36 |
+| `v_cvt_pk_bf16_f32` | 4 | 4 | 4 |
+| `global_load_dword` | 18 | 18 | 18 |
+| `s_load_dword` | 11 | 18 | 10 |
+| `s_load_dwordx8` | 2 | 1 | 2 |
+| `global_store_dwordx4` | 1 | 1 | 1 |
+| `s_waitcnt` | 19 | 35 | 27 |
+| SGPR | 34 | 36 | 38 |
+| VGPR | 62 | 28 | 29 |
+| spills/private segment | 0 / 0 B | 0 / 0 B | 0 / 0 B |
+
+v4 reduces the remaining scatter gap from the earlier `~18us` snapshot to about
+`5.5us` in the latest profiler run.  A v5 experiment staged all route
+weight/scale/q values before decode to increase ILP, but it measured
+`141.1us`, so it was rejected.  The remaining difference is likely mostly
+instruction scheduling: aiter spends many more VGPRs to keep more memory results
+live, while the current FlyDSL version is still more serialized around waits.
+
 ## GPU Selection Note
 
 `gpu_select.py` intentionally treats `rocm-smi cardN` / `GPU[N]` as the

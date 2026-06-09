@@ -100,7 +100,7 @@ def _extract_global_ptr(ptr):
     return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), addr_i64)
 
 
-def _global_load_i32(global_ptr, elem_offset):
+def _global_load_i32(global_ptr, elem_offset, *, nontemporal: bool = False):
     if isinstance(elem_offset, int):
         elem_offset = arith.constant(elem_offset, type=T.i32)
     elem_offset_raw = elem_offset.ir_value() if hasattr(elem_offset, "ir_value") else elem_offset
@@ -114,7 +114,34 @@ def _global_load_i32(global_ptr, elem_offset):
             elem_offset_i64 = ArithValue(arith.ExtSIOp(T.i64, elem_offset_raw).result)
     byte_offset_i64 = elem_offset_i64 * arith.constant(4, type=T.i64)
     ptr = buffer_ops.get_element_ptr(global_ptr, byte_offset=byte_offset_i64, elem_type=T.i8)
-    return llvm.LoadOp(T.i32, ptr, alignment=4).result
+    return llvm.LoadOp(T.i32, ptr, alignment=4, nontemporal=nontemporal).result
+
+
+def _global_load_f32(global_ptr, elem_offset, *, nontemporal: bool = False):
+    elem_offset_i64 = _elem_offset_to_i64(elem_offset)
+    byte_offset_i64 = elem_offset_i64 * arith.constant(4, type=T.i64)
+    ptr = buffer_ops.get_element_ptr(global_ptr, byte_offset=byte_offset_i64, elem_type=T.i8)
+    return llvm.LoadOp(T.f32, ptr, alignment=4, nontemporal=nontemporal).result
+
+
+def _global_load_i32_vec(global_ptr, elem_offset, width: int, *, nontemporal: bool = False):
+    elem_offset_i64 = _elem_offset_to_i64(elem_offset)
+    byte_offset_i64 = elem_offset_i64 * arith.constant(4, type=T.i64)
+    ptr = buffer_ops.get_element_ptr(global_ptr, byte_offset=byte_offset_i64, elem_type=T.i8)
+    return llvm.LoadOp(
+        T.vec(width, T.i32),
+        ptr,
+        alignment=4,
+        nontemporal=nontemporal,
+    ).result
+
+
+def _global_store_vec4_i32(global_ptr, elem_offset, value, *, nontemporal: bool = False):
+    elem_offset_i64 = _elem_offset_to_i64(elem_offset)
+    byte_offset_i64 = elem_offset_i64 * arith.constant(4, type=T.i64)
+    ptr = buffer_ops.get_element_ptr(global_ptr, byte_offset=byte_offset_i64, elem_type=T.i8)
+    raw_value = value.ir_value() if hasattr(value, "ir_value") else value
+    return llvm.StoreOp(raw_value, ptr, alignment=16, nontemporal=nontemporal)
 
 
 def _elem_offset_to_i64(elem_offset):
@@ -229,12 +256,7 @@ def compile_kimi_mxfp4_scatter_reduce_q_16384():
     qcols_i32 = MODEL_DIM // 2 // 4
     scols_i32 = MODEL_DIM // 32 // 4
     out_i32_stride = MODEL_DIM // 2
-    q_nbytes = mxfp4_max_sorted_16384() * (MODEL_DIM // 2)
-    scale_nbytes = mxfp4_max_sorted_16384() * (MODEL_DIM // 32)
-    reverse_nbytes = TOKEN * TOPK * 4
-    weights_nbytes = mxfp4_max_sorted_16384() * 4
-    out_nbytes = TOKEN * MODEL_DIM * 2
-    module_name = "flydsl_kimi_mxfp4_scatter_reduce_q_NE385_H7168_E512_M16384_TOPK9"
+    module_name = "flydsl_kimi_mxfp4_scatter_reduce_q_NE385_H7168_E512_M16384_TOPK9_v4_routevec"
 
     @flyc.kernel(name=module_name)
     def scatter_reduce_q(
@@ -247,11 +269,11 @@ def compile_kimi_mxfp4_scatter_reduce_q_16384():
         i32 = T.i32
         f32 = T.f32
 
-        q_rsrc = _ptr_buffer_resource(arg_flat_out_q, q_nbytes)
-        scale_rsrc = _ptr_buffer_resource(arg_flat_out_scale, scale_nbytes)
-        reverse_rsrc = _ptr_buffer_resource(arg_reverse_sorted, reverse_nbytes)
-        weights_rsrc = _ptr_buffer_resource(arg_sorted_weights, weights_nbytes)
-        out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes)
+        q_ptr = _extract_global_ptr(arg_flat_out_q)
+        scale_ptr = _extract_global_ptr(arg_flat_out_scale)
+        out_ptr = _extract_global_ptr(arg_out)
+        reverse_ptr = _extract_global_ptr(arg_reverse_sorted)
+        weights_ptr = _extract_global_ptr(arg_sorted_weights)
 
         tx = gpu.thread_id("x")
         bx = gpu.block_id("x")
@@ -271,9 +293,11 @@ def compile_kimi_mxfp4_scatter_reduce_q_16384():
         c_scols_i32 = arith.constant(scols_i32, type=i32)
         c_out_stride_i32 = arith.constant(out_i32_stride, type=i32)
 
+        vec2_f32 = T.vec(2, f32)
         c0_f32 = arith.constant(0.0, type=f32)
+        c0_v2_f32 = vector.from_elements(vec2_f32, [c0_f32, c0_f32])
 
-        def _fma_f32(a, b, c):
+        def _fma_v2_f32(a, b, c):
             return ArithValue(
                 _math_fma(
                     arith._to_raw(a),
@@ -282,33 +306,28 @@ def compile_kimi_mxfp4_scatter_reduce_q_16384():
                 )
             )
 
-        acc = [c0_f32 for _ in range(MXFP4_SCATTER_COLS_PER_THREAD)]
+        acc_pairs = [c0_v2_f32 for _ in range(MXFP4_SCATTER_COLS_PER_THREAD // 2)]
         blk = col_base_i32 >> arith.constant(5, type=i32)
         scale_word_col = (blk & ~c3_i32) >> arith.constant(2, type=i32)
         q_col_word = col_base_i32 >> c3_i32
 
-        for i in range_constexpr(TOPK):
-            reverse_off = token_i32 * c_topk_i32 + arith.constant(i, type=i32)
-            sorted_pos = ArithValue(
-                buffer_ops.buffer_load(reverse_rsrc, reverse_off, vec_width=1, dtype=i32)
-            )
-            route_w = buffer_ops.buffer_load(weights_rsrc, sorted_pos, vec_width=1, dtype=f32)
+        reverse_base = token_i32 * c_topk_i32
+        route_ids_0_7 = _global_load_i32_vec(reverse_ptr, reverse_base, 8)
+
+        def accumulate_route(sorted_pos):
+            route_w = _global_load_f32(weights_ptr, sorted_pos)
 
             scale_idx = sorted_pos * c_scols_i32 + scale_word_col
-            scale_word = ArithValue(
-                buffer_ops.buffer_load(scale_rsrc, scale_idx, vec_width=1, dtype=i32)
-            )
+            scale_word = ArithValue(_global_load_i32(scale_ptr, scale_idx))
             scale_shift = (blk & c3_i32) << c3_i32
             e8 = (scale_word >> scale_shift) & c255_i32
             scale = (e8 << c23_i32).bitcast(f32)
 
             q_idx = sorted_pos * c_qcols_i32 + q_col_word
-            packed = ArithValue(
-                buffer_ops.buffer_load(q_rsrc, q_idx, vec_width=1, dtype=i32, cache_modifier=4)
-            )
-            decoded_pairs = []
+            packed = ArithValue(_global_load_i32(q_ptr, q_idx, nontemporal=True))
+            route_w_pair = vector.from_elements(vec2_f32, [route_w, route_w])
             for pair in range_constexpr(MXFP4_SCATTER_COLS_PER_THREAD // 2):
-                decoded_pairs.append(
+                decoded_pair = (
                     llvm.call_intrinsic(
                         T.vec(2, f32),
                         "llvm.amdgcn.cvt.scalef32.pk.f32.fp4",
@@ -317,25 +336,32 @@ def compile_kimi_mxfp4_scatter_reduce_q_16384():
                         [],
                     )
                 )
-            for k in range_constexpr(MXFP4_SCATTER_COLS_PER_THREAD):
-                decoded = vector.extract(
-                    decoded_pairs[k // 2],
-                    static_position=[k % 2],
+                acc_pairs[pair] = _fma_v2_f32(decoded_pair, route_w_pair, acc_pairs[pair])
+
+        for i in range_constexpr(8):
+            sorted_pos = ArithValue(
+                vector.extract(
+                    route_ids_0_7,
+                    static_position=[i],
                     dynamic_position=[],
                 )
-                acc[k] = _fma_f32(decoded, route_w, acc[k])
+            )
+            accumulate_route(sorted_pos)
+
+        sorted_pos = ArithValue(
+            _global_load_i32(reverse_ptr, reverse_base + arith.constant(8, type=i32))
+        )
+        accumulate_route(sorted_pos)
 
         packed_words = []
         for k in range_constexpr(MXFP4_SCATTER_COLS_PER_THREAD // 2):
-            packed_words.append(rocdl.cvt_pk_bf16_f32(acc[2 * k], acc[2 * k + 1]))
+            acc_pair = acc_pairs[k]
+            acc_lo = vector.extract(acc_pair, static_position=[0], dynamic_position=[])
+            acc_hi = vector.extract(acc_pair, static_position=[1], dynamic_position=[])
+            packed_words.append(rocdl.cvt_pk_bf16_f32(acc_lo, acc_hi))
         out_i32_vec = vector.from_elements(T.vec(4, i32), packed_words)
         out_word_off = token_i32 * c_out_stride_i32 + (col_base_i32 >> c1_i32)
-        buffer_ops.buffer_store(
-            out_i32_vec,
-            out_rsrc,
-            out_word_off,
-            cache_modifier=4,
-        )
+        _global_store_vec4_i32(out_ptr, out_word_off, out_i32_vec, nontemporal=True)
 
     @flyc.jit
     def launch_scatter_reduce_q(
