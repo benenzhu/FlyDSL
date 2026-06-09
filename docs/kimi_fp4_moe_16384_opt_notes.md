@@ -564,3 +564,112 @@ same 128KiB LDS allocation. The main confirmed resource gap is that aiter uses
 168 AGPRs for accumulators while FlyDSL uses 0 AGPRs and raises VGPR pressure to
 222. The next GEMM1 optimization should port the AGPR MFMA inline-asm path from
 aiter before spending time on smaller schedule tweaks.
+
+### Step 5: Grid and Waitcnt Comparison
+
+Current grid status for the fixed M=16384 mxfp4 path:
+
+```text
+sort_count:       grid=[16, 1, 1]      block=[1024, 1, 1]
+sort_cumsum:      grid=[1, 1, 1]       block=[1024, 1, 1]
+sort_place_pad:   grid=[16, 1, 1]      block=[1024, 1, 1]
+quant:            grid=[512, 1, 1]     block=[1024, 1, 1]
+sort_scales:      grid=[512, 1, 1]     block=[1024, 1, 1]
+aiter GEMM1:      grid=[6136, 1, 1]    block=[256, 1, 1]
+FlyDSL GEMM1:     grid=[4, 1534, 1]    block=[256, 1, 1]
+aiter GEMM2:      grid=[256, 1, 1]     block=[256, 1, 1]
+FlyDSL GEMM2:     grid=[28, 1534, 1]   block=[256, 1, 1]
+scatter_reduce_q: grid=[7, 16384, 1]   block=[128, 1, 1]
+```
+
+GEMM1 launches the same number of CTAs:
+
+```text
+1534 M blocks * 4 N blocks = 6136 CTAs
+```
+
+aiter expresses this as a 1D grid and maps `pid / 4` to M and `pid % 4` to N.
+FlyDSL expresses the same logical work as a 2D grid with `x=N` and `y=M`.
+This grid shape is not the main GEMM1 gap.
+
+GEMM2 is different: aiter's nonatomic mxfp4out path is persistent and launches
+only `NUM_CU=256` CTAs, while the current FlyDSL GEMM2 candidate launches the
+full logical tile grid:
+
+```text
+28 N blocks * 1534 M blocks = 42952 CTAs
+```
+
+That explains why the GEMM2 candidate is also slower; it is not just a local
+MFMA schedule issue.
+
+Static GEMM1 ISA counts before the waitcnt tweak:
+
+```text
+                 aiter GEMM1    FlyDSL GEMM1 v0
+mfma_scale       1792           1792
+buffer_load      408            622
+ds_read          536            480
+ds_write         128            96
+s_waitcnt        320            499
+s_barrier        30             58
+s_nop            123            455
+```
+
+The MFMA count is aligned, so the gap is in load/wait/barrier scheduling and
+epilogue/control overhead. The original FlyDSL loop did:
+
+```text
+barrier
+A raw load -> LDS
+B load -> VGPR
+A/B scale load -> VGPR
+s_waitcnt(0)
+barrier
+compute
+```
+
+The first small optimization keeps the single-LDS-buffer structure but changes
+the pre-compute wait from `s_waitcnt(0)` to `s_waitcnt(14)`. For this GEMM1
+tile, each K tile issues:
+
+```text
+8 A raw LDS VMEM loads
+8 B vector VMEM loads
+6 scale VMEM loads
+```
+
+Waiting until `vmcnt <= 14` is enough for the older 8 A->LDS loads to complete
+before the cross-wave barrier. The newer B and scale loads can continue until
+their values are actually consumed by the MFMA path. This mirrors the aiter
+idea of not draining all VMEM before the barrier.
+
+Validated result for `flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v1`:
+
+```text
+CUDAGraph:
+  local_mxfp4_opt_gemm1_vs_aiter_mxfp4_cos=1.000000
+  local_mxfp4_opt_gemm1_vs_aiter_mxfp4_max_abs=0.000000
+  aiter_mxfp4_moe_us=1804.5
+  local_mxfp4_opt_gemm1_us=2248.6
+
+Profiler:
+  FlyDSL GEMM1 v1 ~1184.5us
+  previous FlyDSL GEMM1 v0 snapshot ~1226.6us
+  aiter GEMM1 snapshot ~725.0us
+```
+
+The v1 resource metadata remains:
+
+```text
+agpr_count=0
+sgpr_count=46
+vgpr_count=222
+spill=0
+LDS=131072
+```
+
+An attempted one-ahead LDS double-buffer/prefetch experiment reduced time a
+little but produced incorrect output, so it was not kept. A correct version
+needs to match aiter's physical LDS slot lifetime and explicit LDS read/write
+ordering more closely instead of just moving Python-level loads.

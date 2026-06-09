@@ -357,7 +357,7 @@ def compile_kimi_mxfp4_gemm1_16384():
     # Output scale layout consumed by GEMM2 for K=INTER_DIM=512.
     k_out_as_per_chunk_dw = ((INTER_DIM // 32) // 4 // 2) * 64
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v0"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v1"
 
     @flyc.kernel(name=module_name)
     def gemm1(
@@ -641,7 +641,10 @@ def compile_kimi_mxfp4_gemm1_16384():
                 b_tile = load_b_tile(k_tile)
                 a_scale = load_a_scale_tile(k_tile)
                 b_scale = load_b_scale_tile(k_tile)
-                rocdl.s_waitcnt(0)
+                # Only the raw A->LDS loads must be complete before the
+                # cross-wave barrier. B and scale VMEM loads can keep running
+                # until the MFMA path consumes them.
+                rocdl.s_waitcnt(14)
                 gpu.barrier()
                 acc = compute_tile(acc, b_tile, a_scale, b_scale)
 
