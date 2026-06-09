@@ -2195,3 +2195,26 @@ not one uniform issue.  M=4 is almost entirely sort/prologue overhead.  M=64 and
 M=128 are dominated by GEMM1, with GEMM2 as the second largest term.  The next
 kernel-level optimization should therefore start from GEMM1 for M=64/128, while
 keeping sort/prologue in mind for the very small M=4 case.
+
+Profiler sanity check for M=64 (`warmup=20`, `graph_iters=20`, `replays=5`)
+confirmed the stage split is real kernel time, not extra graph kernels:
+
+| runner | sort | GEMM1 | GEMM2 | total |
+| --- | ---: | ---: | ---: | ---: |
+| `aiter` | 5.391 us | 135.481 us | 66.707 us | 207.579 us |
+| `sort_aiter` | 7.324 us | 135.804 us | 66.822 us | 209.950 us |
+| `gemm1fly_aiter` | 7.275 us | 142.643 us | 66.625 us | 216.543 us |
+| `allfly` | 7.233 us | 142.682 us | 69.813 us | 219.727 us |
+
+Rejected follow-ups:
+
+- GEMM2 barrier relaxation: replacing the pre-compute
+  `rocdl.s_waitcnt(0); gpu.barrier()` with `_barrier(lgkmcnt=0)` was not
+  correct.  M=8/16 cosine dropped to about `0.80`, so the current GEMM2 path
+  still needs a stronger VMEM/LDS ordering point.
+- GEMM1 preload v5: interleaving the initial two K-tile preload as
+  half-quant/B-load/half-quant/B-load was correct (`min_cos=0.999997199`) but
+  did not improve performance.  Short graph profiler changed M=64 GEMM1 only
+  from about `142.643 us` to `142.564 us`, and long graph timing made the
+  M=64 GEMM1 stage delta worse (`+6.861 us`).  The saved code stays at GEMM1
+  v4.
