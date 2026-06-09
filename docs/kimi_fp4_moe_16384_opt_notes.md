@@ -2423,11 +2423,11 @@ bench_small_bm16.py defaults:
 
 profile_small_bm16.py defaults:
   warmup=1000
-  graph_iters=512
-  replays=8
-  logical_iters_per_sample=4096
-  repeat=61
-  max_retries=1000
+  graph_iters=64
+  replays=2
+  logical_iters_per_sample=128
+  repeat=101
+  max_retries=1500
 ```
 
 Use the default commands for final comparison:
@@ -2440,14 +2440,21 @@ Use the default commands for final comparison:
 For smoke checks only, override these values explicitly with small numbers.
 The defaults are intentionally slow: for BM16 the end-to-end bench measures
 `32768 * 501` graph calls per sample and reports 21 independent samples. The
-profiler uses `512 * 8` logical graph iterations per sample and `repeat=61`.
-This keeps the profiler sample window bounded enough to avoid the worst event
-drop behavior, while still giving many more graph-replay kernel observations for
+profiler uses `64 * 2` logical graph iterations per sample and `repeat=101`.
+This keeps the profiler sample window in the previously stable event-capture
+range, while still increasing the total number of graph-replay observations for
 small kernels.
 
 `bench.py` now also has a `--repeat` loop and prints the per-backend timing
 samples. This makes the root sweep usable for final conclusions without relying
 on a single CUDA-event median.
+
+Two larger `profile_small_bm16.py` windows were rejected for default use:
+`graph_iters=512, replays=8` repeatedly captured incomplete CUDA event streams
+(`~10.8k` kernel events instead of the expected `12.3k` for M=64 aiter), and
+`graph_iters=128, replays=4` again had near-zero acceptance in this environment.
+`graph_iters=64, replays=2` accepted complete 3-kernel/iteration samples
+reliably in the spot check, while `64,4` already showed substantial drops.
 
 ## BM16 GEMM2 v4 Packed-Multiply Trial
 
@@ -2626,3 +2633,50 @@ An allfly-only repeat-21 check had noisy M=64 outliers but stable medians:
 
 The improvement is small, but the code is cleaner and statically closer to the
 aiter epilogue, so keep GEMM1 v8.
+
+## Small-M BM16 Stable Profile Window and Rejected Follow-ups
+
+The default `profile_small_bm16.py` window was adjusted after testing larger
+graph-replay samples.  `graph_iters=512, replays=8` and then
+`graph_iters=128, replays=4` repeatedly produced incomplete torch-profiler CUDA
+event streams for M=64 aiter.  The retained default is a bounded window with
+more independent samples:
+
+```text
+warmup=1000
+graph_iters=64
+replays=2
+repeat=101
+max_retries=1500
+```
+
+With a development repeat of 21, the current v8/v3 all-FlyDSL baseline remains:
+
+| M | stage | aiter | allfly | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | sort_zero_init | 4.912 us | 7.044 us | +2.132 us |
+| 64 | GEMM1 v8 | 130.852 us | 135.523 us | +4.672 us |
+| 64 | GEMM2 v3 | 65.364 us | 67.740 us | +2.376 us |
+| 64 | total | 200.929 us | 210.284 us | +9.355 us |
+| 128 | sort_zero_init | 6.291 us | 8.473 us | +2.183 us |
+| 128 | GEMM1 v8 | 163.787 us | 169.849 us | +6.062 us |
+| 128 | GEMM2 v3 | 81.691 us | 86.111 us | +4.420 us |
+| 128 | total | 251.759 us | 264.474 us | +12.715 us |
+
+Rejected follow-ups:
+
+- GEMM1 early expert-load guard: moving the `sorted_expert_ids` load behind the
+  `cumsum`/block-valid check was correct but did not improve performance. M=64
+  GEMM1 measured `135.695 us`; M=128 measured `170.001 us`, both slightly worse
+  than v8.
+- GEMM2 LDS-value preload epilogue: reading all four bf16-pair LDS values before
+  issuing atomics was correct but did not improve performance. M=64 GEMM2
+  measured `67.868 us`; M=128 measured `86.163 us`, effectively equal or worse
+  than v3.
+- GEMM1 1D-grid remap: changing from `(num_n_blocks, m_blocks)` grid to aiter's
+  one-dimensional `pid -> (m_block,n_block)` mapping was correct but slower.
+  M=64 GEMM1 measured `136.435 us`; M=128 measured `170.354 us`.
+
+Keep GEMM1 v8 and GEMM2 v3 as the stable BM16 kernel baselines.  The next
+useful GEMM1 work likely needs deeper schedule/resource changes rather than
+small launch or epilogue reshaping.
