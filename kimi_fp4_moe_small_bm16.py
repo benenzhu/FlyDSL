@@ -1355,7 +1355,7 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
     lds_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_offset + max(lds_a_bytes, lds_acc_bytes)
 
-    module_name = "flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v0"
+    module_name = "flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v2"
 
     @flyc.kernel(name=module_name)
     def gemm2_atomic(
@@ -1408,7 +1408,6 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
 
         base_ptr = allocator.get_base()
         lds_a_i8 = SmemPtr(base_ptr, lds_offset, T.f8, shape=(lds_a_bytes,)).get()
-        lds_a_i32 = SmemPtr(base_ptr, lds_offset, T.i32, shape=(lds_a_bytes // 4,)).get()
         lds_acc = SmemPtr(base_ptr, lds_offset, T.f32, shape=(tile_m * tile_n,)).get()
 
         shape_lds = fx.make_shape(tile_m, tile_k // 2)
@@ -1442,39 +1441,36 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
         def load_a_to_lds(slot: int, kt: int):
             row_off = lane_id // arith.constant(8, index=True)
             lane_mod8 = lane_id % arith.constant(8, index=True)
-            lds_row = wave_id * arith.constant(8, index=True) + row_off
+            lds_row_base = wave_id * arith.constant(8, index=True)
+            lds_row = lds_row_base + row_off
             actual_row = m_row + lds_row
+            col_sw = swizzle_xor16(
+                lds_row,
+                lane_mod8 * arith.constant(16, index=True),
+                k_blocks16,
+            )
             global_off = (
                 actual_row * arith.constant(k_half, index=True)
                 + arith.constant(kt * (tile_k // 2), index=True)
-                + lane_mod8 * arith.constant(16, index=True)
+                + col_sw
             )
-            a16 = _buffer_load_vec(
-                buffer_ops,
-                vector,
-                a_q_rsrc,
-                global_off,
-                elem_type=T.i8,
-                vec_elems=16,
-                elem_bytes=1,
-                offset_in_bytes=True,
-                cache_modifier=0,
-            )
-            a_i32x4 = vector.bitcast(T.vec(4, i32), a16)
-            col_sw = swizzle_xor16(lds_row, lane_mod8 * arith.constant(16, index=True), k_blocks16)
             byte_idx = (
                 arith.constant(slot * single_a_bytes, index=True)
-                + crd2idx([lds_row, col_sw], layout_lds)
+                + crd2idx([lds_row_base, arith.index(0)], layout_lds)
             )
-            word_idx = byte_idx // arith.constant(4, index=True)
-            for wi in range_constexpr(4):
-                word = vector.extract(a_i32x4, static_position=[wi], dynamic_position=[])
-                vector.store(
-                    vector.from_elements(T.vec(1, i32), [word]),
-                    lds_a_i32,
-                    [word_idx + arith.constant(wi, index=True)],
-                    alignment=4,
-                )
+            lds_addr = memref.extract_aligned_pointer_as_index(lds_a_i8) + byte_idx
+            lds_addr_i64 = arith.index_cast(i64, lds_addr)
+            lds_addr_i64 = rocdl.readfirstlane(i64, lds_addr_i64)
+            lds_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), lds_addr_i64)
+            rocdl.raw_ptr_buffer_load_lds(
+                a_q_rsrc,
+                lds_ptr,
+                arith.constant(16, type=i32),
+                arith.index_cast(i32, global_off),
+                arith.constant(0, type=i32),
+                arith.constant(0, type=i32),
+                arith.constant(0, type=i32),
+            )
 
         def guarded_load_a_to_lds(slot: int, kt: int):
             if_wave = scf.IfOp(arith.cmpi(CmpIPredicate.ult, wave_i32, c2_i32))

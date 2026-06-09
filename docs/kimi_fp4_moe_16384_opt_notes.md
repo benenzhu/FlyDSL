@@ -2260,3 +2260,48 @@ strictly closer to aiter and correctness is unchanged.  A long graph sample
 with `--no-check` was noisy (`M=64` sort/GEMM stages all inflated together), so
 the retained evidence for this small cleanup is correctness plus direct kernel
 profiler/ISA alignment.
+
+## Small-M BM16 GEMM2 v2 LDS Load Alignment
+
+Change:
+
+- Replace GEMM2's A path from `buffer_load_dwordx4` into VGPR followed by
+  `ds_write*` with `raw_ptr_buffer_load_lds`, matching aiter's direct
+  global-to-LDS load for the two K tiles.
+- Keep the stronger pre-compute `s_waitcnt(0); s_barrier` ordering.  The earlier
+  `lgkmcnt=0` relaxation was not correct.
+
+Correctness sweep against aiter mxfp4:
+
+```text
+M=4   cos=0.999997437 max_abs=0.031250
+M=8   cos=0.999998689 max_abs=0.015625
+M=16  cos=0.999999166 max_abs=0.015625
+M=32  cos=0.999998748 max_abs=0.031250
+M=64  cos=0.999998808 max_abs=0.023438
+M=128 cos=0.999999225 max_abs=0.031250
+min_cos=0.999997437
+```
+
+Static ISA comparison:
+
+| kernel | `s_waitcnt` | `buffer_load ... lds` | `ds_write_b128` | `ds_write_b32` |
+| --- | ---: | ---: | ---: | ---: |
+| aiter GEMM2 | 34 | 2 | 0 | 0 |
+| FlyDSL GEMM2 v0 | 19 | 0 | 1 | 4 |
+| FlyDSL GEMM2 v2 | 17 | 2 | 0 | 0 |
+
+Short graph profiler (`warmup=20`, `graph_iters=20`, `replays=5`) for the
+kernel body:
+
+| M | aiter GEMM2 | FlyDSL v2 GEMM2 | delta |
+| ---: | ---: | ---: | ---: |
+| 64 | 67.528 us | 69.296 us | +1.768 us |
+| 128 | 84.206 us | 88.799 us | +4.593 us |
+
+Interpretation: v2 removes the obvious extra LDS writes and makes the static
+A-load sequence closer to aiter.  The measured M=64 gap is slightly smaller
+than the earlier `~3 us` snapshot, while M=128 still has a meaningful gap.  The
+remaining GEMM2 difference is now more likely in the atomic epilogue form
+(`buffer_atomic_pk_add_bf16` vs aiter's `global_atomic_pk_add_bf16`) and/or the
+exact wait scheduling around the epilogue, rather than the A-load staging.
