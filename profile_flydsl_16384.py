@@ -57,6 +57,52 @@ def _profile_runner(fn, *, warmup: int, iters: int, trace_path: Path | None):
     return events
 
 
+def _capture_graph(fn, *, warmup: int, graph_iters: int):
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(warmup):
+            fn()
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(graph_iters):
+            fn()
+
+    graph.replay()
+    torch.cuda.synchronize()
+    return graph
+
+
+def _profile_runner_graph(
+    fn,
+    *,
+    warmup: int,
+    graph_iters: int,
+    replays: int,
+    trace_path: Path | None,
+):
+    graph = _capture_graph(fn, warmup=warmup, graph_iters=graph_iters)
+
+    with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
+        for _ in range(replays):
+            graph.replay()
+        torch.cuda.synchronize()
+
+    if trace_path is not None:
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        prof.export_chrome_trace(str(trace_path))
+
+    events = [
+        (_event_name(evt), float(evt.self_device_time_total))
+        for evt in prof.events()
+        if _is_cuda_event(evt)
+    ]
+    return events
+
+
 def _split_by_iteration(events, iters: int):
     if not events:
         return []
@@ -132,11 +178,28 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--runners",
-        default="aiter_mxfp4_moe,local_kimi_fp4,local_mxfp4_opt",
+        default="aiter_mxfp4_moe,local_mxfp4_all_flydsl",
         help="comma-separated runner names from bench_flydsl_16384.py",
     )
+    parser.add_argument(
+        "--mode",
+        choices=("graph", "eager"),
+        default="graph",
+        help="profile CUDA/HIP graph replay by default; use eager for normal launch profiling",
+    )
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument(
+        "--iters",
+        type=int,
+        default=5,
+        help="eager iterations, or graph replay count in graph mode",
+    )
+    parser.add_argument(
+        "--graph-iters",
+        type=int,
+        default=20,
+        help="pipeline iterations captured inside each graph replay",
+    )
     parser.add_argument("--top", type=int, default=None)
     parser.add_argument(
         "--trace-dir",
@@ -151,7 +214,17 @@ def main():
         f"M={M} NE={SHAPE.experts} H={SHAPE.model_dim} "
         f"INTER={SHAPE.inter_dim} TOPK={SHAPE.topk}"
     )
-    print(f"warmup={args.warmup} iters={args.iters}")
+    if args.mode == "graph" and args.graph_iters <= 0:
+        raise ValueError("--graph-iters must be positive in graph mode")
+    if args.iters <= 0:
+        raise ValueError("--iters must be positive")
+
+    logical_iters = args.iters * args.graph_iters if args.mode == "graph" else args.iters
+    print(
+        f"mode={args.mode} warmup={args.warmup} "
+        f"iters={args.iters} graph_iters={args.graph_iters if args.mode == 'graph' else 0} "
+        f"logical_iters={logical_iters}"
+    )
 
     weights = build_weights(SHAPE, device)
     hidden, topk_ids, topk_weight = build_inputs(SHAPE, device)
@@ -165,13 +238,22 @@ def main():
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
     for name in requested:
         trace_path = trace_dir / f"profile_16384_{name}.json.gz" if trace_dir else None
-        events = _profile_runner(
-            runners[name],
-            warmup=args.warmup,
-            iters=args.iters,
-            trace_path=trace_path,
-        )
-        _print_ordered_report(name, events, args.iters, args.top)
+        if args.mode == "graph":
+            events = _profile_runner_graph(
+                runners[name],
+                warmup=args.warmup,
+                graph_iters=args.graph_iters,
+                replays=args.iters,
+                trace_path=trace_path,
+            )
+        else:
+            events = _profile_runner(
+                runners[name],
+                warmup=args.warmup,
+                iters=args.iters,
+                trace_path=trace_path,
+            )
+        _print_ordered_report(name, events, logical_iters, args.top)
         if trace_path is not None:
             print(f"trace={trace_path}")
 
