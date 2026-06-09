@@ -35,6 +35,7 @@ from kimi_fp4_moe_16384 import (
     INTER_DIM,
     MODEL_DIM,
     TOPK,
+    _barrier,
     _ptr_view_safe,
     _run_compiled,
 )
@@ -553,7 +554,7 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
     lds_scale_offset = lds_offset + lds_x_bytes
     allocator.ptr = lds_offset + max(lds_x_bytes + lds_scale_bytes, lds_acc_bytes)
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v1"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v4"
 
     @flyc.kernel(name=module_name)
     def gemm1_inline(
@@ -726,6 +727,7 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
         c254_i32 = arith.constant(254, type=i32)
         cffff_i32 = arith.constant(0xFFFF, type=i32)
         c7fff_i32 = arith.constant(0x7FFF, type=i32)
+        c7fff7fff_i32 = arith.constant(0x7FFF7FFF, type=i32)
         chi_mask_i32 = arith.constant(-65536, type=i32)
         c0x200000_i32 = arith.constant(0x200000, type=i32)
         c64_i32 = arith.constant(64, type=i32)
@@ -736,6 +738,58 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
 
         def _max_u32(a, b):
             return arith.select(arith.cmpi(CmpIPredicate.ugt, b, a), b, a)
+
+        def _raw(v):
+            return v.ir_value() if hasattr(v, "ir_value") else v
+
+        def _pkmax_u16(a, b):
+            return ArithValue(
+                llvm.inline_asm(
+                    i32,
+                    [_raw(a), _raw(b)],
+                    "v_pk_max_u16 $0, $1, $2",
+                    "=v,v,v",
+                    has_side_effects=False,
+                )
+            )
+
+        def _max_u32_dpp_xor1(src):
+            peer = ArithValue(
+                llvm.call_intrinsic(
+                    i32,
+                    "llvm.amdgcn.update.dpp.i32",
+                    [
+                        _raw(src),
+                        _raw(src),
+                        arith.constant(0xB1, type=i32),
+                        arith.constant(0xF, type=i32),
+                        arith.constant(0xF, type=i32),
+                        arith.constant(True, type=ir.IntegerType.get_signless(1)),
+                    ],
+                    [],
+                    [],
+                )
+            )
+            return _max_u32(src, peer)
+
+        def _max_u32_dpp_xor2(src):
+            peer = ArithValue(
+                llvm.call_intrinsic(
+                    i32,
+                    "llvm.amdgcn.update.dpp.i32",
+                    [
+                        _raw(src),
+                        _raw(src),
+                        arith.constant(0x4E, type=i32),
+                        arith.constant(0xF, type=i32),
+                        arith.constant(0xF, type=i32),
+                        arith.constant(True, type=ir.IntegerType.get_signless(1)),
+                    ],
+                    [],
+                    [],
+                )
+            )
+            return _max_u32(src, peer)
 
         def inline_quant_load_half(k_tile: int, b128: int):
             lane_div4 = (lane_id // arith.constant(4, index=True)) % arith.constant(4, index=True)
@@ -762,14 +816,11 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
         def inline_quant_finish_half(a_slot: int, k_tile: int, b128: int, h4):
             lane_div4 = (lane_id // arith.constant(4, index=True)) % arith.constant(4, index=True)
             lane_mod4 = lane_id % arith.constant(4, index=True)
-            local_amax = c0_i32
+            hm = []
             bf16_pairs = []
             for j in range_constexpr(4):
                 w = ArithValue(vector.extract(h4, static_position=[j], dynamic_position=[]))
-                lo_abs = (w & cffff_i32) & c7fff_i32
-                hi_abs = (w >> c16_i32) & c7fff_i32
-                local_amax = _max_u32(local_amax, lo_abs)
-                local_amax = _max_u32(local_amax, hi_abs)
+                hm.append(w & c7fff7fff_i32)
                 bf16_pairs.append(
                     vector.bitcast(
                         vec2_bf16,
@@ -777,10 +828,14 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
                     )
                 )
 
-            peer1 = local_amax.shuffle_xor(c1_i32, c64_i32)
-            local_amax = _max_u32(local_amax, peer1)
-            peer2 = local_amax.shuffle_xor(c2_i32, c64_i32)
-            local_amax = _max_u32(local_amax, peer2)
+            m01 = _pkmax_u16(hm[0], hm[1])
+            m23 = _pkmax_u16(hm[2], hm[3])
+            m0123 = _pkmax_u16(m01, m23)
+            lo_abs = m0123 & cffff_i32
+            hi_abs = m0123 >> c16_i32
+            local_amax = _max_u32(lo_abs, hi_abs)
+            local_amax = _max_u32_dpp_xor1(local_amax)
+            local_amax = _max_u32_dpp_xor2(local_amax)
 
             f32bits = local_amax << c16_i32
             bexp = ((f32bits + c0x200000_i32) >> c23_i32) & arith.constant(255, type=i32)
@@ -963,8 +1018,7 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
                 slot_b = offset % k_stages
                 next_k_tile = offset + k_stages
                 write_slot = next_k_tile % a_stages
-                rocdl.s_waitcnt(0)
-                gpu.barrier()
+                _barrier(lgkmcnt=0)
                 a_scale = load_a_scale_tile(offset)
                 h4_0 = inline_quant_load_half(next_k_tile, 0)
                 h4_1 = inline_quant_load_half(next_k_tile, 1)
@@ -987,8 +1041,7 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
                 k_tile = num_k_tiles - k_stages + tail
                 read_slot = k_tile % a_stages
                 slot_b = k_tile % k_stages
-                rocdl.s_waitcnt(0)
-                gpu.barrier()
+                _barrier(lgkmcnt=0)
                 a_scale = load_a_scale_tile(k_tile)
                 acc = compute_tile(
                     acc,
