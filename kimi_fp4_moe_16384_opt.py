@@ -409,7 +409,7 @@ def compile_kimi_mxfp4_gemm1_16384():
     # Output scale layout consumed by GEMM2 for K=INTER_DIM=512.
     k_out_as_per_chunk_dw = ((INTER_DIM // 32) // 4 // 2) * 64
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v11"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v21"
 
     @flyc.kernel(name=module_name)
     def gemm1(
@@ -939,6 +939,10 @@ def compile_kimi_mxfp4_gemm1_16384():
             c23_i32 = arith.constant(23, type=i32)
             c254_i32 = arith.constant(254, type=i32)
             c0x200000_i32 = arith.constant(0x200000, type=i32)
+            fm_fast = arith.FastMathFlags.fast
+
+            def _fmax_num(a, b):
+                return ArithValue(arith.MaxNumFOp(arith._to_raw(a), arith._to_raw(b), fastmath=fm_fast).result)
 
             for mi in range_constexpr(m_repeat):
                 row_base = arith.constant(mi * 16, index=True) + lane_div_16 * arith.constant(4, index=True)
@@ -1000,12 +1004,12 @@ def compile_kimi_mxfp4_gemm1_16384():
                     res = _silu_mul(gate_v, up_v)
                     result_vals.append(res)
                     abs_v = llvm.call_intrinsic(f32, "llvm.fabs.f32", [res], [], [])
-                    local_max = arith.maximumf(local_max, abs_v)
+                    local_max = _fmax_num(local_max, abs_v)
 
                 peer1 = _dpp_xor_f32(local_max, 1)
-                local_max = arith.maximumf(local_max, peer1)
+                local_max = _fmax_num(local_max, peer1)
                 peer2 = _dpp_xor_f32(local_max, 2)
-                local_max = arith.maximumf(local_max, peer2)
+                local_max = _fmax_num(local_max, peer2)
 
                 amax_i32 = local_max.bitcast(i32)
                 quant_scale = (amax_i32 + c0x200000_i32).bitcast(f32) * c025_f32

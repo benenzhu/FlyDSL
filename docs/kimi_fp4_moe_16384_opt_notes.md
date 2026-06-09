@@ -1060,3 +1060,79 @@ Next optimization targets:
 3. Treat the Python-level GEMM1 schedule as close to the current ceiling until
    a lowering/pass or targeted inline-asm change removes static instruction
    differences.
+
+## Relaxed-Correctness GEMM1 v21
+
+The correctness target was relaxed from bit-exact replacement to cosine-level
+similarity. Under that target, v21 keeps the v11 schedule and changes only the
+epilogue max reduction used for MXFP4 scale selection:
+
+```python
+arith.maximumf(...)
+```
+
+becomes:
+
+```python
+arith.MaxNumFOp(..., fastmath=arith.FastMathFlags.fast)
+```
+
+This aligns the generated max instructions more closely with aiter and removes
+the `v_maximum3_f32` sequence from FlyDSL GEMM1.
+
+ATT static comparison:
+
+| group | aiter | FlyDSL v11 | FlyDSL v21 |
+| --- | ---: | ---: | ---: |
+| total instructions | 4368 | 4480 | 4480 |
+| `v_mfma` | 1792 | 1792 | 1792 |
+| `buffer_load_dwordx4` | 340 | 340 | 340 |
+| `buffer_load_dword` | 68 | 68 | 68 |
+| `global_load` | 4 | 4 | 4 |
+| `v_maximum3` | 0 | 48 | 0 |
+| `v_max3_f32` | 24 | 0 | 32 |
+| `v_max_f32` | 40 | 0 | 16 |
+| `s_waitcnt` | 320 | 375 | 375 |
+| `s_barrier` | 30 | 31 | 31 |
+
+The full buffer-load variant breakdown remains exactly matched in v21:
+
+| buffer-load variant | count |
+| --- | ---: |
+| `buffer_load_dword lds,offen` | 12 |
+| `buffer_load_dword offen` | 4 |
+| `buffer_load_dword offen,offset` | 52 |
+| `buffer_load_dwordx4 lds,offen` | 116 |
+| `buffer_load_dwordx4 offen` | 56 |
+| `buffer_load_dwordx4 offen,offset` | 168 |
+
+Measurements on GPU 6:
+
+```text
+CUDA_VISIBLE_DEVICES=6 /opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_opt_gemm1 \
+  --warmup 8 --graph-iters 40 --measure 40
+
+local_mxfp4_opt_gemm1_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_opt_gemm1_vs_aiter_mxfp4_max_abs=0.000000
+aiter_mxfp4_moe_us=1811.1
+local_mxfp4_opt_gemm1_us=1833.2
+```
+
+Sanity rerun:
+
+```text
+CUDA_VISIBLE_DEVICES=6 /opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_opt_gemm1 \
+  --warmup 5 --graph-iters 20 --measure 20
+
+local_mxfp4_opt_gemm1_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_opt_gemm1_vs_aiter_mxfp4_max_abs=0.000000
+aiter_mxfp4_moe_us=1814.4
+local_mxfp4_opt_gemm1_us=1836.7
+```
+
+A direct global-store experiment (`v23`) was also tested to mimic aiter's
+`global_store` epilogue instead of FlyDSL `buffer_store`. It was not retained:
+it produced `cos=0.999992`, `max_abs=1.007812`, and `local_mxfp4_opt_gemm1_us=1841.0`
+in a short graph run.
