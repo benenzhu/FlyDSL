@@ -16,6 +16,8 @@ RUNNER_ORDER = (
     "allfly",
 )
 
+DEFAULT_REPEAT = 5
+
 
 def _time_fn(fn, args):
     samples = []
@@ -101,7 +103,7 @@ def main():
         type=int,
         default=b.DEFAULT_GRAPH_WARMUP_REPLAYS,
     )
-    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--repeat", type=int, default=DEFAULT_REPEAT)
     parser.add_argument("--eager", action="store_true")
     parser.add_argument("--no-check", action="store_true")
     args = parser.parse_args()

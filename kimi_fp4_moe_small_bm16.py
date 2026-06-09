@@ -42,6 +42,7 @@ from kimi_fp4_moe_16384 import (
 from kimi_fp4_moe_16384_opt import (
     _extract_global_ptr,
     _global_load_i32,
+    _global_load_i32_vec,
     _global_load_f32,
     _ptr_buffer_resource,
     _global_store_f32,
@@ -202,7 +203,7 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
     allocator.ptr = lds_scratch_offset + 16 * 4
 
     @flyc.kernel(
-        name="flydsl_kimi_mxfp4_sort_zero_init_NE385_TOPK9_H7168_BM16_v0",
+        name="flydsl_kimi_mxfp4_sort_zero_init_NE385_TOPK9_H7168_BM16_v2",
         known_block_size=[threads, 1, 1],
     )
     def sort_zero_init(
@@ -272,12 +273,22 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
             m_idx = ArithValue(i32_m).index_cast(T.index)
             total_pairs_idx = m_idx * arith.constant(TOPK, index=True)
 
-            count_loop = scf.ForOp(tx, total_pairs_idx, c_threads_idx)
+            # Supported BM16 M buckets are multiples of 4, so TOPK routes are
+            # 4-aligned. Match aiter's int4 count path instead of issuing one
+            # scalar global load per route.
+            count_loop = scf.ForOp(
+                tx * arith.constant(4, index=True),
+                total_pairs_idx,
+                c_threads_idx * arith.constant(4, index=True),
+            )
             with ir.InsertionPoint(count_loop.body):
                 idx = count_loop.induction_variable
-                idx_i32 = arith.index_cast(i32, idx)
-                eid = _global_load_i32(topk_ptr, idx_i32)
-                _lds_atomic_add_i32(count, eid, c1_i32)
+                ids = _global_load_i32_vec(topk_ptr, idx, 4)
+                for lane in range_constexpr(4):
+                    eid = ArithValue(
+                        vector.extract(ids, static_position=[lane], dynamic_position=[])
+                    )
+                    _lds_atomic_add_i32(count, eid, c1_i32)
                 scf.YieldOp([])
             gpu.barrier()
 
@@ -330,24 +341,36 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
                 scf.YieldOp([])
             gpu.barrier()
 
-            place_loop = scf.ForOp(tx, total_pairs_idx, c_threads_idx)
+            token_id_init = tx_i32 // c_topk
+            topk_id_init = tx_i32 % c_topk
+            place_loop = scf.ForOp(
+                tx,
+                total_pairs_idx,
+                c_threads_idx,
+                [arith._to_raw(token_id_init), arith._to_raw(topk_id_init)],
+            )
             with ir.InsertionPoint(place_loop.body):
                 idx = place_loop.induction_variable
+                token_id = ArithValue(place_loop.inner_iter_args[0])
+                topk_id = ArithValue(place_loop.inner_iter_args[1])
                 idx_i32 = arith.index_cast(i32, idx)
                 eid = ArithValue(_global_load_i32(topk_ptr, idx_i32))
                 eid_idx = eid.index_cast(T.index)
                 pos = _lds_atomic_add_i32(counter, eid, c1_i32)
                 start = ArithValue(memref.load(cumsum, [eid_idx]))
                 sp = start + pos
-                token_id = idx_i32 // c_topk
-                topk_id = idx_i32 % c_topk
                 packed_id = (token_id & c_token_mask) | (topk_id << c_topk_shift)
                 route_w = _global_load_f32(weight_ptr, idx_i32)
                 _global_store_i32(sorted_ptr, sp, packed_id)
                 _global_store_i32(mindices_ptr, sp, token_id & c_token_mask)
                 _global_store_f32(sorted_weight_ptr, sp, route_w)
                 _global_store_i32(reverse_ptr, idx_i32, sp)
-                scf.YieldOp([])
+                next_token_id = token_id + arith.constant(threads // TOPK, type=i32)
+                next_topk_id = topk_id + arith.constant(threads % TOPK, type=i32)
+                carry = arith.cmpi(CmpIPredicate.sge, next_topk_id, c_topk)
+                next_topk_id = arith.select(carry, next_topk_id - c_topk, next_topk_id)
+                next_token_id = arith.select(carry, next_token_id + c1_i32, next_token_id)
+                scf.YieldOp([arith._to_raw(next_token_id), arith._to_raw(next_topk_id)])
             gpu.barrier()
 
             pad_valid = arith.cmpi(CmpIPredicate.ult, tx, c_experts_idx)
@@ -1355,7 +1378,7 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
     lds_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_offset + max(lds_a_bytes, lds_acc_bytes)
 
-    module_name = "flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v2"
+    module_name = "flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v3"
 
     @flyc.kernel(name=module_name)
     def gemm2_atomic(
@@ -1384,7 +1407,7 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
         a_scale_rsrc = _ptr_buffer_resource(arg_inter_sorted_scale, a_scale_nbytes)
         b_q_rsrc = _ptr_buffer_resource(arg_w, b_q_nbytes)
         b_scale_rsrc = _ptr_buffer_resource(arg_w_scale, b_scale_nbytes)
-        out_rsrc = _ptr_buffer_resource(arg_out, out_nbytes)
+        out_ptr = _extract_global_ptr(arg_out)
         expert_ptr = _extract_global_ptr(arg_sorted_expert_ids)
         cumsum_ptr = _extract_global_ptr(arg_cumsum_tensor)
         sorted_token_ptr = _extract_global_ptr(arg_sorted_token_ids)
@@ -1688,12 +1711,20 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
                             + arith.constant(s_idx * 64, type=i32)
                         )
                         byte_off = elem_off * c2_i32
-                        rocdl.raw_ptr_buffer_atomic_fadd(
-                            frag,
-                            out_rsrc,
-                            byte_off,
-                            zero_i32,
-                            zero_i32,
+                        byte_off_i64 = arith.ExtSIOp(i64, arith._to_raw(byte_off)).result
+                        atomic_ptr = buffer_ops.get_element_ptr(
+                            out_ptr,
+                            byte_offset=byte_off_i64,
+                            elem_type=T.i8,
+                        )
+                        frag_v = frag.ir_value() if hasattr(frag, "ir_value") else frag
+                        llvm.AtomicRMWOp(
+                            llvm.AtomicBinOp.fadd,
+                            atomic_ptr,
+                            frag_v,
+                            llvm.AtomicOrdering.monotonic,
+                            syncscope="agent",
+                            alignment=4,
                         )
                     scf.YieldOp([])
 

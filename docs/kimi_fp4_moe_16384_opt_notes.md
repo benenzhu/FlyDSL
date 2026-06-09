@@ -2305,3 +2305,96 @@ than the earlier `~3 us` snapshot, while M=128 still has a meaningful gap.  The
 remaining GEMM2 difference is now more likely in the atomic epilogue form
 (`buffer_atomic_pk_add_bf16` vs aiter's `global_atomic_pk_add_bf16`) and/or the
 exact wait scheduling around the epilogue, rather than the A-load staging.
+
+## Small-M BM16 Stable Bench / Profiler Defaults
+
+`bench_small_bm16.py` now defaults to `repeat=5` on top of the long graph
+timing inherited from `bench.py`:
+
+```text
+warmup=200 graph_iters=5000 measure=101 graph_warmup_replays=10 repeat=5
+```
+
+This is intentionally slow. A repeat-3 run before the default was raised showed
+why repeated captures are needed: most samples are tight, but individual graph
+captures can still produce outliers.
+
+```text
+/opt/venv/bin/python bench_small_bm16.py -M 4,8,16,32,64,128
+```
+
+| M | aiter | sort_aiter | gemm1fly_aiter | allfly | sort delta | GEMM1 delta | GEMM2 delta | cos all |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 39.250 us | 40.235 us | 41.192 us | 42.650 us | +0.985 us | +0.957 us | +1.459 us | 0.999996483 |
+| 8 | 58.433 us | 59.186 us | 59.749 us | 61.833 us | +0.753 us | +0.563 us | +2.083 us | 0.999998450 |
+| 16 | 97.599 us | 97.425 us | 99.425 us | 100.636 us | -0.174 us | +2.000 us | +1.210 us | 0.999998927 |
+| 32 | 146.151 us | 147.739 us | 150.295 us | 152.101 us | +1.588 us | +2.556 us | +1.806 us | 0.999998868 |
+| 64 | 200.347 us | 204.580 us | 210.103 us | 210.362 us | +4.234 us | +5.522 us | +0.259 us | 0.999998212 |
+| 128 | 251.843 us | 254.975 us | 261.167 us | 265.062 us | +3.132 us | +6.192 us | +3.895 us | 0.999999166 |
+
+The long graph bench is the end-to-end timing source, but per-stage deltas are
+still sensitive to adjacent runner noise. `profile_small_bm16.py` was added to
+profile the graph replay directly as three kernel bodies per logical iteration:
+
+```text
+/opt/venv/bin/python profile_small_bm16.py -M 64,128
+```
+
+The profiler default is deliberately shorter than the bench default
+(`warmup=20 graph_iters=20 replays=5 repeat=5`). Longer profiler windows caused
+ROCProfiler event drops for `M=128`; the shorter window keeps the event sequence
+complete while still averaging 100 logical iterations per sample.
+
+## Small-M BM16 Sort v2 and GEMM2 v3
+
+Sort changes:
+
+- `flydsl_kimi_mxfp4_sort_zero_init_NE385_TOPK9_H7168_BM16_v2`
+- Count phase now matches aiter's `int4` route-id load path.
+- Place phase carries `token_id/topk_id` through the loop, avoiding per-route
+  division/modulo and matching aiter's `place_tokens` update pattern.
+
+GEMM2 change:
+
+- `flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v3`
+- Replace `raw_ptr_buffer_atomic_fadd` with LLVM `atomicrmw fadd` on the global
+  pointer, which lowers to `global_atomic_pk_add_bf16`.
+- ISA check:
+
+```text
+v2: buffer_atomic_pk_add_bf16
+v3: global_atomic_pk_add_bf16
+aiter: global_atomic_pk_add_bf16
+```
+
+Correctness sweep:
+
+```text
+M=4   cos=0.999997497 max_abs=0.031250
+M=8   cos=0.999997735 max_abs=0.031250
+M=16  cos=0.999998033 max_abs=0.023438
+M=32  cos=0.999998331 max_abs=0.031250
+M=64  cos=0.999998808 max_abs=0.015625
+M=128 cos=0.999999166 max_abs=0.031250
+min_cos=0.999997497
+```
+
+Latest graph-profiler median over 5 samples:
+
+| M | stage | aiter | allfly | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | sort_zero_init | 4.945 us | 7.064 us | +2.118 us |
+| 64 | GEMM1 | 134.625 us | 135.204 us | +0.579 us |
+| 64 | GEMM2 | 66.341 us | 67.899 us | +1.558 us |
+| 64 | total | 205.865 us | 210.209 us | +4.344 us |
+| 128 | sort_zero_init | 6.339 us | 8.491 us | +2.152 us |
+| 128 | GEMM1 | 164.029 us | 169.704 us | +5.674 us |
+| 128 | GEMM2 | 81.698 us | 86.086 us | +4.388 us |
+| 128 | total | 252.123 us | 264.297 us | +12.173 us |
+
+Interpretation: v2/v3 are correct and statically closer to aiter. The sort
+changes only give small profiler movement, so the remaining sort gap is probably
+not just scalar route counting or div/mod. The global-atomic GEMM2 form matches
+aiter ISA, but the measured GEMM2 gap remains meaningful, especially at `M=128`.
+The next work should look at GEMM1/GEMM2 resource scheduling and exact wait/DS
+traffic rather than only the atomic opcode form.
