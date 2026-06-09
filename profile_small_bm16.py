@@ -8,11 +8,13 @@ from torch.profiler import ProfilerActivity, profile
 
 
 STAGE_NAMES = ("sort_zero_init", "GEMM1", "GEMM2")
-DEFAULT_PROFILE_WARMUP = 1000
+# Keep the profiler graph window bounded: larger single profiler windows have
+# dropped CUDA kernel events on this stack. Use many accepted samples instead.
+DEFAULT_PROFILE_WARMUP = 2000
 DEFAULT_PROFILE_GRAPH_ITERS = 64
 DEFAULT_PROFILE_REPLAYS = 2
-DEFAULT_PROFILE_REPEAT = 101
-DEFAULT_PROFILE_MAX_RETRIES = 1500
+DEFAULT_PROFILE_REPEAT = 201
+DEFAULT_PROFILE_MAX_RETRIES = 4000
 
 
 def _is_cuda_event(evt) -> bool:

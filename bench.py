@@ -27,16 +27,16 @@ class Shape:
 
 KIMI = Shape(NE=385, H=7168, INTER=512, TOPK=9)
 
-# Accuracy-first benchmark defaults. Small-M MoE paths are tens of
-# microseconds, so keep the graph window and replay sample count large enough
-# to amortize event/replay overhead. Override these down only for quick smoke
-# tests or very large-M sweeps.
-DEFAULT_WARMUP = 2000
-DEFAULT_EAGER_ITERS = 50000
-DEFAULT_GRAPH_ITERS = 20000
-DEFAULT_GRAPH_MEASURE = 301
-DEFAULT_GRAPH_WARMUP_REPLAYS = 80
-DEFAULT_REPEAT = 5
+# Accuracy-first benchmark defaults. Small-M MoE paths are short enough that
+# CUDA-event and graph-replay noise can move the conclusion, so default to many
+# captured calls, replay measurements, and independent graph captures. Override
+# these down only for quick smoke tests or exploratory large-M sweeps.
+DEFAULT_WARMUP = 5000
+DEFAULT_EAGER_ITERS = 100000
+DEFAULT_GRAPH_ITERS = 32768
+DEFAULT_GRAPH_MEASURE = 701
+DEFAULT_GRAPH_WARMUP_REPLAYS = 160
+DEFAULT_REPEAT = 11
 
 # mxfp4 tuned dispatch per token bucket (from kimik2_5_mxfp4_tuned_fmoe.csv).
 # (M_max, block_m, g1_suffix, g2_suffix)
@@ -308,7 +308,11 @@ def main():
         if len(samples) <= 1:
             return ""
         body = ",".join(f"{sample:.1f}" for sample in samples)
-        return f" samples_us={body} range_us={min(samples):.1f}..{max(samples):.1f}"
+        return (
+            f" samples_us={body}"
+            f" range_us={min(samples):.1f}..{max(samples):.1f}"
+            f" stdev_us={statistics.stdev(samples):.1f}"
+        )
 
     timing_mode = (
         f"cudagraph replay ({args.graph_iters}/graph, "

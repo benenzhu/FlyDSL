@@ -2406,28 +2406,28 @@ the kernels are short and launch/event overhead can otherwise move the conclusio
 
 ```text
 bench.py shared defaults:
-  warmup=2000
-  eager_iters=50000
-  graph_iters=20000
-  measure=301
-  graph_warmup_replays=80
-  repeat=5
-
-bench_small_bm16.py defaults:
   warmup=5000
   eager_iters=100000
   graph_iters=32768
-  measure=501
+  measure=701
   graph_warmup_replays=160
-  repeat=21
+  repeat=11
+
+bench_small_bm16.py defaults:
+  warmup=10000
+  eager_iters=200000
+  graph_iters=49152
+  measure=701
+  graph_warmup_replays=240
+  repeat=31
 
 profile_small_bm16.py defaults:
-  warmup=1000
+  warmup=2000
   graph_iters=64
   replays=2
   logical_iters_per_sample=128
-  repeat=101
-  max_retries=1500
+  repeat=201
+  max_retries=4000
 ```
 
 Use the default commands for final comparison:
@@ -2439,11 +2439,11 @@ Use the default commands for final comparison:
 
 For smoke checks only, override these values explicitly with small numbers.
 The defaults are intentionally slow: for BM16 the end-to-end bench measures
-`32768 * 501` graph calls per sample and reports 21 independent samples. The
-profiler uses `64 * 2` logical graph iterations per sample and `repeat=101`.
+`49152 * 701` graph calls per sample and reports 31 independent graph captures.
+The profiler uses `64 * 2` logical graph iterations per sample and `repeat=201`.
 This keeps the profiler sample window in the previously stable event-capture
-range, while still increasing the total number of graph-replay observations for
-small kernels.
+range, while increasing the total number of graph-replay observations for small
+kernels.
 
 `bench.py` now also has a `--repeat` loop and prints the per-backend timing
 samples. This makes the root sweep usable for final conclusions without relying
@@ -2649,6 +2649,11 @@ replays=2
 repeat=101
 max_retries=1500
 ```
+
+The retained window was later kept at `graph_iters=64, replays=2`, but the
+default was raised to `warmup=2000`, `repeat=201`, and `max_retries=4000` so
+the small-kernel profiler conclusions use more accepted graph samples without
+reintroducing incomplete event streams from a larger single profiler window.
 
 With a development repeat of 21, the current v8/v3 all-FlyDSL baseline remains:
 
