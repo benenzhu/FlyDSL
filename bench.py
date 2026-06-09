@@ -1,4 +1,5 @@
 import argparse
+import statistics
 import time
 from dataclasses import dataclass
 import os
@@ -30,11 +31,12 @@ KIMI = Shape(NE=385, H=7168, INTER=512, TOPK=9)
 # microseconds, so keep the graph window and replay sample count large enough
 # to amortize event/replay overhead. Override these down only for quick smoke
 # tests or very large-M sweeps.
-DEFAULT_WARMUP = 500
-DEFAULT_EAGER_ITERS = 10000
-DEFAULT_GRAPH_ITERS = 10000
-DEFAULT_GRAPH_MEASURE = 201
-DEFAULT_GRAPH_WARMUP_REPLAYS = 20
+DEFAULT_WARMUP = 2000
+DEFAULT_EAGER_ITERS = 50000
+DEFAULT_GRAPH_ITERS = 20000
+DEFAULT_GRAPH_MEASURE = 301
+DEFAULT_GRAPH_WARMUP_REPLAYS = 80
+DEFAULT_REPEAT = 5
 
 # mxfp4 tuned dispatch per token bucket (from kimik2_5_mxfp4_tuned_fmoe.csv).
 # (M_max, block_m, g1_suffix, g2_suffix)
@@ -273,35 +275,56 @@ def main():
     ap.add_argument("--graph-warmup-replays", type=int,
                     default=DEFAULT_GRAPH_WARMUP_REPLAYS,
                     help="full-graph replays before CUDA-event measurement")
+    ap.add_argument("--repeat", type=int, default=DEFAULT_REPEAT,
+                    help="independent timing samples; median is reported")
     ap.add_argument("--ref-max-M", type=int, default=16385,
                     help="run torch_moe ground-truth ref for M<=this (slow on large "
                          "M since torch_moe loops over experts in python).")
     args = ap.parse_args()
+    if args.repeat <= 0:
+        raise ValueError("--repeat must be positive")
 
     device = torch.device("cuda")
     shape = KIMI
     Ms = [int(x) for x in args.M_list.split(",")]
     def time_fn(fn):
-        if args.cudagraph:
-            return bench_cudagraph(
-                fn,
-                warmup=args.warmup,
-                iters=args.graph_iters,
-                measure=args.measure,
-                graph_warmup_replays=args.graph_warmup_replays,
-            )
-        return bench(fn, warmup=args.warmup, iters=args.iters)
+        samples = []
+        for _ in range(args.repeat):
+            if args.cudagraph:
+                samples.append(
+                    bench_cudagraph(
+                        fn,
+                        warmup=args.warmup,
+                        iters=args.graph_iters,
+                        measure=args.measure,
+                        graph_warmup_replays=args.graph_warmup_replays,
+                    )
+                )
+            else:
+                samples.append(bench(fn, warmup=args.warmup, iters=args.iters))
+        return float(statistics.median(samples)), samples
+
+    def sample_text(samples):
+        if len(samples) <= 1:
+            return ""
+        body = ",".join(f"{sample:.1f}" for sample in samples)
+        return f" samples_us={body} range_us={min(samples):.1f}..{max(samples):.1f}"
 
     timing_mode = (
         f"cudagraph replay ({args.graph_iters}/graph, "
         f"warmup={args.warmup}, measure={args.measure}, "
-        f"graph_warmup_replays={args.graph_warmup_replays})"
+        f"graph_warmup_replays={args.graph_warmup_replays}, "
+        f"measured_calls_per_sample={args.graph_iters * args.measure}, "
+        f"measured_calls_per_backend={args.graph_iters * args.measure * args.repeat})"
         if args.cudagraph
-        else f"eager perf_counter (warmup={args.warmup}, iters={args.iters})"
+        else (
+            f"eager perf_counter (warmup={args.warmup}, iters={args.iters}, "
+            f"measured_calls_per_backend={args.iters * args.repeat})"
+        )
     )
 
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"Timing: {timing_mode}")
+    print(f"Timing: {timing_mode} repeat={args.repeat}")
     print(f"Shape Kimi-K2.5 TP=4: NE={shape.NE} H={shape.H} "
           f"INTER={shape.INTER} TOPK={shape.TOPK}")
     print("Preparing weights (once)...", flush=True)
@@ -360,14 +383,16 @@ def main():
             fly_ref_cos = (cosine(out.float(), ref_out)
                            if finite and ref_out is not None else float("nan"))
             print(f"bench flydsl, M={M} mx⋅fly={fly_mx_cos:.4f} fly⋅ref={fly_ref_cos:.4f}")
-            fly_us = time_fn(f_fn)
+            fly_us, fly_samples = time_fn(f_fn)
+            print(f"flydsl M={M} median_us={fly_us:.1f}{sample_text(fly_samples)}")
             fly_ok = True
         except Exception as e:
             print(f"  [flydsl M={M}] ERROR: {type(e).__name__}: {e}", flush=True)
 
         try:
             print(f"bench mxfp4, M={M} bm={mx_bm} mx⋅ref={mx_ref_cos:.4f}")
-            mx_us = time_fn(mx_fn)
+            mx_us, mx_samples = time_fn(mx_fn)
+            print(f"mxfp4 M={M} median_us={mx_us:.1f}{sample_text(mx_samples)}")
         except Exception as e:
             print(f"{M:>6} | mxfp4 timing ERROR: {type(e).__name__}: {e} — skipping")
             continue

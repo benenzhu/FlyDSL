@@ -16,12 +16,12 @@ RUNNER_ORDER = (
     "allfly",
 )
 
-DEFAULT_SMALL_WARMUP = 2000
-DEFAULT_SMALL_EAGER_ITERS = 50000
-DEFAULT_SMALL_GRAPH_ITERS = 20000
-DEFAULT_SMALL_GRAPH_MEASURE = 301
-DEFAULT_SMALL_GRAPH_WARMUP_REPLAYS = 80
-DEFAULT_REPEAT = 11
+DEFAULT_SMALL_WARMUP = 5000
+DEFAULT_SMALL_EAGER_ITERS = 100000
+DEFAULT_SMALL_GRAPH_ITERS = 32768
+DEFAULT_SMALL_GRAPH_MEASURE = 501
+DEFAULT_SMALL_GRAPH_WARMUP_REPLAYS = 160
+DEFAULT_REPEAT = 21
 
 
 def _time_fn(fn, args):
@@ -46,7 +46,11 @@ def _fmt_samples(samples):
     if len(samples) <= 1:
         return ""
     body = ",".join(f"{sample:.3f}" for sample in samples)
-    return f" samples={body}"
+    return (
+        f" samples={body}"
+        f" range_us={min(samples):.3f}..{max(samples):.3f}"
+        f" stdev_us={statistics.stdev(samples):.3f}"
+    )
 
 
 def _make_runners(shape, m, hidden, topk_ids, topk_weight, weights, device):

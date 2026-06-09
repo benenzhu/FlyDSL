@@ -2406,27 +2406,28 @@ the kernels are short and launch/event overhead can otherwise move the conclusio
 
 ```text
 bench.py shared defaults:
-  warmup=500
-  eager_iters=10000
-  graph_iters=10000
-  measure=201
-  graph_warmup_replays=20
-
-bench_small_bm16.py defaults:
   warmup=2000
   eager_iters=50000
   graph_iters=20000
   measure=301
   graph_warmup_replays=80
-  repeat=11
+  repeat=5
+
+bench_small_bm16.py defaults:
+  warmup=5000
+  eager_iters=100000
+  graph_iters=32768
+  measure=501
+  graph_warmup_replays=160
+  repeat=21
 
 profile_small_bm16.py defaults:
-  warmup=300
-  graph_iters=128
-  replays=4
-  logical_iters_per_sample=512
-  repeat=41
-  max_retries=500
+  warmup=1000
+  graph_iters=512
+  replays=8
+  logical_iters_per_sample=4096
+  repeat=61
+  max_retries=1000
 ```
 
 Use the default commands for final comparison:
@@ -2438,10 +2439,15 @@ Use the default commands for final comparison:
 
 For smoke checks only, override these values explicitly with small numbers.
 The defaults are intentionally slow: for BM16 the end-to-end bench measures
-`20000 * 301` graph calls per sample. The profiler uses `128 * 4` logical graph
-iterations per sample and `repeat=41`; larger per-sample profiler windows were
-observed to drop CUDA/HIP kernel events in `torch.profiler`, so profiler
-stability is improved by more samples rather than unbounded events per sample.
+`32768 * 501` graph calls per sample and reports 21 independent samples. The
+profiler uses `512 * 8` logical graph iterations per sample and `repeat=61`.
+This keeps the profiler sample window bounded enough to avoid the worst event
+drop behavior, while still giving many more graph-replay kernel observations for
+small kernels.
+
+`bench.py` now also has a `--repeat` loop and prints the per-backend timing
+samples. This makes the root sweep usable for final conclusions without relying
+on a single CUDA-event median.
 
 ## BM16 GEMM2 v4 Packed-Multiply Trial
 
@@ -2539,3 +2545,84 @@ Conclusion: reducing `s_waitcnt` alone did not improve the stable small-M sort
 path. The extra barrier in v3 is harmful at M=128, and v4 did not beat the v2
 baseline. Keep sort v2 for now; the remaining sort gap likely needs ATT/Pmc
 analysis rather than scan-shape tweaks.
+
+## Small-M BM16 GEMM2 ATT Waitcnt Trial
+
+Analyzed the existing FlyDSL GEMM2 v3 ATT trace with
+`.claude/skills/kernel-trace-analysis/scripts/hotspot_analyzer.py`. The trace is
+dominated by VMEM waits rather than MFMA issue:
+
+```text
+VMEM-wait      ~5.01M stall cycles, 50.0%
+VMEM-load      ~3.75M stall cycles, 37.4%
+barrier        ~0.47M stall cycles,  4.7%
+LDS/SMEM-wait  ~0.31M stall cycles,  3.1%
+MFMA/FMA       ~0.08M stall cycles,  0.8%
+```
+
+Largest source-level hotspots:
+
+| rank | source | dominant issue |
+| ---: | --- | --- |
+| 1 | GEMM2 epilogue sorted-token wait (`line ~1672`) | `s_waitcnt vmcnt(0)` |
+| 2 | B tile loads (`mfma_preshuffle_pipeline.py:83`) | `buffer_load_dwordx4` |
+| 3 | GEMM2 precompute wait (`line ~1637`) | full `s_waitcnt` before barrier |
+| 4 | GEMM2 epilogue weight/LDS wait (`line ~1704`) | `s_waitcnt vmcnt(0) lgkmcnt(0)` |
+
+Two partial-wait experiments were tried and rejected:
+
+- v5/v6: replace the precompute full `s_waitcnt(0); s_barrier` with partial
+  waits around `vmcnt(23/22)` and `vmcnt(20/19)`. Both produced finite outputs
+  but poor cosine, so the waits were not strong enough for the current FlyDSL
+  instruction ordering.
+- v7: add aiter-style per-MFMA descending `vmcnt` waits while keeping the current
+  FlyDSL compute loop shape. This also failed correctness. The aiter schedule
+  interleaves LDS reads, barriers, and MFMA in a different order; the wait
+  counts cannot be transplanted without matching that order.
+
+Keep GEMM2 v3 for now. A correct GEMM2 waitcnt optimization needs a full
+schedule rewrite to mirror aiter's LDS-read/MFMA sequence, not only local
+wait-count edits.
+
+## Small-M BM16 GEMM1 v8 Epilogue Amax Cleanup
+
+Changed GEMM1 requant epilogue to match aiter's local amax pattern: initialize
+`local_max` from `fabs(result[0])` and reduce only results 1..7, instead of
+starting at zero and doing eight `fmax` operations. This is a
+semantics-preserving cleanup of the epilogue dependency chain.
+
+Correctness against aiter remains in the accepted band:
+
+```text
+M=4   cos=0.999996305 max_abs=0.015625
+M=8   cos=0.999998391 max_abs=0.015625
+M=16  cos=0.999998331 max_abs=0.031250
+M=32  cos=0.999998212 max_abs=0.031250
+M=64  cos=0.999998927 max_abs=0.023438
+M=128 cos=0.999998927 max_abs=0.031250
+min_cos=0.999996305
+```
+
+Graph-profiler check (`warmup=300`, `graph_iters=128`, `replays=4`,
+`repeat=5`) showed a small positive movement:
+
+| M | stage | aiter | allfly v8 | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | sort_zero_init | 4.899 us | 7.091 us | +2.191 us |
+| 64 | GEMM1 | 130.791 us | 135.658 us | +4.868 us |
+| 64 | GEMM2 | 65.285 us | 67.807 us | +2.521 us |
+| 64 | total | 200.889 us | 210.606 us | +9.717 us |
+| 128 | sort_zero_init | 6.275 us | 8.453 us | +2.178 us |
+| 128 | GEMM1 | 163.757 us | 169.965 us | +6.208 us |
+| 128 | GEMM2 | 81.784 us | 86.257 us | +4.473 us |
+| 128 | total | 251.823 us | 264.641 us | +12.818 us |
+
+An allfly-only repeat-21 check had noisy M=64 outliers but stable medians:
+
+| M | sort | GEMM1 v8 | GEMM2 | total |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 7.229 us | 135.824 us | 67.880 us | 210.958 us |
+| 128 | 8.652 us | 170.064 us | 86.302 us | 265.016 us |
+
+The improvement is small, but the code is cleaner and statically closer to the
+aiter epilogue, so keep GEMM1 v8.

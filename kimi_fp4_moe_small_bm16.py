@@ -577,7 +577,7 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
     lds_scale_offset = lds_offset + lds_x_bytes
     allocator.ptr = lds_offset + max(lds_x_bytes + lds_scale_bytes, lds_acc_bytes)
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v7"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v8"
 
     @flyc.kernel(name=module_name)
     def gemm1_inline(
@@ -1170,7 +1170,10 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
                 res = _silu_mul(gate_v, up_v)
                 result_vals.append(res)
                 abs_v = llvm.call_intrinsic(f32, "llvm.fabs.f32", [res], [], [])
-                local_max = _fmax_num(local_max, abs_v)
+                if const_expr(e == 0):
+                    local_max = abs_v
+                else:
+                    local_max = _fmax_num(local_max, abs_v)
 
             local_max = _fmax_dpp_xor1(local_max)
             local_max = _fmax_dpp_xor2(local_max)
