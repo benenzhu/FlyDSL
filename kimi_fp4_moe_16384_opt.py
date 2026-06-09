@@ -94,6 +94,54 @@ def _ptr_buffer_resource(ptr, num_records_bytes: int):
     )
 
 
+def _extract_global_ptr(ptr):
+    addr = fx.ptrtoint(ptr)
+    addr_i64 = arith.index_cast(T.i64, addr)
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<1>"), addr_i64)
+
+
+def _global_load_i32(global_ptr, elem_offset):
+    if isinstance(elem_offset, int):
+        elem_offset = arith.constant(elem_offset, type=T.i32)
+    elem_offset_raw = elem_offset.ir_value() if hasattr(elem_offset, "ir_value") else elem_offset
+    if isinstance(elem_offset_raw.type, ir.IndexType):
+        elem_offset_i64 = arith.index_cast(T.i64, elem_offset_raw)
+    else:
+        int_type = ir.IntegerType(elem_offset_raw.type)
+        if int_type.width == 64:
+            elem_offset_i64 = ArithValue(elem_offset_raw)
+        else:
+            elem_offset_i64 = ArithValue(arith.ExtSIOp(T.i64, elem_offset_raw).result)
+    byte_offset_i64 = elem_offset_i64 * arith.constant(4, type=T.i64)
+    ptr = buffer_ops.get_element_ptr(global_ptr, byte_offset=byte_offset_i64, elem_type=T.i8)
+    return llvm.LoadOp(T.i32, ptr, alignment=4).result
+
+
+def _dpp_xor_f32(src, offset: int):
+    src_i32 = src.bitcast(T.i32) if hasattr(src, "bitcast") else ArithValue(src).bitcast(T.i32)
+    if offset == 1:
+        dpp_ctrl = 0xB1
+    elif offset == 2:
+        dpp_ctrl = 0x4E
+    else:
+        raise ValueError(f"unsupported DPP xor offset: {offset}")
+    out_i32 = llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.update.dpp.i32",
+        [
+            src_i32,
+            src_i32,
+            arith.constant(dpp_ctrl, type=T.i32),
+            arith.constant(0xF, type=T.i32),
+            arith.constant(0xF, type=T.i32),
+            arith.constant(False, type=ir.IntegerType.get_signless(1)),
+        ],
+        [],
+        [],
+    )
+    return out_i32.bitcast(T.f32)
+
+
 @functools.lru_cache(maxsize=1)
 def compile_kimi_mxfp4_scatter_reduce_q_16384():
     """Compile the fixed Kimi mxfp4 scatter/reduce-q kernel.
@@ -361,7 +409,7 @@ def compile_kimi_mxfp4_gemm1_16384():
     # Output scale layout consumed by GEMM2 for K=INTER_DIM=512.
     k_out_as_per_chunk_dw = ((INTER_DIM // 32) // 4 // 2) * 64
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v5"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v7"
 
     @flyc.kernel(name=module_name)
     def gemm1(
@@ -390,9 +438,9 @@ def compile_kimi_mxfp4_gemm1_16384():
         w_rsrc = _ptr_buffer_resource(arg_w, w_nbytes)
         sx_rsrc = _ptr_buffer_resource(arg_a_scale_sorted, x_scale_nbytes)
         sw_rsrc = _ptr_buffer_resource(arg_w_scale, w_scale_nbytes)
-        expert_rsrc = _ptr_buffer_resource(arg_expert_ids, expert_nbytes)
-        m_indices_rsrc = _ptr_buffer_resource(arg_m_indices, m_indices_nbytes)
-        numids_rsrc = _ptr_buffer_resource(arg_num_valid_ids, numids_nbytes)
+        expert_ptr = _extract_global_ptr(arg_expert_ids)
+        m_indices_ptr = _extract_global_ptr(arg_m_indices)
+        numids_ptr = _extract_global_ptr(arg_num_valid_ids)
 
         tx = gpu.thread_id("x")
         by = gpu.block_id("x")
@@ -400,16 +448,11 @@ def compile_kimi_mxfp4_gemm1_16384():
         bx_m = bx * arith.constant(tile_m, index=True)
         bx_m_i32 = arith.index_cast(i32, bx_m)
 
-        num_valid_i32 = buffer_ops.buffer_load(
-            numids_rsrc,
-            arith.constant(0, index=True),
-            vec_width=1,
-            dtype=i32,
-        )
+        num_valid_i32 = _global_load_i32(numids_ptr, 0)
         num_valid_i32 = rocdl.ReadfirstlaneOp(i32, num_valid_i32).res
         blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
 
-        expert_i32 = buffer_ops.buffer_load(expert_rsrc, bx, vec_width=1, dtype=i32)
+        expert_i32 = _global_load_i32(expert_ptr, bx)
         expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
         exp_valid = arith.cmpi(CmpIPredicate.ult, expert_i32, arith.constant(EXPERTS, type=i32))
         do_gemm = arith.andi(blk_valid, exp_valid)
@@ -478,7 +521,7 @@ def compile_kimi_mxfp4_gemm1_16384():
             x_row_local.append(row_local)
             x_col_local_i32.append(col_local_i32)
             sorted_row_i = bx_m + row_local
-            actual_row = buffer_ops.buffer_load(m_indices_rsrc, sorted_row_i, vec_width=1, dtype=i32)
+            actual_row = _global_load_i32(m_indices_ptr, sorted_row_i)
             row_ok = arith.cmpi(CmpIPredicate.ult, actual_row, arith.constant(TOKEN, type=i32))
             # aiter lets invalid padded rows read one-past the A buffer; MUBUF
             # OOB returns zero, which keeps padded inter rows zero.
@@ -579,7 +622,6 @@ def compile_kimi_mxfp4_gemm1_16384():
         def compute_tile(acc_in, lds_x_tile, b_tile_in, a_scale, b_scale):
             acc_list = list(acc_in)
             for k_idx in range_constexpr(k_unroll):
-                ikxdl = k_idx
                 b_packs0, b_packs1 = b_tile_in[k_idx]
                 col_base = col_offset_base + arith.constant(k_idx * 128 // a_elem_vec_pack, index=True)
                 for mi in range_constexpr(m_repeat_packed):
@@ -607,9 +649,52 @@ def compile_kimi_mxfp4_gemm1_16384():
                                         acc_list[acc_idx],
                                         cbsz,
                                         blgp,
-                                        ikxdl * _scale_pack_m + imxdl,
+                                        k_idx * _scale_pack_m + imxdl,
                                         a_scale_val,
-                                        ikxdl * _scale_pack_n + inxdl,
+                                        k_idx * _scale_pack_n + inxdl,
+                                        b_scale_val,
+                                    ],
+                                )
+            return acc_list
+
+        def compute_tile_jmajor(acc_in, lds_x_tile, b_tile_in, a_scale, b_scale):
+            acc_list = list(acc_in)
+            a_pairs = []
+            for k_idx in range_constexpr(k_unroll):
+                col_base = col_offset_base + arith.constant(k_idx * 128 // a_elem_vec_pack, index=True)
+                for mi_idx in range_constexpr(m_repeat):
+                    curr_row_a_lds = row_a_lds + arith.constant(mi_idx * 16, index=True)
+                    a0, a1 = lds_load_packs_k64(lds_x_tile, curr_row_a_lds, col_base)
+                    a_pairs.append(pack_i64x4_to_i32x8(a0, a1, c0_i64, c0_i64))
+
+            for ni in range_constexpr(num_acc_n_packed):
+                b_scale_i32 = b_scale[ni]
+                b_scale_val = vector.extract(b_scale_i32, static_position=[0], dynamic_position=[])
+                for inxdl in range_constexpr(pack_N):
+                    ni_idx = ni * pack_N + inxdl
+                    for mi in range_constexpr(m_repeat_packed):
+                        a_scale_i32 = a_scale[mi]
+                        a_scale_val = vector.extract(a_scale_i32, static_position=[0], dynamic_position=[])
+                        for imxdl in range_constexpr(pack_M):
+                            mi_idx = mi * pack_M + imxdl
+                            acc_idx = mi_idx * num_acc_n + ni_idx
+                            for k_idx in range_constexpr(k_unroll):
+                                b_packs0, b_packs1 = b_tile_in[k_idx]
+                                b0 = b_packs0[ni_idx]
+                                b1 = b_packs1[ni_idx]
+                                b128 = pack_i64x4_to_i32x8(b0, b1, c0_i64, c0_i64)
+                                a128 = a_pairs[k_idx * m_repeat + mi_idx]
+                                acc_list[acc_idx] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+                                    vec4_f32,
+                                    [
+                                        a128,
+                                        b128,
+                                        acc_list[acc_idx],
+                                        cbsz,
+                                        blgp,
+                                        k_idx * _scale_pack_m + imxdl,
+                                        a_scale_val,
+                                        k_idx * _scale_pack_n + inxdl,
                                         b_scale_val,
                                     ],
                                 )
@@ -727,7 +812,7 @@ def compile_kimi_mxfp4_gemm1_16384():
                     b_scale_next = load_b_scale_tile(k_tile + 1)
 
                 curr_slot = k_tile % 2
-                acc = compute_tile(acc, lds_x_slots[curr_slot], b_tile, a_scale, b_scale)
+                acc = compute_tile_jmajor(acc, lds_x_slots[curr_slot], b_tile, a_scale, b_scale)
 
                 if const_expr(k_tile + 1 < num_k_tiles):
                     # Only the next raw A->LDS loads must be complete before
@@ -818,9 +903,9 @@ def compile_kimi_mxfp4_gemm1_16384():
                     abs_v = llvm.call_intrinsic(f32, "llvm.fabs.f32", [res], [], [])
                     local_max = arith.maximumf(local_max, abs_v)
 
-                peer1 = local_max.shuffle_xor(c1_i32, arith.constant(64, type=i32))
+                peer1 = _dpp_xor_f32(local_max, 1)
                 local_max = arith.maximumf(local_max, peer1)
-                peer2 = local_max.shuffle_xor(c2_i32, arith.constant(64, type=i32))
+                peer2 = _dpp_xor_f32(local_max, 2)
                 local_max = arith.maximumf(local_max, peer2)
 
                 amax_i32 = local_max.bitcast(i32)
