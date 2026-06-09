@@ -8,6 +8,11 @@ from torch.profiler import ProfilerActivity, profile
 
 
 STAGE_NAMES = ("sort_zero_init", "GEMM1", "GEMM2")
+DEFAULT_PROFILE_WARMUP = 100
+DEFAULT_PROFILE_GRAPH_ITERS = 64
+DEFAULT_PROFILE_REPLAYS = 16
+DEFAULT_PROFILE_REPEAT = 9
+DEFAULT_PROFILE_MAX_RETRIES = 200
 
 
 def _is_cuda_event(evt) -> bool:
@@ -240,11 +245,11 @@ def main():
         default="aiter,sort_aiter,gemm1fly_aiter,allfly",
         help=f"comma-separated subset of: {','.join(small.RUNNER_ORDER)}",
     )
-    parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--graph-iters", type=int, default=20)
-    parser.add_argument("--replays", type=int, default=5)
-    parser.add_argument("--repeat", type=int, default=5)
-    parser.add_argument("--max-retries", type=int, default=80)
+    parser.add_argument("--warmup", type=int, default=DEFAULT_PROFILE_WARMUP)
+    parser.add_argument("--graph-iters", type=int, default=DEFAULT_PROFILE_GRAPH_ITERS)
+    parser.add_argument("--replays", type=int, default=DEFAULT_PROFILE_REPLAYS)
+    parser.add_argument("--repeat", type=int, default=DEFAULT_PROFILE_REPEAT)
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_PROFILE_MAX_RETRIES)
     parser.add_argument("--expected-kernels", type=int, default=3)
     parser.add_argument("--trace-dir", default=None)
     args = parser.parse_args()

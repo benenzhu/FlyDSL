@@ -2398,3 +2398,98 @@ not just scalar route counting or div/mod. The global-atomic GEMM2 form matches
 aiter ISA, but the measured GEMM2 gap remains meaningful, especially at `M=128`.
 The next work should look at GEMM1/GEMM2 resource scheduling and exact wait/DS
 traffic rather than only the atomic opcode form.
+
+## Accuracy-First BM16 Measurement Defaults
+
+The small-M BM16 timing scripts now default to longer graph measurements because
+the kernels are short and launch/event overhead can otherwise move the conclusion:
+
+```text
+bench.py shared defaults:
+  warmup=500
+  eager_iters=10000
+  graph_iters=10000
+  measure=201
+  graph_warmup_replays=20
+
+bench_small_bm16.py defaults:
+  warmup=1000
+  eager_iters=20000
+  graph_iters=10000
+  measure=201
+  graph_warmup_replays=30
+  repeat=9
+
+profile_small_bm16.py defaults:
+  warmup=100
+  graph_iters=64
+  replays=16
+  logical_iters_per_sample=1024
+  repeat=9
+  max_retries=200
+```
+
+Use the default commands for final comparison:
+
+```text
+/opt/venv/bin/python bench_small_bm16.py -M 4,8,16,32,64,128
+/opt/venv/bin/python profile_small_bm16.py -M 64,128
+```
+
+For smoke checks only, override these values explicitly with small numbers.
+
+## BM16 GEMM2 v4 Packed-Multiply Trial
+
+Tried replacing GEMM2 v3's epilogue route-weight multiply from two scalar
+`v_mul_f32` instructions per bf16 pair to one inline-asm `v_pk_mul_f32`.
+
+Correctness against aiter remained within the accepted cosine band:
+
+```text
+M=4   cos=0.999997199 max_abs=0.031250
+M=8   cos=0.999997437 max_abs=0.031250
+M=16  cos=0.999997318 max_abs=0.015625
+M=32  cos=0.999998748 max_abs=0.031250
+M=64  cos=0.999998152 max_abs=0.031250
+M=128 cos=0.999999046 max_abs=0.023438
+min_cos=0.999997199
+```
+
+ISA moved closer to aiter:
+
+```text
+v3: v_pk_mul_f32=0, v_mul_f32=16, s_waitcnt=17, VGPR=98, SGPR=34, spills=0
+v4: v_pk_mul_f32=8, v_mul_f32=0,  s_waitcnt=19, VGPR=98, SGPR=34, spills=0
+```
+
+Graph-profiler medians with the longer default profiler window:
+
+| M | stage | aiter | allfly v4 | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | sort_zero_init | 4.907 us | 7.026 us | +2.119 us |
+| 64 | GEMM1 | 130.719 us | 135.476 us | +4.757 us |
+| 64 | GEMM2 | 65.340 us | 67.746 us | +2.405 us |
+| 64 | total | 200.713 us | 210.226 us | +9.513 us |
+| 128 | sort_zero_init | 6.248 us | 8.420 us | +2.172 us |
+| 128 | GEMM1 | 163.551 us | 169.731 us | +6.180 us |
+| 128 | GEMM2 | 81.690 us | 86.114 us | +4.423 us |
+| 128 | total | 251.468 us | 264.259 us | +12.791 us |
+
+Conclusion: v4 is correct and statically closer, but does not produce a
+stable runtime win over v3. The two extra `s_waitcnt` instructions appear to
+erase the scalar-multiply reduction. Reverted to GEMM2 v3 as the current stable
+performance baseline.
+
+Current v3 baseline with the longer profiler defaults (`warmup=100`,
+`graph_iters=64`, `replays=16`, `repeat=9`):
+
+| M | stage | aiter | allfly v3 | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | sort_zero_init | 4.953 us | 7.057 us | +2.103 us |
+| 64 | GEMM1 | 135.529 us | 136.310 us | +0.781 us |
+| 64 | GEMM2 | 65.772 us | 68.188 us | +2.417 us |
+| 64 | total | 207.244 us | 211.560 us | +4.316 us |
+| 128 | sort_zero_init | 6.273 us | 8.423 us | +2.150 us |
+| 128 | GEMM1 | 164.476 us | 170.508 us | +6.032 us |
+| 128 | GEMM2 | 82.186 us | 86.617 us | +4.431 us |
+| 128 | total | 252.823 us | 265.521 us | +12.698 us |

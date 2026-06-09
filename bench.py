@@ -26,14 +26,15 @@ class Shape:
 
 KIMI = Shape(NE=385, H=7168, INTER=512, TOPK=9)
 
-# Small-M MoE paths are tens of microseconds, so keep the default benchmark
-# deliberately long: amortize event/replay overhead and report a median across
-# many full-graph replays. Measurement time is less important than stability.
-DEFAULT_WARMUP = 200
-DEFAULT_EAGER_ITERS = 5000
-DEFAULT_GRAPH_ITERS = 5000
-DEFAULT_GRAPH_MEASURE = 101
-DEFAULT_GRAPH_WARMUP_REPLAYS = 10
+# Accuracy-first benchmark defaults. Small-M MoE paths are tens of
+# microseconds, so keep the graph window and replay sample count large enough
+# to amortize event/replay overhead. Override these down only for quick smoke
+# tests or very large-M sweeps.
+DEFAULT_WARMUP = 500
+DEFAULT_EAGER_ITERS = 10000
+DEFAULT_GRAPH_ITERS = 10000
+DEFAULT_GRAPH_MEASURE = 201
+DEFAULT_GRAPH_WARMUP_REPLAYS = 20
 
 # mxfp4 tuned dispatch per token bucket (from kimik2_5_mxfp4_tuned_fmoe.csv).
 # (M_max, block_m, g1_suffix, g2_suffix)

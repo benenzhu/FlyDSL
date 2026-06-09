@@ -16,7 +16,12 @@ RUNNER_ORDER = (
     "allfly",
 )
 
-DEFAULT_REPEAT = 5
+DEFAULT_SMALL_WARMUP = 1000
+DEFAULT_SMALL_EAGER_ITERS = 20000
+DEFAULT_SMALL_GRAPH_ITERS = 10000
+DEFAULT_SMALL_GRAPH_MEASURE = 201
+DEFAULT_SMALL_GRAPH_WARMUP_REPLAYS = 30
+DEFAULT_REPEAT = 9
 
 
 def _time_fn(fn, args):
@@ -94,14 +99,14 @@ def _make_runners(shape, m, hidden, topk_ids, topk_weight, weights, device):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-M", "--M-list", default="4,8,16,32,64,128")
-    parser.add_argument("--warmup", type=int, default=b.DEFAULT_WARMUP)
-    parser.add_argument("--iters", type=int, default=b.DEFAULT_EAGER_ITERS)
-    parser.add_argument("--graph-iters", type=int, default=b.DEFAULT_GRAPH_ITERS)
-    parser.add_argument("--measure", type=int, default=b.DEFAULT_GRAPH_MEASURE)
+    parser.add_argument("--warmup", type=int, default=DEFAULT_SMALL_WARMUP)
+    parser.add_argument("--iters", type=int, default=DEFAULT_SMALL_EAGER_ITERS)
+    parser.add_argument("--graph-iters", type=int, default=DEFAULT_SMALL_GRAPH_ITERS)
+    parser.add_argument("--measure", type=int, default=DEFAULT_SMALL_GRAPH_MEASURE)
     parser.add_argument(
         "--graph-warmup-replays",
         type=int,
-        default=b.DEFAULT_GRAPH_WARMUP_REPLAYS,
+        default=DEFAULT_SMALL_GRAPH_WARMUP_REPLAYS,
     )
     parser.add_argument("--repeat", type=int, default=DEFAULT_REPEAT)
     parser.add_argument("--eager", action="store_true")
@@ -120,7 +125,8 @@ def main():
         if args.eager
         else (
             f"graph warmup={args.warmup} graph_iters={args.graph_iters} "
-            f"measure={args.measure} graph_warmup_replays={args.graph_warmup_replays}"
+            f"measure={args.measure} graph_warmup_replays={args.graph_warmup_replays} "
+            f"measured_calls_per_sample={args.graph_iters * args.measure}"
         )
     )
     print(f"GPU: {b.torch.cuda.get_device_name(0)}")
