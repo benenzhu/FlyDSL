@@ -1847,3 +1847,63 @@ local_mxfp4_all_flydsl_us=1864.2
 Interpretation: `scatter_reduce` is now faster than aiter in the graph-profiler
 breakdown.  `sort_place_pad` improved by about 1 us but is still roughly
 2-2.5 us slower than aiter, so the next sort-side work should focus there.
+
+## Sort Place v5 Dynamic Placement Loop
+
+Current saved sort placement kernel:
+
+```text
+flydsl_kimi_mxfp4_sort_place_pad_NE385_TOPK9_M16384_BM128_v5_placeloop
+```
+
+Change from v4:
+
+- Keep the raw global I/O and aiter-like phase order from v4.
+- Replace the compile-time unrolled real-token placement loop with one dynamic
+  `scf.ForOp(c_start + tx, end, 1024)`.
+- Keep the padding loop compile-time unrolled.  A dynamic padding-loop
+  experiment did not improve the graph-profiler timing.
+
+Rejected follow-up:
+
+- `v6_exactend` removed the `min(c_start + per_cta, total_pairs)` end bound
+  because this shape has exactly `16 * 9216 == 16384 * 9` routed pairs.  It was
+  slower in the graph profiler, so the saved version keeps the v5 bound form.
+
+Graph replay profiler median over 5 valid samples:
+
+```text
+/opt/venv/bin/python profile_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl --max-retries 10
+```
+
+| stage | aiter | FlyDSL v5 | delta |
+| --- | ---: | ---: | ---: |
+| sort_count | 6.0 us | 6.4 us | +0.5 us |
+| sort_cumsum | 10.2 us | 9.7 us | -0.5 us |
+| sort_place_pad | 31.9 us | 32.9 us | +1.0 us |
+| quant | 58.8 us | 59.4 us | +0.6 us |
+| sort_scales | 55.1 us | 54.9 us | -0.2 us |
+| GEMM1 | 698.9 us | 710.9 us | +12.0 us |
+| GEMM2 | 859.9 us | 858.2 us | -1.6 us |
+| scatter_reduce | 134.5 us | 130.5 us | -4.1 us |
+| total kernel sum | 1855.0 us | 1863.3 us | +8.3 us |
+
+Default graph replay end-to-end timing:
+
+```text
+/opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl
+
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+aiter_mxfp4_moe_samples_us=1864.9,1856.7,1853.7 range_us=1853.7..1864.9
+aiter_mxfp4_moe_us=1856.7
+local_mxfp4_all_flydsl_samples_us=1862.3,1863.3,1862.6 range_us=1862.3..1863.3
+local_mxfp4_all_flydsl_us=1862.6
+```
+
+Interpretation: v5 recovers most of the previous `sort_place_pad` gap, from
+roughly +2-3 us down to about +1 us in graph replay profiling.  The all-FlyDSL
+path still launches the same 8 kernels as aiter; the remaining graph-profiler
+gap is mostly `GEMM1`, with `sort_place_pad` now a smaller residual item.

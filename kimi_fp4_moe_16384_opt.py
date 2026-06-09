@@ -2076,7 +2076,7 @@ def compile_kimi_mxfp4_sort_16384():
             scf.YieldOp([])
 
     @flyc.kernel(
-        name="flydsl_kimi_mxfp4_sort_place_pad_NE385_TOPK9_M16384_BM128_v4_globalio",
+        name="flydsl_kimi_mxfp4_sort_place_pad_NE385_TOPK9_M16384_BM128_v5_placeloop",
         known_block_size=[threads, 1, 1],
     )
     def sort_place_pad(
@@ -2143,23 +2143,21 @@ def compile_kimi_mxfp4_sort_16384():
         c_end = c_start + arith.constant(per_cta, index=True)
         c_total = arith.constant(total_pairs, index=True)
         end = arith.select(arith.cmpi(CmpIPredicate.ult, c_end, c_total), c_end, c_total)
-        for it in range_constexpr((per_cta + threads - 1) // threads):
-            idx = c_start + tx + arith.constant(it * threads, index=True)
-            valid = arith.cmpi(CmpIPredicate.ult, idx, end)
-            _if = scf.IfOp(valid)
-            with ir.InsertionPoint(_if.then_block):
-                idx_i32 = arith.index_cast(i32, idx)
-                eid = ArithValue(_global_load_i32(topk_ptr, idx_i32))
-                sp = _lds_atomic_add_i32(local_offsets, eid, c1_i32)
-                token_id = idx_i32 // c_topk
-                topk_id = idx_i32 % c_topk
-                packed_id = (token_id & c_mask_token) | (topk_id << c_topk_shift)
-                w = _global_load_f32(topk_weight_ptr, idx_i32)
-                _global_store_i32(sorted_ptr, sp, packed_id)
-                _global_store_i32(mindices_ptr, sp, token_id & c_mask_token)
-                _global_store_f32(weights_ptr, sp, w)
-                _global_store_i32(reverse_ptr, idx_i32, sp)
-                scf.YieldOp([])
+        place_loop = scf.ForOp(c_start + tx, end, c_threads_idx)
+        with ir.InsertionPoint(place_loop.body):
+            idx = place_loop.induction_variable
+            idx_i32 = arith.index_cast(i32, idx)
+            eid = ArithValue(_global_load_i32(topk_ptr, idx_i32))
+            sp = _lds_atomic_add_i32(local_offsets, eid, c1_i32)
+            token_id = idx_i32 // c_topk
+            topk_id = idx_i32 % c_topk
+            packed_id = (token_id & c_mask_token) | (topk_id << c_topk_shift)
+            w = _global_load_f32(topk_weight_ptr, idx_i32)
+            _global_store_i32(sorted_ptr, sp, packed_id)
+            _global_store_i32(mindices_ptr, sp, token_id & c_mask_token)
+            _global_store_f32(weights_ptr, sp, w)
+            _global_store_i32(reverse_ptr, idx_i32, sp)
+            scf.YieldOp([])
 
         gpu.barrier()
 
