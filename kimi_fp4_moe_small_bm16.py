@@ -577,7 +577,7 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
     lds_scale_offset = lds_offset + lds_x_bytes
     allocator.ptr = lds_offset + max(lds_x_bytes + lds_scale_bytes, lds_acc_bytes)
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v8"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v9"
 
     @flyc.kernel(name=module_name)
     def gemm1_inline(
@@ -938,6 +938,14 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
         cbsz = 4
         blgp = 4
 
+        def load_a128_tile(a_slot: int):
+            a128_vals = []
+            for k_idx in range_constexpr(k_unroll):
+                col_base = col_offset_base + arith.constant(k_idx * 64, index=True)
+                a0, a1 = lds_load_packs_k64(row_a_lds, col_base, a_slot)
+                a128_vals.append(pack_i64x4_to_i32x8(a0, a1, c0_i64, c0_i64))
+            return a128_vals
+
         def compute_tile(acc_in, b_tile, a_scale, b_scale, a_slot: int):
             acc_list = list(acc_in)
             a_scale_val = vector.extract(a_scale, static_position=[0], dynamic_position=[])
@@ -970,15 +978,11 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
                         )
             return acc_list
 
-        def compute_tile_prefetch_b(acc_in, b_tile, a_scale, b_scale, a_slot: int, next_k_tile: int):
+        def compute_tile_prefetch_b(acc_in, b_tile, a128_vals, a_scale, b_scale, next_k_tile: int):
             acc_list = list(acc_in)
             a_scale_val = vector.extract(a_scale, static_position=[0], dynamic_position=[])
-            a128_vals = []
             next_b_tile = []
             for k_idx in range_constexpr(k_unroll):
-                col_base = col_offset_base + arith.constant(k_idx * 64, index=True)
-                a0, a1 = lds_load_packs_k64(row_a_lds, col_base, a_slot)
-                a128_vals.append(pack_i64x4_to_i32x8(a0, a1, c0_i64, c0_i64))
                 next_b_tile.append(([], []))
 
             for ni in range_constexpr(num_acc_n // 2):
@@ -1082,6 +1086,7 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
                 next_k_tile = offset + k_stages
                 write_slot = next_k_tile % a_stages
                 _barrier(lgkmcnt=0)
+                a128_vals = load_a128_tile(read_slot)
                 a_scale = load_a_scale_tile(offset)
                 h4_0 = inline_quant_load_half(next_k_tile, 0)
                 h4_1 = inline_quant_load_half(next_k_tile, 1)
@@ -1089,9 +1094,9 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
                 acc, next_b_tile = compute_tile_prefetch_b(
                     acc,
                     b_stages[slot_b],
+                    a128_vals,
                     a_scale,
                     b_scale_stages[slot_b],
-                    read_slot,
                     next_k_tile,
                 )
                 b_scale_stages[slot_b] = load_b_scale_tile(next_k_tile)

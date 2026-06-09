@@ -2685,3 +2685,56 @@ Rejected follow-ups:
 Keep GEMM1 v8 and GEMM2 v3 as the stable BM16 kernel baselines.  The next
 useful GEMM1 work likely needs deeper schedule/resource changes rather than
 small launch or epilogue reshaping.
+
+## BM16 GEMM1 v9 A-Read Hoist
+
+Moved the main-loop A LDS reads for the BM16 inline-quant GEMM1 out of
+`compute_tile_prefetch_b()` and into the loop body immediately after the LDS
+barrier, before the inline hidden-state quant loads.  This matches the aiter
+ordering more closely: barrier, A ds-read, A-scale ds-read, hidden load/quant,
+then MFMA cluster.
+
+Correctness against aiter remained within the accepted cosine band:
+
+```text
+M=4   cos=0.999997437 max_abs=0.015625
+M=8   cos=0.999998808 max_abs=0.015625
+M=16  cos=0.999998629 max_abs=0.015625
+M=32  cos=0.999998689 max_abs=0.023438
+M=64  cos=0.999998569 max_abs=0.031250
+M=128 cos=0.999999046 max_abs=0.031250
+```
+
+Static GEMM1 ISA counts moved in the intended direction:
+
+```text
+                 aiter   FlyDSL v8   FlyDSL v9
+s_waitcnt          126        150         126
+v_mfma             224        224         224
+buffer_load        336        336         336
+DS read             88         88          88
+DS write            92         92          92
+s_barrier           30         30          30
+s_setprio          208        208         208
+```
+
+Long graph-profiler check using the current default profiler settings
+(`warmup=2000`, `graph_iters=64`, `replays=2`, `repeat=201`) measured:
+
+| M | stage | aiter | allfly v9 | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 64 | sort_zero_init | 5.157 us | 7.272 us | +2.115 us |
+| 64 | GEMM1 v9 | 130.773 us | 135.489 us | +4.716 us |
+| 64 | GEMM2 v3 | 65.227 us | 67.720 us | +2.493 us |
+| 64 | total | 201.152 us | 210.503 us | +9.352 us |
+| 128 | sort_zero_init | 6.627 us | 8.662 us | +2.035 us |
+| 128 | GEMM1 v9 | 163.527 us | 169.310 us | +5.784 us |
+| 128 | GEMM2 v3 | 81.570 us | 85.976 us | +4.405 us |
+| 128 | total | 251.730 us | 263.970 us | +12.240 us |
+
+Conclusion: v9 is retained.  It removes the static extra waitcnts and gives a
+small, stable M=128 GEMM1 improvement, but the remaining GEMM1 gap is not simply
+static waitcnt count.  The next target is the residual hot-loop wait placement
+and dataflow: FlyDSL still has an early `s_waitcnt vmcnt(2)` between the first
+pair of MFMA instructions in the first cluster, while aiter waits differently
+before entering that pair.
