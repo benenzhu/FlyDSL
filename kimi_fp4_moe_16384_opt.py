@@ -117,6 +117,54 @@ def _global_load_i32(global_ptr, elem_offset):
     return llvm.LoadOp(T.i32, ptr, alignment=4).result
 
 
+def _elem_offset_to_i64(elem_offset):
+    if isinstance(elem_offset, int):
+        return arith.constant(elem_offset, type=T.i64)
+    elem_offset_raw = elem_offset.ir_value() if hasattr(elem_offset, "ir_value") else elem_offset
+    if isinstance(elem_offset_raw.type, ir.IndexType):
+        return arith.index_cast(T.i64, elem_offset_raw)
+    int_type = ir.IntegerType(elem_offset_raw.type)
+    if int_type.width == 64:
+        return ArithValue(elem_offset_raw)
+    return ArithValue(arith.ExtSIOp(T.i64, elem_offset_raw).result)
+
+
+def _global_atomic_add_i32(global_ptr, elem_offset, value):
+    elem_offset_i64 = _elem_offset_to_i64(elem_offset)
+    byte_offset_i64 = elem_offset_i64 * arith.constant(4, type=T.i64)
+    ptr = buffer_ops.get_element_ptr(global_ptr, byte_offset=byte_offset_i64, elem_type=T.i8)
+    val = value.ir_value() if hasattr(value, "ir_value") else value
+    return llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add,
+        ptr,
+        val,
+        llvm.AtomicOrdering.monotonic,
+        syncscope="agent",
+        alignment=4,
+    ).result
+
+
+def _lds_i32_ptr(lds_memref, elem_offset):
+    elem_offset_i64 = _elem_offset_to_i64(elem_offset)
+    byte_offset_idx = ArithValue(elem_offset_i64 * arith.constant(4, type=T.i64)).index_cast(T.index)
+    base_idx = memref.extract_aligned_pointer_as_index(lds_memref)
+    ptr_i64 = arith.index_cast(T.i64, base_idx + byte_offset_idx)
+    return llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), ptr_i64)
+
+
+def _lds_atomic_add_i32(lds_memref, elem_offset, value):
+    ptr = _lds_i32_ptr(lds_memref, elem_offset)
+    val = value.ir_value() if hasattr(value, "ir_value") else value
+    return llvm.AtomicRMWOp(
+        llvm.AtomicBinOp.add,
+        ptr,
+        val,
+        llvm.AtomicOrdering.monotonic,
+        syncscope="workgroup",
+        alignment=4,
+    ).result
+
+
 def _dpp_xor_f32(src, offset: int):
     src_i32 = src.bitcast(T.i32) if hasattr(src, "bitcast") else ArithValue(src).bitcast(T.i32)
     if offset == 1:
@@ -140,6 +188,30 @@ def _dpp_xor_f32(src, offset: int):
         [],
     )
     return out_i32.bitcast(T.f32)
+
+
+def _dpp_xor_i32(src, offset: int):
+    src_i32 = src if hasattr(src, "ir_value") else ArithValue(src)
+    if offset == 1:
+        dpp_ctrl = 0xB1
+    elif offset == 2:
+        dpp_ctrl = 0x4E
+    else:
+        raise ValueError(f"unsupported DPP xor offset: {offset}")
+    return llvm.call_intrinsic(
+        T.i32,
+        "llvm.amdgcn.update.dpp.i32",
+        [
+            src_i32,
+            src_i32,
+            arith.constant(dpp_ctrl, type=T.i32),
+            arith.constant(0xF, type=T.i32),
+            arith.constant(0xF, type=T.i32),
+            arith.constant(False, type=ir.IntegerType.get_signless(1)),
+        ],
+        [],
+        [],
+    )
 
 
 @functools.lru_cache(maxsize=1)
@@ -1166,9 +1238,9 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
     - B: preshuffled fp4, ``[385, 7168, 512 / 2]``
     - C: packed fp4 plus e8m0 block scales, sorted-row-major
 
-    The initial version uses a simple 2D CTA grid for debuggability.  The aiter
-    kernel uses a persistent 1D grid and AGPR MFMA accumulation; those are the
-    next performance-alignment steps once this path is numerically stable.
+    The current version uses the same 1D persistent CTA grid shape as aiter's
+    nonatomic mxfp4out kernel.  The MFMA and epilogue bodies are still FlyDSL
+    generated and use VGPR accumulators.
     """
 
     tile_m = MXFP4_BLOCK_M
@@ -1178,6 +1250,7 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
     max_sorted = mxfp4_max_sorted_16384()
     num_m_blocks = max_sorted // tile_m
     num_n_blocks = MODEL_DIM // tile_n
+    persistent_ctas = 256
 
     _scale_pack_m = 2
     _scale_pack_n = 2
@@ -1239,7 +1312,13 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
     k_bs_stride_n0_dw = 128
     k_bs_per_expert_dw = (MODEL_DIM // 16 // 2) * k_bs_stride_n0_dw
 
-    module_name = "flydsl_kimi_mxfp4_gemm2_mxfp4out_NE385_H7168_E512_BM128_v0"
+    # Match aiter's nonatomic BM128 path more closely: aiter pins MFMA
+    # accumulators into AGPRs with inline asm.  This hint asks LLVM to reserve
+    # the same AGPR budget and prefer non-VGPR MFMA lowering where possible.
+    gemm2_agpr_value_attrs = {"passthrough": [["amdgpu-agpr-alloc", "128,128"]]}
+    gemm2_agpr_llvm_options = {"amdgpu-mfma-vgpr-form": False}
+
+    module_name = "flydsl_kimi_mxfp4_gemm2_mxfp4out_NE385_H7168_E512_BM128_v8_dppamax"
 
     @flyc.kernel(name=module_name)
     def gemm2_mxfp4out(
@@ -1271,10 +1350,7 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
         numids_rsrc = _ptr_buffer_resource(arg_num_valid_ids, numids_nbytes)
 
         tx = gpu.thread_id("x")
-        by = gpu.block_id("x")
-        bx = gpu.block_id("y")
-        bx_m = bx * arith.constant(tile_m, index=True)
-        bx_m_i32 = arith.index_cast(i32, bx_m)
+        pid = gpu.block_id("x")
 
         num_valid_i32 = buffer_ops.buffer_load(
             numids_rsrc,
@@ -1283,17 +1359,17 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
             dtype=i32,
         )
         num_valid_i32 = rocdl.ReadfirstlaneOp(i32, num_valid_i32).res
-        blk_valid = arith.cmpi(CmpIPredicate.ult, bx_m_i32, num_valid_i32)
-
-        expert_i32 = buffer_ops.buffer_load(expert_rsrc, bx, vec_width=1, dtype=i32)
-        expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
-        exp_valid = arith.cmpi(CmpIPredicate.ult, expert_i32, arith.constant(EXPERTS, type=i32))
-        do_gemm = arith.andi(blk_valid, exp_valid)
 
         base_ptr = allocator.get_base()
         lds_x0 = SmemPtr(base_ptr, lds_x0_offset, T.f8, shape=(_input_elems,)).get()
         lds_x1 = SmemPtr(base_ptr, lds_x1_offset, T.f8, shape=(_input_elems,)).get()
         lds_out = SmemPtr(base_ptr, lds_x0_offset, T.f32, shape=(tile_m * tile_n,)).get()
+        lds_scale_i32 = SmemPtr(
+            base_ptr,
+            lds_scale_offset,
+            T.i32,
+            shape=(_lds_scale_bytes // 4,),
+        ).get()
 
         shape_lds = fx.make_shape(tile_m, _eff_lds_stride)
         stride_lds = fx.make_stride(_eff_lds_stride, 1)
@@ -1310,18 +1386,8 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
         row_a_lds = lane_mod_16
         col_offset_base = lane_div_16 * arith.constant(16, index=True)
         n_tile_base = wave_id * arith.constant(n_per_wave, index=True)
-        by_n = by * arith.constant(tile_n, index=True)
-        expert_b_base = expert_idx * arith.constant(_expert_b_stride, index=True)
 
-        n_intra_list = [None] * num_acc_n
-        n_blk_list = [None] * num_acc_n
-        for ni in range_constexpr(num_acc_n):
-            c_offset = arith.constant(ni * 16, index=True)
-            global_n = by_n + n_tile_base + c_offset + lane_mod_16
-            n_blk_list[ni] = _div_pow2(global_n, 16)
-            n_intra_list[ni] = global_n % arith.constant(16, index=True)
-
-        bytes_per_thread_x = tile_m * tile_k * a_elem_bytes // total_threads
+        bytes_per_thread_x = tile_m * tile_k * a_elem_bytes // a_elem_vec_pack // total_threads
         x_load_bytes = 16
         num_x_loads = bytes_per_thread_x // x_load_bytes
         chunk_i32 = x_load_bytes // 4
@@ -1331,7 +1397,6 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
         tx_i32_base = tx * c_chunk_i32
         c_k_div4 = arith.constant((INTER_DIM // a_elem_vec_pack) // 4, index=True)
 
-        x_row_base_div4 = []
         x_col_local_i32 = []
         x_row_local = []
         for i in range_constexpr(num_x_loads):
@@ -1345,77 +1410,6 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
             )
             x_row_local.append(row_local)
             x_col_local_i32.append(col_local_i32)
-            x_row_base_div4.append((bx_m + row_local) * c_k_div4)
-
-        def load_b_packs_k64(base_k_packed, ku: int, ni: int):
-            k0 = _div_pow2(base_k_packed, 64) + arith.constant(ku, index=True)
-            idx_pack = (
-                expert_b_base
-                + n_blk_list[ni] * arith.constant(_b_stride_n0, index=True)
-                + k0 * arith.constant(_b_stride_k0, index=True)
-                + lane_div_16 * arith.constant(_b_stride_klane, index=True)
-                + n_intra_list[ni] * arith.constant(_b_stride_nlane, index=True)
-            )
-            b16 = _buffer_load_vec(
-                buffer_ops,
-                vector,
-                w_rsrc,
-                idx_pack,
-                elem_type=T.i8,
-                vec_elems=16,
-                elem_bytes=1,
-                offset_in_bytes=True,
-                cache_modifier=0,
-            )
-            b_i64x2 = vector.bitcast(vec2_i64, b16)
-            return (
-                vector.extract(b_i64x2, static_position=[0], dynamic_position=[]),
-                vector.extract(b_i64x2, static_position=[1], dynamic_position=[]),
-            )
-
-        def load_b_tile(base_k_packed):
-            b_tile = []
-            for ku in range_constexpr(k_unroll):
-                packs0 = []
-                packs1 = []
-                for ni in range_constexpr(num_acc_n):
-                    b0, b1 = load_b_packs_k64(base_k_packed, ku, ni)
-                    packs0.append(b0)
-                    packs1.append(b1)
-                b_tile.append((packs0, packs1))
-            return b_tile
-
-        def load_a_scale_tile(scale_k_tile: int):
-            a_scale_tile = []
-            chunk_base = bx_m / arith.constant(32, index=True)
-            lane_word = lane_div_16 * arith.constant(16, index=True) + lane_mod_16
-            for mi in range_constexpr(m_repeat_packed):
-                scale_idx = (
-                    (chunk_base + arith.constant(mi, index=True))
-                    * arith.constant(k_as_per_chunk_dw, index=True)
-                    + arith.constant(scale_k_tile * k_bs_stride_k0_dw, index=True)
-                    + lane_word
-                )
-                s = buffer_ops.buffer_load(sx_rsrc, scale_idx, vec_width=1, dtype=i32)
-                a_scale_tile.append(vector.from_elements(T.vec(1, i32), [s]))
-            return a_scale_tile
-
-        def load_b_scale_tile(scale_k_tile: int):
-            b_scale_tile = []
-            mni_base = by * arith.constant(tile_n // 16 // 2, index=True)
-            mni_base = mni_base + wave_id * arith.constant(n_per_wave // 16 // 2, index=True)
-            lane_word = lane_div_16 * arith.constant(16, index=True) + lane_mod_16
-            for ni in range_constexpr(num_acc_n_packed):
-                scale_idx = (
-                    expert_idx * arith.constant(k_bs_per_expert_dw, index=True)
-                    + (mni_base + arith.constant(ni, index=True))
-                    * arith.constant(k_bs_stride_n0_dw, index=True)
-                    + arith.constant(scale_k_tile * k_bs_stride_k0_dw, index=True)
-                    + lane_word
-                )
-                s = buffer_ops.buffer_load(sw_rsrc, scale_idx, vec_width=1, dtype=i32)
-                b_scale_tile.append(vector.from_elements(T.vec(1, i32), [s]))
-            return b_scale_tile
 
         def lds_load_packs_k64(curr_row_a_lds, col_base, lds_buffer):
             col_base_swz = swizzle_xor16(curr_row_a_lds, col_base, k_blocks16)
@@ -1477,177 +1471,293 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
         _dma_bytes = 16
         _wave_size = 64
 
-        def dma_x_tile_to_lds(base_k, lds_buffer):
-            c4_idx = arith.index(4)
-            base_k_div4 = _div_pow2(_div_pow2(base_k, a_elem_vec_pack), 4)
-            lds_ptr_i64 = None
+        def run_one(work_i32):
+            bx_i32 = work_i32 // arith.constant(num_n_blocks, type=i32)
+            by_i32 = work_i32 % arith.constant(num_n_blocks, type=i32)
+            bx = arith.index_cast(ir.IndexType.get(), bx_i32)
+            by = arith.index_cast(ir.IndexType.get(), by_i32)
+            bx_m_i32 = bx_i32 * arith.constant(tile_m, type=i32)
+            bx_m = arith.index_cast(ir.IndexType.get(), bx_m_i32)
+            by_n = by * arith.constant(tile_n, index=True)
+
+            expert_i32 = buffer_ops.buffer_load(expert_rsrc, bx, vec_width=1, dtype=i32)
+            expert_idx = arith.index_cast(ir.IndexType.get(), expert_i32)
+            expert_b_base = expert_idx * arith.constant(_expert_b_stride, index=True)
+
+            n_intra_list = [None] * num_acc_n
+            n_blk_list = [None] * num_acc_n
+            for ni in range_constexpr(num_acc_n):
+                c_offset = arith.constant(ni * 16, index=True)
+                global_n = by_n + n_tile_base + c_offset + lane_mod_16
+                n_blk_list[ni] = _div_pow2(global_n, 16)
+                n_intra_list[ni] = global_n % arith.constant(16, index=True)
+
+            x_row_base_div4 = []
             for i in range_constexpr(num_x_loads):
-                row_local_i = x_row_local[i]
-                col_local_i32_i = x_col_local_i32[i]
-                col_local_sw = swizzle_xor16(row_local_i, col_local_i32_i * c4_idx, k_blocks16)
-                row_k_dw = x_row_base_div4[i] + base_k_div4
-                global_byte_idx = row_k_dw * c4_idx + col_local_sw
-                global_offset = arith.index_cast(i32, global_byte_idx)
-                if const_expr(i == 0):
-                    lds_addr = (
-                        memref.extract_aligned_pointer_as_index(lds_buffer)
-                        + wave_id * arith.constant(_wave_size * _dma_bytes, index=True)
-                    )
-                    lds_ptr_i64 = rocdl.readfirstlane(i64, arith.index_cast(i64, lds_addr))
-                else:
-                    lds_ptr_i64 = lds_ptr_i64 + arith.constant(total_threads * _dma_bytes, type=i64)
-                lds_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), lds_ptr_i64)
-                rocdl.raw_ptr_buffer_load_lds(
-                    x_rsrc,
-                    lds_ptr,
-                    arith.constant(_dma_bytes, type=i32),
-                    global_offset,
-                    arith.constant(0, type=i32),
-                    arith.constant(0, type=i32),
-                    arith.constant(0, type=i32),
+                x_row_base_div4.append((bx_m + x_row_local[i]) * c_k_div4)
+
+            def load_b_packs_k64(base_k_packed, ku: int, ni: int):
+                k0 = _div_pow2(base_k_packed, 64) + arith.constant(ku, index=True)
+                idx_pack = (
+                    expert_b_base
+                    + n_blk_list[ni] * arith.constant(_b_stride_n0, index=True)
+                    + k0 * arith.constant(_b_stride_k0, index=True)
+                    + lane_div_16 * arith.constant(_b_stride_klane, index=True)
+                    + n_intra_list[ni] * arith.constant(_b_stride_nlane, index=True)
+                )
+                b16 = _buffer_load_vec(
+                    buffer_ops,
+                    vector,
+                    w_rsrc,
+                    idx_pack,
+                    elem_type=T.i8,
+                    vec_elems=16,
+                    elem_bytes=1,
+                    offset_in_bytes=True,
+                    cache_modifier=0,
+                )
+                b_i64x2 = vector.bitcast(vec2_i64, b16)
+                return (
+                    vector.extract(b_i64x2, static_position=[0], dynamic_position=[]),
+                    vector.extract(b_i64x2, static_position=[1], dynamic_position=[]),
                 )
 
-        def _then_body():
-            rocdl.sched_barrier(0)
-            dma_x_tile_to_lds(arith.index(0), lds_x0)
-            dma_x_tile_to_lds(arith.index(tile_k), lds_x1)
-            b_tile0 = load_b_tile(arith.index(0))
-            b_tile1 = load_b_tile(arith.index(tile_k // a_elem_vec_pack))
-            a_scale0 = load_a_scale_tile(0)
-            a_scale1 = load_a_scale_tile(1)
-            b_scale0 = load_b_scale_tile(0)
-            b_scale1 = load_b_scale_tile(1)
-            rocdl.s_waitcnt(0)
-            gpu.barrier()
+            def load_b_tile(base_k_packed):
+                b_tile = []
+                for ku in range_constexpr(k_unroll):
+                    packs0 = []
+                    packs1 = []
+                    for ni in range_constexpr(num_acc_n):
+                        b0, b1 = load_b_packs_k64(base_k_packed, ku, ni)
+                        packs0.append(b0)
+                        packs1.append(b1)
+                    b_tile.append((packs0, packs1))
+                return b_tile
 
-            acc = [arith.constant_vector(0.0, vec4_f32)] * (m_repeat * num_acc_n)
-            acc = compute_tile(acc, b_tile0, lds_x0, a_scale0, b_scale0)
-            acc = compute_tile(acc, b_tile1, lds_x1, a_scale1, b_scale1)
+            lane_word = lane_div_16 * arith.constant(16, index=True) + lane_mod_16
+            scale_slot_dw = arith.constant((tile_m // 32) * (256 // 4), index=True)
+            scale_sub_dw = arith.constant(256 // 4, index=True)
 
-            c0_f32 = arith.constant(0.0, type=f32)
-            c0_i32 = arith.constant(0, type=i32)
-            c1_i32 = arith.constant(1, type=i32)
-            c2_i32 = arith.constant(2, type=i32)
-            c3_i32 = arith.constant(3, type=i32)
-            c8_i32 = arith.constant(8, type=i32)
-            c16_i32 = arith.constant(16, type=i32)
-            c23_i32 = arith.constant(23, type=i32)
-            c255_i32 = arith.constant(255, type=i32)
-            c254_i32 = arith.constant(254, type=i32)
-            c0x200000_i32 = arith.constant(0x200000, type=i32)
+            def stage_a_scale_tile(scale_k_tile: int, slot: int):
+                chunk_base = bx_m // arith.constant(32, index=True)
+                scale_idx = (
+                    (chunk_base + wave_id)
+                    * arith.constant(k_as_per_chunk_dw, index=True)
+                    + arith.constant(scale_k_tile * k_bs_stride_k0_dw, index=True)
+                    + lane_word
+                )
+                s = buffer_ops.buffer_load(sx_rsrc, scale_idx, vec_width=1, dtype=i32)
+                lds_idx = (
+                    arith.constant(slot, index=True) * scale_slot_dw
+                    + wave_id * scale_sub_dw
+                    + lane_word
+                )
+                vector.store(
+                    vector.from_elements(T.vec(1, i32), [s]),
+                    lds_scale_i32,
+                    [lds_idx],
+                    alignment=4,
+                )
 
-            def write_row_to_lds(
-                *,
-                mi: int,
-                ii: int,
-                row_in_tile,
-                row,
-                row_base_lds,
-                col_base_local,
-                num_acc_n: int,
-                lds_out,
-            ):
-                for ni in range_constexpr(num_acc_n):
-                    col_local = col_base_local + arith.constant(ni * 16, index=True)
-                    acc_idx = mi * num_acc_n + ni
-                    v = vector.extract(acc[acc_idx], static_position=[ii], dynamic_position=[])
-                    v1 = vector.from_elements(T.vec(1, f32), [v])
-                    vector.store(v1, lds_out, [row_base_lds + col_local], alignment=4)
+            def load_a_scale_tile(slot: int):
+                a_scale_tile = []
+                for mi in range_constexpr(m_repeat_packed):
+                    lds_idx = (
+                        arith.constant(slot, index=True) * scale_slot_dw
+                        + arith.constant(mi, index=True) * scale_sub_dw
+                        + lane_word
+                    )
+                    s_vec = vector.load_op(T.vec(1, i32), lds_scale_i32, [lds_idx])
+                    s = vector.extract(s_vec, static_position=[0], dynamic_position=[])
+                    a_scale_tile.append(vector.from_elements(T.vec(1, i32), [s]))
+                return a_scale_tile
 
-            def precompute_row(*, row_local, row):
-                row_i32 = arith.index_cast(i32, row)
-                row_valid = arith.cmpi(CmpIPredicate.ult, row_i32, num_valid_i32)
-                return (row, row_valid)
+            def load_b_scale_tile(scale_k_tile: int):
+                b_scale_tile = []
+                mni_base = by * arith.constant(tile_n // 16 // 2, index=True)
+                mni_base = mni_base + wave_id * arith.constant(n_per_wave // 16 // 2, index=True)
+                for ni in range_constexpr(num_acc_n_packed):
+                    scale_idx = (
+                        expert_idx * arith.constant(k_bs_per_expert_dw, index=True)
+                        + (mni_base + arith.constant(ni, index=True))
+                        * arith.constant(k_bs_stride_n0_dw, index=True)
+                        + arith.constant(scale_k_tile * k_bs_stride_k0_dw, index=True)
+                        + lane_word
+                    )
+                    s = buffer_ops.buffer_load(sw_rsrc, scale_idx, vec_width=1, dtype=i32)
+                    b_scale_tile.append(vector.from_elements(T.vec(1, i32), [s]))
+                return b_scale_tile
 
-            def _max_u32(a, b):
-                return arith.select(arith.cmpi(CmpIPredicate.ugt, b, a), b, a)
-
-            def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
-                frag_vals = []
-                for i in range_constexpr(8):
-                    frag_vals.append(vector.extract(frag, static_position=[i], dynamic_position=[]))
-
-                local_max = c0_f32
-                for i in range_constexpr(8):
-                    abs_v = llvm.call_intrinsic(f32, "llvm.fabs.f32", [frag_vals[i]], [], [])
-                    local_max = arith.maximumf(local_max, abs_v)
-
-                # Match aiter: reduce bf16-truncated amax across a 4-lane quad.
-                amax_bf16 = local_max.bitcast(i32) >> c16_i32
-                peer1 = amax_bf16.shuffle_xor(c1_i32, arith.constant(64, type=i32))
-                amax_bf16 = _max_u32(amax_bf16, peer1)
-                peer2 = amax_bf16.shuffle_xor(c2_i32, arith.constant(64, type=i32))
-                amax_bf16 = _max_u32(amax_bf16, peer2)
-
-                f32bits = amax_bf16 << c16_i32
-                bexp = ((f32bits + c0x200000_i32) >> c23_i32) & c255_i32
-                e8m0 = bexp - c2_i32
-                e8m0 = arith.select(arith.cmpi(CmpIPredicate.slt, e8m0, c0_i32), c0_i32, e8m0)
-                e8m0 = arith.select(arith.cmpi(CmpIPredicate.sgt, e8m0, c254_i32), c254_i32, e8m0)
-                quant_scale = (e8m0 << c23_i32).bitcast(f32)
-
-                packed = c0_i32
-                for pair in range_constexpr(4):
-                    packed = ArithValue(
-                        llvm.call_intrinsic(
-                            i32,
-                            "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
-                            [
-                                packed,
-                                frag_vals[2 * pair],
-                                frag_vals[2 * pair + 1],
-                                quant_scale,
-                                arith.constant(pair, type=i32),
-                            ],
-                            [],
-                            [],
+            def dma_x_tile_to_lds(base_k, lds_buffer):
+                c4_idx = arith.index(4)
+                base_k_div4 = _div_pow2(_div_pow2(base_k, a_elem_vec_pack), 4)
+                lds_ptr_i64 = None
+                for i in range_constexpr(num_x_loads):
+                    row_local_i = x_row_local[i]
+                    col_local_i32_i = x_col_local_i32[i]
+                    col_local_sw = swizzle_xor16(row_local_i, col_local_i32_i * c4_idx, k_blocks16)
+                    row_k_dw = x_row_base_div4[i] + base_k_div4
+                    global_byte_idx = row_k_dw * c4_idx + col_local_sw
+                    global_offset = arith.index_cast(i32, global_byte_idx)
+                    if const_expr(i == 0):
+                        lds_addr = (
+                            memref.extract_aligned_pointer_as_index(lds_buffer)
+                            + wave_id * arith.constant(_wave_size * _dma_bytes, index=True)
                         )
+                        lds_ptr_i64 = rocdl.readfirstlane(i64, arith.index_cast(i64, lds_addr))
+                    else:
+                        lds_ptr_i64 = lds_ptr_i64 + arith.constant(total_threads * _dma_bytes, type=i64)
+                    lds_ptr = llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), lds_ptr_i64)
+                    rocdl.raw_ptr_buffer_load_lds(
+                        x_rsrc,
+                        lds_ptr,
+                        arith.constant(_dma_bytes, type=i32),
+                        global_offset,
+                        arith.constant(0, type=i32),
+                        arith.constant(0, type=i32),
+                        arith.constant(0, type=i32),
                     )
 
-                row_i32 = arith.index_cast(i32, row)
-                col_i32 = arith.index_cast(i32, col_g0)
-                q_word_off = row_i32 * arith.constant(MODEL_DIM // 8, type=i32) + (col_i32 >> c3_i32)
-                buffer_ops.buffer_store(packed, q_rsrc, q_word_off, cache_modifier=4)
+            def _then_body():
+                gpu.barrier()
+                rocdl.sched_barrier(0)
+                stage_a_scale_tile(0, 0)
+                stage_a_scale_tile(1, 1)
+                dma_x_tile_to_lds(arith.index(0), lds_x0)
+                dma_x_tile_to_lds(arith.index(tile_k), lds_x1)
+                b_tile0 = load_b_tile(arith.index(0))
+                b_tile1 = load_b_tile(arith.index(tile_k // a_elem_vec_pack))
+                b_scale0 = load_b_scale_tile(0)
+                b_scale1 = load_b_scale_tile(1)
+                rocdl.s_waitcnt(0)
+                gpu.barrier()
+                a_scale0 = load_a_scale_tile(0)
+                a_scale1 = load_a_scale_tile(1)
 
-                lane_in_scale = (col_i32 >> c3_i32) & c3_i32
-                _if_scale = scf.IfOp(arith.cmpi(CmpIPredicate.eq, lane_in_scale, c0_i32))
-                with ir.InsertionPoint(_if_scale.then_block):
-                    scale_off = row_i32 * arith.constant(MODEL_DIM // 32, type=i32) + (col_i32 >> arith.constant(5, type=i32))
-                    e8m0_i8 = arith.TruncIOp(T.i8, e8m0).result
-                    buffer_ops.buffer_store(e8m0_i8, out_scale_rsrc, scale_off, cache_modifier=4)
-                    scf.YieldOp([])
+                acc = [arith.constant_vector(0.0, vec4_f32)] * (m_repeat * num_acc_n)
+                acc = compute_tile(acc, b_tile0, lds_x0, a_scale0, b_scale0)
+                acc = compute_tile(acc, b_tile1, lds_x1, a_scale1, b_scale1)
 
-            c_shuffle_epilog(
-                arith=arith,
-                vector=vector,
-                gpu=gpu,
-                scf=scf,
-                range_constexpr=range_constexpr,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                e_vec=8,
-                cshuffle_nlane=32,
-                block_size=total_threads,
-                m_repeat=m_repeat,
-                num_acc_n=num_acc_n,
-                tx=tx,
-                lane_div_16=lane_div_16,
-                lane_mod_16=lane_mod_16,
-                bx_m=bx_m,
-                by_n=by_n,
-                n_tile_base=n_tile_base,
-                lds_out=lds_out,
-                frag_elem_type=ir.F32Type.get(),
-                write_row_to_lds=write_row_to_lds,
-                precompute_row=precompute_row,
-                store_pair=store_pair,
-            )
+                c0_f32 = arith.constant(0.0, type=f32)
+                c0_i32 = arith.constant(0, type=i32)
+                c1_i32 = arith.constant(1, type=i32)
+                c2_i32 = arith.constant(2, type=i32)
+                c3_i32 = arith.constant(3, type=i32)
+                c8_i32 = arith.constant(8, type=i32)
+                c16_i32 = arith.constant(16, type=i32)
+                c23_i32 = arith.constant(23, type=i32)
+                c255_i32 = arith.constant(255, type=i32)
+                c254_i32 = arith.constant(254, type=i32)
+                c0x200000_i32 = arith.constant(0x200000, type=i32)
 
-        _if_valid = scf.IfOp(do_gemm)
-        with ir.InsertionPoint(_if_valid.then_block):
+                def write_row_to_lds(
+                    *,
+                    mi: int,
+                    ii: int,
+                    row_in_tile,
+                    row,
+                    row_base_lds,
+                    col_base_local,
+                    num_acc_n: int,
+                    lds_out,
+                ):
+                    for ni in range_constexpr(num_acc_n):
+                        col_local = col_base_local + arith.constant(ni * 16, index=True)
+                        acc_idx = mi * num_acc_n + ni
+                        v = vector.extract(acc[acc_idx], static_position=[ii], dynamic_position=[])
+                        v1 = vector.from_elements(T.vec(1, f32), [v])
+                        vector.store(v1, lds_out, [row_base_lds + col_local], alignment=4)
+
+                def _max_u32(a, b):
+                    return arith.select(arith.cmpi(CmpIPredicate.ugt, b, a), b, a)
+
+                def store_pair(*, row_local, row, row_ctx, col_pair0, col_g0, frag):
+                    frag_vals = []
+                    for i in range_constexpr(8):
+                        frag_vals.append(vector.extract(frag, static_position=[i], dynamic_position=[]))
+
+                    local_max = c0_f32
+                    for i in range_constexpr(8):
+                        abs_v = llvm.call_intrinsic(f32, "llvm.fabs.f32", [frag_vals[i]], [], [])
+                        local_max = arith.maximumf(local_max, abs_v)
+
+                    # Match aiter: reduce bf16-truncated amax across a 4-lane quad.
+                    amax_bf16 = local_max.bitcast(i32) >> c16_i32
+                    peer1 = _dpp_xor_i32(amax_bf16, 1)
+                    amax_bf16 = _max_u32(amax_bf16, peer1)
+                    peer2 = _dpp_xor_i32(amax_bf16, 2)
+                    amax_bf16 = _max_u32(amax_bf16, peer2)
+
+                    f32bits = amax_bf16 << c16_i32
+                    bexp = ((f32bits + c0x200000_i32) >> c23_i32) & c255_i32
+                    e8m0 = bexp - c2_i32
+                    e8m0 = arith.select(arith.cmpi(CmpIPredicate.slt, e8m0, c0_i32), c0_i32, e8m0)
+                    e8m0 = arith.select(arith.cmpi(CmpIPredicate.sgt, e8m0, c254_i32), c254_i32, e8m0)
+                    quant_scale = (e8m0 << c23_i32).bitcast(f32)
+
+                    packed = c0_i32
+                    for pair in range_constexpr(4):
+                        packed = ArithValue(
+                            llvm.call_intrinsic(
+                                i32,
+                                "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
+                                [
+                                    packed,
+                                    frag_vals[2 * pair],
+                                    frag_vals[2 * pair + 1],
+                                    quant_scale,
+                                    arith.constant(pair, type=i32),
+                                ],
+                                [],
+                                [],
+                            )
+                        )
+
+                    row_i32 = arith.index_cast(i32, row)
+                    col_i32 = arith.index_cast(i32, col_g0)
+                    q_word_off = row_i32 * arith.constant(MODEL_DIM // 8, type=i32) + (col_i32 >> c3_i32)
+                    buffer_ops.buffer_store(packed, q_rsrc, q_word_off, cache_modifier=4)
+
+                    lane_in_scale = (col_i32 >> c3_i32) & c3_i32
+                    _if_scale = scf.IfOp(arith.cmpi(CmpIPredicate.eq, lane_in_scale, c0_i32))
+                    with ir.InsertionPoint(_if_scale.then_block):
+                        scale_off = row_i32 * arith.constant(MODEL_DIM // 32, type=i32) + (col_i32 >> arith.constant(5, type=i32))
+                        e8m0_i8 = arith.TruncIOp(T.i8, e8m0).result
+                        buffer_ops.buffer_store(e8m0_i8, out_scale_rsrc, scale_off, cache_modifier=4)
+                        scf.YieldOp([])
+
+                c_shuffle_epilog(
+                    arith=arith,
+                    vector=vector,
+                    gpu=gpu,
+                    scf=scf,
+                    range_constexpr=range_constexpr,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    e_vec=8,
+                    cshuffle_nlane=32,
+                    block_size=total_threads,
+                    m_repeat=m_repeat,
+                    num_acc_n=num_acc_n,
+                    tx=tx,
+                    lane_div_16=lane_div_16,
+                    lane_mod_16=lane_mod_16,
+                    bx_m=bx_m,
+                    by_n=by_n,
+                    n_tile_base=n_tile_base,
+                    lds_out=lds_out,
+                    frag_elem_type=ir.F32Type.get(),
+                    write_row_to_lds=write_row_to_lds,
+                    precompute_row=None,
+                    store_pair=store_pair,
+                )
+
             _then_body()
-            scf.YieldOp([])
-        gpu.barrier()
+
+        total_m_blocks_i32 = num_valid_i32 >> arith.constant(7, type=i32)
+        total_work_i32 = total_m_blocks_i32 * arith.constant(num_n_blocks, type=i32)
+        for work in range(pid, total_work_i32, arith.constant(persistent_ctas, type=i32)):
+            run_one(work)
 
     @flyc.jit
     def launch_gemm2_mxfp4out(
@@ -1674,11 +1784,14 @@ def compile_kimi_mxfp4_gemm2_mxfp4out_16384():
             scale_w,
             expert_ids,
             num_valid_ids,
+            value_attrs=gemm2_agpr_value_attrs,
         ).launch(
-            grid=(num_n_blocks, num_m_blocks, 1),
+            grid=(persistent_ctas, 1, 1),
             block=(total_threads, 1, 1),
             stream=stream,
         )
+
+    launch_gemm2_mxfp4out.compile_hints["llvm_options"] = gemm2_agpr_llvm_options
 
     return launch_gemm2_mxfp4out
 
@@ -1729,11 +1842,345 @@ def mxfp4_max_sorted_16384(block_m: int = MXFP4_BLOCK_M) -> int:
     return ((cumsum_max + block_m - 1) // block_m) * block_m
 
 
+@functools.lru_cache(maxsize=1)
+def compile_kimi_mxfp4_sort_16384():
+    """FlyDSL port of aiter's fixed Kimi mxfp4 three-stage sorter.
+
+    This mirrors the aiter prologue=1 path:
+    sort_count -> sort_cumsum -> sort_place_pad.
+    """
+
+    sort_ctas = 16
+    threads = 1024
+    block_m = MXFP4_BLOCK_M
+    max_sorted = mxfp4_max_sorted_16384(block_m)
+    max_blocks = max_sorted // block_m
+    total_pairs = TOKEN * TOPK
+    per_cta = (total_pairs + sort_ctas - 1) // sort_ctas
+    experts_per_cta = (EXPERTS + sort_ctas - 1) // sort_ctas
+
+    topk_nbytes = total_pairs * 4
+    weight_nbytes = total_pairs * 4
+    sorted_nbytes = max_sorted * 4
+    expert_nbytes = max_blocks * 4
+    cumsum_nbytes = 4
+    reverse_nbytes = total_pairs * 4
+    masked_nbytes = EXPERTS * 4
+    block_offsets_nbytes = EXPERTS * sort_ctas * 4
+    real_counts_nbytes = EXPERTS * 4
+    expert_starts_nbytes = (EXPERTS + 1) * 4
+
+    gpu_arch = get_hip_arch()
+    allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_mxfp4_sort")
+    lds_count_offset = allocator._align(allocator.ptr, 16)
+    lds_padded_offset = lds_count_offset + EXPERTS * 4
+    lds_starts_offset = lds_padded_offset + EXPERTS * 4
+    allocator.ptr = lds_starts_offset + (EXPERTS + 1) * 4
+
+    @flyc.kernel(
+        name="flydsl_kimi_mxfp4_sort_count_NE385_TOPK9_M16384_BM128_v1",
+        known_block_size=[threads, 1, 1],
+    )
+    def sort_count(arg_topk_ids: fx.Pointer, arg_block_offsets: fx.Pointer):
+        i32 = T.i32
+        tx = gpu.thread_id("x")
+        bx = gpu.block_id("x")
+        tx_i32 = arith.index_cast(i32, tx)
+        bx_i32 = arith.index_cast(i32, bx)
+
+        topk_rsrc = _ptr_buffer_resource(arg_topk_ids, topk_nbytes)
+        offsets_rsrc = _ptr_buffer_resource(arg_block_offsets, block_offsets_nbytes)
+        base_ptr = allocator.get_base()
+        local_count = SmemPtr(base_ptr, lds_count_offset, T.i32, shape=(EXPERTS,)).get()
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c_sort_ctas = arith.constant(sort_ctas, type=i32)
+        c_threads_idx = arith.constant(threads, index=True)
+        c_experts_idx = arith.constant(EXPERTS, index=True)
+        c_start = bx * arith.constant(per_cta, index=True)
+        c_end = c_start + arith.constant(per_cta, index=True)
+        c_total = arith.constant(total_pairs, index=True)
+        end = arith.select(arith.cmpi(CmpIPredicate.ult, c_end, c_total), c_end, c_total)
+
+        zero_valid = arith.cmpi(CmpIPredicate.ult, tx, c_experts_idx)
+        _if_zero = scf.IfOp(zero_valid)
+        with ir.InsertionPoint(_if_zero.then_block):
+            memref.store(c0_i32, local_count, [tx])
+            scf.YieldOp([])
+        gpu.barrier()
+
+        for it in range_constexpr((per_cta + threads - 1) // threads):
+            idx = c_start + tx + arith.constant(it * threads, index=True)
+            valid = arith.cmpi(CmpIPredicate.ult, idx, end)
+            _if = scf.IfOp(valid)
+            with ir.InsertionPoint(_if.then_block):
+                eid = buffer_ops.buffer_load(topk_rsrc, idx, vec_width=1, dtype=i32)
+                _lds_atomic_add_i32(local_count, eid, c1_i32)
+                scf.YieldOp([])
+        gpu.barrier()
+
+        write_valid = arith.cmpi(CmpIPredicate.ult, tx, c_experts_idx)
+        _if_write = scf.IfOp(write_valid)
+        with ir.InsertionPoint(_if_write.then_block):
+            cnt = memref.load(local_count, [tx])
+            off = tx_i32 * c_sort_ctas + bx_i32
+            buffer_ops.buffer_store(cnt, offsets_rsrc, off)
+            scf.YieldOp([])
+
+    @flyc.kernel(
+        name="flydsl_kimi_mxfp4_sort_cumsum_NE385_TOPK9_M16384_BM128_v1",
+        known_block_size=[threads, 1, 1],
+    )
+    def sort_cumsum(
+        arg_block_offsets: fx.Pointer,
+        arg_masked_m: fx.Pointer,
+        arg_real_counts: fx.Pointer,
+        arg_expert_starts: fx.Pointer,
+        arg_cumsum_tensor: fx.Pointer,
+        arg_sorted_expert_ids: fx.Pointer,
+    ):
+        i32 = T.i32
+        tx = gpu.thread_id("x")
+        tx_i32 = arith.index_cast(i32, tx)
+
+        offsets_rsrc = _ptr_buffer_resource(arg_block_offsets, block_offsets_nbytes)
+        masked_rsrc = _ptr_buffer_resource(arg_masked_m, masked_nbytes)
+        real_rsrc = _ptr_buffer_resource(arg_real_counts, real_counts_nbytes)
+        starts_rsrc = _ptr_buffer_resource(arg_expert_starts, expert_starts_nbytes)
+        cumsum_rsrc = _ptr_buffer_resource(arg_cumsum_tensor, cumsum_nbytes)
+        expert_rsrc = _ptr_buffer_resource(arg_sorted_expert_ids, expert_nbytes)
+        base_ptr = allocator.get_base()
+        total_count = SmemPtr(base_ptr, lds_count_offset, T.i32, shape=(EXPERTS,)).get()
+        padded_count = SmemPtr(base_ptr, lds_padded_offset, T.i32, shape=(EXPERTS,)).get()
+        expert_starts = SmemPtr(base_ptr, lds_starts_offset, T.i32, shape=(EXPERTS + 1,)).get()
+
+        c0_i32 = arith.constant(0, type=i32)
+        c_sort_ctas = arith.constant(sort_ctas, type=i32)
+        c_bm_minus_1 = arith.constant(block_m - 1, type=i32)
+        c_bm_mask = arith.constant(~(block_m - 1), type=i32)
+
+        e_valid = arith.cmpi(CmpIPredicate.ult, tx, arith.constant(EXPERTS, index=True))
+        _if_sum = scf.IfOp(e_valid)
+        with ir.InsertionPoint(_if_sum.then_block):
+            total = c0_i32
+            for c in range_constexpr(sort_ctas):
+                cnt = buffer_ops.buffer_load(
+                    offsets_rsrc,
+                    tx_i32 * c_sort_ctas + arith.constant(c, type=i32),
+                    vec_width=1,
+                    dtype=i32,
+                )
+                total = total + cnt
+            padded = (total + c_bm_minus_1) & c_bm_mask
+            memref.store(total, total_count, [tx])
+            memref.store(padded, padded_count, [tx])
+            buffer_ops.buffer_store(total, real_rsrc, tx_i32)
+            buffer_ops.buffer_store(padded, masked_rsrc, tx_i32)
+            scf.YieldOp([])
+        gpu.barrier()
+
+        _if_t0 = scf.IfOp(arith.cmpi(CmpIPredicate.eq, tx_i32, c0_i32))
+        with ir.InsertionPoint(_if_t0.then_block):
+            acc = c0_i32
+            for e in range_constexpr(EXPERTS):
+                e_i32 = arith.constant(e, type=i32)
+                padded = memref.load(padded_count, [arith.index(e)])
+                memref.store(acc, expert_starts, [arith.index(e)])
+                buffer_ops.buffer_store(acc, starts_rsrc, e_i32)
+                acc = acc + padded
+
+            memref.store(acc, expert_starts, [arith.index(EXPERTS)])
+            buffer_ops.buffer_store(acc, starts_rsrc, arith.constant(EXPERTS, type=i32))
+            buffer_ops.buffer_store(acc, cumsum_rsrc, c0_i32)
+            tail_b0 = acc >> arith.constant(7, type=i32)
+            for b in range(
+                ArithValue(tail_b0).index_cast(T.index),
+                arith.index(max_blocks),
+                arith.index(1),
+            ):
+                buffer_ops.buffer_store(c0_i32, expert_rsrc, arith.index_cast(i32, b))
+            scf.YieldOp([])
+        gpu.barrier()
+
+        _if_update = scf.IfOp(e_valid)
+        with ir.InsertionPoint(_if_update.then_block):
+            acc = memref.load(expert_starts, [tx])
+            for c in range_constexpr(sort_ctas):
+                off = tx_i32 * c_sort_ctas + arith.constant(c, type=i32)
+                cnt = buffer_ops.buffer_load(offsets_rsrc, off, vec_width=1, dtype=i32)
+                buffer_ops.buffer_store(acc, offsets_rsrc, off)
+                acc = acc + cnt
+
+            start = memref.load(expert_starts, [tx])
+            end = memref.load(expert_starts, [tx + arith.index(1)])
+            b0 = start >> arith.constant(7, type=i32)
+            b1 = end >> arith.constant(7, type=i32)
+            for b in range(
+                ArithValue(b0).index_cast(T.index),
+                ArithValue(b1).index_cast(T.index),
+                arith.index(1),
+            ):
+                buffer_ops.buffer_store(tx_i32, expert_rsrc, arith.index_cast(i32, b))
+            scf.YieldOp([])
+
+    @flyc.kernel(
+        name="flydsl_kimi_mxfp4_sort_place_pad_NE385_TOPK9_M16384_BM128_v1",
+        known_block_size=[threads, 1, 1],
+    )
+    def sort_place_pad(
+        arg_topk_ids: fx.Pointer,
+        arg_topk_weight: fx.Pointer,
+        arg_block_offsets: fx.Pointer,
+        arg_real_counts: fx.Pointer,
+        arg_expert_starts: fx.Pointer,
+        arg_sorted_token_ids: fx.Pointer,
+        arg_reverse_sorted: fx.Pointer,
+        arg_sorted_weights: fx.Pointer,
+        arg_m_indices: fx.Pointer,
+    ):
+        i32 = T.i32
+        f32 = T.f32
+        tx = gpu.thread_id("x")
+        bx = gpu.block_id("x")
+        tx_i32 = arith.index_cast(i32, tx)
+        bx_i32 = arith.index_cast(i32, bx)
+
+        topk_rsrc = _ptr_buffer_resource(arg_topk_ids, topk_nbytes)
+        topk_weight_rsrc = _ptr_buffer_resource(arg_topk_weight, weight_nbytes)
+        offsets_rsrc = _ptr_buffer_resource(arg_block_offsets, block_offsets_nbytes)
+        real_rsrc = _ptr_buffer_resource(arg_real_counts, real_counts_nbytes)
+        starts_rsrc = _ptr_buffer_resource(arg_expert_starts, expert_starts_nbytes)
+        sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes)
+        reverse_rsrc = _ptr_buffer_resource(arg_reverse_sorted, reverse_nbytes)
+        weights_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes)
+        mindices_rsrc = _ptr_buffer_resource(arg_m_indices, sorted_nbytes)
+        base_ptr = allocator.get_base()
+        local_offsets = SmemPtr(base_ptr, lds_count_offset, T.i32, shape=(EXPERTS,)).get()
+        row_starts = SmemPtr(base_ptr, lds_starts_offset, T.i32, shape=(EXPERTS + 1,)).get()
+
+        c0_i32 = arith.constant(0, type=i32)
+        c1_i32 = arith.constant(1, type=i32)
+        c_topk = arith.constant(TOPK, type=i32)
+        c_sort_ctas = arith.constant(sort_ctas, type=i32)
+        c_threads_i32 = arith.constant(threads, type=i32)
+        c_threads_idx = arith.constant(threads, index=True)
+        c_mask_token = arith.constant(0x00FFFFFF, type=i32)
+        c_topk_shift = arith.constant(24, type=i32)
+        c_pad = arith.constant(TOKEN & 0x00FFFFFF, type=i32)
+        c0_f32 = arith.constant(0.0, type=f32)
+
+        init_valid = arith.cmpi(CmpIPredicate.ult, tx, arith.constant(EXPERTS, index=True))
+        _if_init = scf.IfOp(init_valid)
+        with ir.InsertionPoint(_if_init.then_block):
+            e_i32 = tx_i32
+            off = e_i32 * c_sort_ctas + bx_i32
+            local = buffer_ops.buffer_load(offsets_rsrc, off, vec_width=1, dtype=i32)
+            start = buffer_ops.buffer_load(offsets_rsrc, e_i32 * c_sort_ctas, vec_width=1, dtype=i32)
+            memref.store(local, local_offsets, [tx])
+            memref.store(start, row_starts, [tx])
+            scf.YieldOp([])
+
+        _if_last_start = scf.IfOp(arith.cmpi(CmpIPredicate.eq, tx_i32, c0_i32))
+        with ir.InsertionPoint(_if_last_start.then_block):
+            last = buffer_ops.buffer_load(starts_rsrc, arith.constant(EXPERTS, type=i32), vec_width=1, dtype=i32)
+            memref.store(last, row_starts, [arith.index(EXPERTS)])
+            scf.YieldOp([])
+        gpu.barrier()
+
+        for ee in range_constexpr(experts_per_cta):
+            e = bx * arith.constant(experts_per_cta, index=True) + arith.constant(ee, index=True)
+            e_valid = arith.cmpi(CmpIPredicate.ult, e, arith.constant(EXPERTS, index=True))
+            _if_e = scf.IfOp(e_valid)
+            with ir.InsertionPoint(_if_e.then_block):
+                e_i32 = arith.index_cast(i32, e)
+                start = memref.load(row_starts, [e])
+                real = buffer_ops.buffer_load(real_rsrc, e_i32, vec_width=1, dtype=i32)
+                padded_end = memref.load(row_starts, [e + arith.index(1)])
+                real_end = start + real
+                j0 = ArithValue(real_end + tx_i32).index_cast(T.index)
+                j1 = ArithValue(padded_end).index_cast(T.index)
+                for j in range(j0, j1, c_threads_idx):
+                    j_i32 = arith.index_cast(i32, j)
+                    buffer_ops.buffer_store(c_pad, sorted_rsrc, j_i32)
+                    buffer_ops.buffer_store(c_pad, mindices_rsrc, j_i32)
+                    buffer_ops.buffer_store(c0_f32, weights_rsrc, j_i32)
+                scf.YieldOp([])
+
+        gpu.barrier()
+
+        c_start = bx * arith.constant(per_cta, index=True)
+        c_end = c_start + arith.constant(per_cta, index=True)
+        c_total = arith.constant(total_pairs, index=True)
+        end = arith.select(arith.cmpi(CmpIPredicate.ult, c_end, c_total), c_end, c_total)
+        for it in range_constexpr((per_cta + threads - 1) // threads):
+            idx = c_start + tx + arith.constant(it * threads, index=True)
+            valid = arith.cmpi(CmpIPredicate.ult, idx, end)
+            _if = scf.IfOp(valid)
+            with ir.InsertionPoint(_if.then_block):
+                idx_i32 = arith.index_cast(i32, idx)
+                eid = buffer_ops.buffer_load(topk_rsrc, idx, vec_width=1, dtype=i32)
+                sp = _lds_atomic_add_i32(local_offsets, eid, c1_i32)
+                token_id = idx_i32 // c_topk
+                topk_id = idx_i32 % c_topk
+                packed_id = (token_id & c_mask_token) | (topk_id << c_topk_shift)
+                w = buffer_ops.buffer_load(topk_weight_rsrc, idx, vec_width=1, dtype=f32)
+                buffer_ops.buffer_store(packed_id, sorted_rsrc, sp)
+                buffer_ops.buffer_store(token_id & c_mask_token, mindices_rsrc, sp)
+                buffer_ops.buffer_store(w, weights_rsrc, sp)
+                buffer_ops.buffer_store(sp, reverse_rsrc, idx_i32)
+                scf.YieldOp([])
+
+    @flyc.jit
+    def launch_sort(
+        topk_ids: fx.Pointer,
+        topk_weight: fx.Pointer,
+        sorted_token_ids: fx.Pointer,
+        sorted_expert_ids: fx.Pointer,
+        cumsum_tensor: fx.Pointer,
+        reverse_sorted: fx.Pointer,
+        sorted_weights: fx.Pointer,
+        masked_m: fx.Pointer,
+        m_indices: fx.Pointer,
+        block_offsets: fx.Pointer,
+        real_counts: fx.Pointer,
+        expert_starts: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        allocator.finalized = False
+        ctx = CompilationContext.get_current()
+        with ir.InsertionPoint(ctx.gpu_module_body):
+            allocator.finalize()
+        sort_count(topk_ids, block_offsets).launch(grid=(sort_ctas, 1, 1), block=(threads, 1, 1), stream=stream)
+        sort_cumsum(
+            block_offsets,
+            masked_m,
+            real_counts,
+            expert_starts,
+            cumsum_tensor,
+            sorted_expert_ids,
+        ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
+        sort_place_pad(
+            topk_ids,
+            topk_weight,
+            block_offsets,
+            real_counts,
+            expert_starts,
+            sorted_token_ids,
+            reverse_sorted,
+            sorted_weights,
+            m_indices,
+        ).launch(grid=(sort_ctas, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    return launch_sort
+
+
 def kimi_mxfp4_sort_16384(
     topk_ids: torch.Tensor,
     topk_weight: torch.Tensor,
     *,
     block_m: int = MXFP4_BLOCK_M,
+    use_flydsl: bool = False,
 ) -> Mxfp4SortBuffers:
     """Run the fixed mxfp4_moe three-stage sorter for Kimi M=16384."""
     if tuple(topk_ids.shape) != (TOKEN, TOPK):
@@ -1759,26 +2206,49 @@ def kimi_mxfp4_sort_16384(
     masked_m = torch.empty((EXPERTS,), device=device, dtype=dtypes.i32)
     m_indices = torch.empty((max_sorted,), device=device, dtype=dtypes.i32)
 
-    aiter.mxfp4_moe_sort(
-        topk_ids=topk_ids,
-        topk_weight=topk_weight,
-        sorted_token_ids=sorted_token_ids,
-        sorted_expert_ids=sorted_expert_ids,
-        cumsum_tensor=cumsum_tensor,
-        reverse_sorted=reverse_sorted,
-        sorted_weights=sorted_weights,
-        masked_m=masked_m,
-        m_indices=m_indices,
-        bf16_zero_out=_empty_bf16(device),
-        bf16_zero_workspace=_empty_bf16(device),
-        M_logical=TOKEN,
-        NE=EXPERTS,
-        TOPK=TOPK,
-        D_HIDDEN=MODEL_DIM,
-        D_INTER=INTER_DIM,
-        MB=block_m,
-        prologue=1,
-    )
+    if use_flydsl:
+        if block_m != MXFP4_BLOCK_M:
+            raise ValueError(f"FlyDSL mxfp4 sort only supports block_m={MXFP4_BLOCK_M}")
+        block_offsets = torch.empty((EXPERTS * 16,), device=device, dtype=dtypes.i32)
+        real_counts = torch.empty((EXPERTS,), device=device, dtype=dtypes.i32)
+        expert_starts = torch.empty((EXPERTS + 1,), device=device, dtype=dtypes.i32)
+        args = (
+            _ptr_view_safe(topk_ids.view(-1)),
+            _ptr_view_safe(topk_weight.view(-1)),
+            _ptr_view_safe(sorted_token_ids.view(-1)),
+            _ptr_view_safe(sorted_expert_ids.view(-1)),
+            _ptr_view_safe(cumsum_tensor.view(-1)),
+            _ptr_view_safe(reverse_sorted.view(-1)),
+            _ptr_view_safe(sorted_weights.view(-1)),
+            _ptr_view_safe(masked_m.view(-1)),
+            _ptr_view_safe(m_indices.view(-1)),
+            _ptr_view_safe(block_offsets.view(-1)),
+            _ptr_view_safe(real_counts.view(-1)),
+            _ptr_view_safe(expert_starts.view(-1)),
+            torch.cuda.current_stream(),
+        )
+        _run_compiled(compile_kimi_mxfp4_sort_16384(), args)
+    else:
+        aiter.mxfp4_moe_sort(
+            topk_ids=topk_ids,
+            topk_weight=topk_weight,
+            sorted_token_ids=sorted_token_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=cumsum_tensor,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            masked_m=masked_m,
+            m_indices=m_indices,
+            bf16_zero_out=_empty_bf16(device),
+            bf16_zero_workspace=_empty_bf16(device),
+            M_logical=TOKEN,
+            NE=EXPERTS,
+            TOPK=TOPK,
+            D_HIDDEN=MODEL_DIM,
+            D_INTER=INTER_DIM,
+            MB=block_m,
+            prologue=1,
+        )
     return Mxfp4SortBuffers(
         sorted_token_ids=sorted_token_ids,
         sorted_expert_ids=sorted_expert_ids,
@@ -1790,6 +2260,323 @@ def kimi_mxfp4_sort_16384(
         max_sorted=max_sorted,
         block_m=block_m,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def compile_kimi_mxfp4_quant_16384():
+    """FlyDSL port of aiter's fixed Kimi mxfp4 input quant kernel."""
+
+    n_ctas = 512
+    threads = 1024
+    warp_size = 64
+    lanes_per_block = 4
+    blocks_per_wave = warp_size // lanes_per_block
+    waves_per_cta = threads // warp_size
+    blocks_per_cta = blocks_per_wave * waves_per_cta
+    blocks_per_hidden = MODEL_DIM // 32
+    total_blocks = TOKEN * blocks_per_hidden
+    n_batches = (total_blocks + blocks_per_cta - 1) // blocks_per_cta
+    batch_per_cta = (n_batches + n_ctas - 1) // n_ctas
+
+    hidden_nbytes = TOKEN * MODEL_DIM * 2
+    quant_nbytes = TOKEN * (MODEL_DIM // 2)
+    scale_nbytes = TOKEN * (MODEL_DIM // 32)
+
+    @flyc.kernel(
+        name="flydsl_kimi_mxfp4_quant_NE385_TOPK9_H7168_M16384_BM128_v0",
+        known_block_size=[threads, 1, 1],
+    )
+    def quant(arg_hidden: fx.Pointer, arg_a_quant: fx.Pointer, arg_a_scale: fx.Pointer):
+        i8 = T.i8
+        i32 = T.i32
+        f32 = T.f32
+        vec4_i32 = T.vec(4, i32)
+
+        tx = gpu.thread_id("x")
+        bx = gpu.block_id("x")
+        tx_i32 = arith.index_cast(i32, tx)
+        bx_i32 = arith.index_cast(i32, bx)
+
+        hidden_rsrc = _ptr_buffer_resource(arg_hidden, hidden_nbytes)
+        quant_rsrc = _ptr_buffer_resource(arg_a_quant, quant_nbytes)
+        scale_rsrc = _ptr_buffer_resource(arg_a_scale, scale_nbytes)
+
+        wave_id = tx_i32 // arith.constant(warp_size, type=i32)
+        lane = tx_i32 % arith.constant(warp_size, type=i32)
+        block_in_wave = lane // arith.constant(lanes_per_block, type=i32)
+        lane_in_block = lane % arith.constant(lanes_per_block, type=i32)
+
+        c0_i32 = arith.constant(0, type=i32)
+        c2_i32 = arith.constant(2, type=i32)
+        c4_i32 = arith.constant(4, type=i32)
+        c7fff_i32 = arith.constant(0x7FFF, type=i32)
+        cffff_i32 = arith.constant(0xFFFF, type=i32)
+        chi_mask_i32 = arith.constant(-65536, type=i32)
+        c16_i32 = arith.constant(16, type=i32)
+        c23_i32 = arith.constant(23, type=i32)
+        c255_i32 = arith.constant(255, type=i32)
+        c254_i32 = arith.constant(254, type=i32)
+        c64_i32 = arith.constant(64, type=i32)
+
+        def _max_u32(a, b):
+            return arith.select(arith.cmpi(CmpIPredicate.ugt, b, a), b, a)
+
+        wi_start_i32 = bx_i32 * arith.constant(batch_per_cta, type=i32)
+        wi_stop_i32 = wi_start_i32 + arith.constant(batch_per_cta, type=i32)
+        wi_end_i32 = arith.select(
+            arith.cmpi(CmpIPredicate.ult, wi_stop_i32, arith.constant(n_batches, type=i32)),
+            wi_stop_i32,
+            arith.constant(n_batches, type=i32),
+        )
+        for wi in range(
+            ArithValue(wi_start_i32).index_cast(T.index),
+            ArithValue(wi_end_i32).index_cast(T.index),
+            arith.index(1),
+        ):
+            wi_i32 = arith.index_cast(i32, wi)
+            my_block_i32 = (
+                wi_i32 * arith.constant(blocks_per_cta, type=i32)
+                + wave_id * arith.constant(blocks_per_wave, type=i32)
+                + block_in_wave
+            )
+            valid = arith.cmpi(CmpIPredicate.ult, my_block_i32, arith.constant(total_blocks, type=i32))
+            _if = scf.IfOp(valid)
+            with ir.InsertionPoint(_if.then_block):
+                kb_i32 = my_block_i32 * arith.constant(32, type=i32) + lane_in_block * arith.constant(8, type=i32)
+                h4 = buffer_ops.buffer_load(hidden_rsrc, kb_i32 >> arith.constant(1, type=i32), vec_width=4, dtype=i32)
+                words = [
+                    ArithValue(vector.extract(h4, static_position=[j], dynamic_position=[]))
+                    for j in range(4)
+                ]
+
+                local_amax = c0_i32
+                vals = []
+                for j in range_constexpr(4):
+                    w = words[j]
+                    lo_abs = (w & cffff_i32) & c7fff_i32
+                    hi_abs = (w >> c16_i32) & c7fff_i32
+                    local_amax = _max_u32(local_amax, lo_abs)
+                    local_amax = _max_u32(local_amax, hi_abs)
+                    vals.append(((w & cffff_i32) << c16_i32).bitcast(f32))
+                    vals.append((w & chi_mask_i32).bitcast(f32))
+
+                peer1 = local_amax.shuffle_xor(arith.constant(1, type=i32), c64_i32)
+                local_amax = _max_u32(local_amax, peer1)
+                peer2 = local_amax.shuffle_xor(c2_i32, c64_i32)
+                local_amax = _max_u32(local_amax, peer2)
+
+                f32bits = local_amax << c16_i32
+                bexp = ((f32bits + arith.constant(0x200000, type=i32)) >> c23_i32) & c255_i32
+                e8m0 = bexp - c2_i32
+                e8m0 = arith.select(arith.cmpi(CmpIPredicate.slt, e8m0, c0_i32), c0_i32, e8m0)
+                e8m0 = arith.select(arith.cmpi(CmpIPredicate.sgt, e8m0, c254_i32), c254_i32, e8m0)
+                quant_scale = (e8m0 << c23_i32).bitcast(f32)
+
+                packed = c0_i32
+                for pair in range_constexpr(4):
+                    packed = ArithValue(
+                        llvm.call_intrinsic(
+                            i32,
+                            "llvm.amdgcn.cvt.scalef32.pk.fp4.f32",
+                            [
+                                packed,
+                                vals[2 * pair],
+                                vals[2 * pair + 1],
+                                quant_scale,
+                                arith.constant(pair, type=i32),
+                            ],
+                            [],
+                            [],
+                        )
+                    )
+
+                b_off = lane_in_block * c4_i32
+                q_word_off = my_block_i32 * arith.constant(4, type=i32) + (b_off >> c2_i32)
+                buffer_ops.buffer_store(packed, quant_rsrc, q_word_off)
+
+                _if_scale = scf.IfOp(arith.cmpi(CmpIPredicate.eq, lane_in_block, c0_i32))
+                with ir.InsertionPoint(_if_scale.then_block):
+                    e8m0_i8 = arith.TruncIOp(i8, e8m0).result
+                    buffer_ops.buffer_store(
+                        e8m0_i8,
+                        scale_rsrc,
+                        my_block_i32,
+                        offset_is_bytes=True,
+                    )
+                    scf.YieldOp([])
+                scf.YieldOp([])
+
+    @flyc.jit
+    def launch_quant(
+        hidden: fx.Pointer,
+        a_quant: fx.Pointer,
+        a_scale: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        quant(hidden, a_quant, a_scale).launch(grid=(n_ctas, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    return launch_quant
+
+
+def kimi_mxfp4_quant_16384(
+    hidden_states: torch.Tensor,
+    a_quant: torch.Tensor | None = None,
+    a_scale: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FlyDSL port of aiter.mxfp4_moe_quant for the fixed Kimi shape."""
+    if tuple(hidden_states.shape) != (TOKEN, MODEL_DIM):
+        raise ValueError(f"expected hidden shape {(TOKEN, MODEL_DIM)}, got {tuple(hidden_states.shape)}")
+    device = hidden_states.device
+    if a_quant is None:
+        a_quant = torch.empty((TOKEN, MODEL_DIM // 2), device=device, dtype=torch.uint8)
+    if a_scale is None:
+        a_scale = torch.empty((TOKEN, MODEL_DIM // 32), device=device, dtype=torch.uint8)
+    args = (
+        _ptr_view_safe(hidden_states.view(-1)),
+        _ptr_view_safe(_as_u8_storage(a_quant).view(-1)),
+        _ptr_view_safe(_as_u8_storage(a_scale).view(-1)),
+        torch.cuda.current_stream(),
+    )
+    _run_compiled(compile_kimi_mxfp4_quant_16384(), args)
+    return a_quant, a_scale
+
+
+@functools.lru_cache(maxsize=1)
+def compile_kimi_mxfp4_sort_scales_16384():
+    """FlyDSL port of aiter's fixed Kimi mxfp4 sort_scales kernel."""
+
+    n_ctas = 512
+    threads = 1024
+    block_m = MXFP4_BLOCK_M
+    bk = 256
+    max_sorted = mxfp4_max_sorted_16384(block_m)
+    n_chunks = max_sorted // block_m
+    a_scale_cols = MODEL_DIM // 32
+    mn_pack = 2
+    k_pack = bk // 128
+    c_m1 = block_m // (16 * mn_pack)
+    c_k1 = (MODEL_DIM // 32) // (4 * k_pack)
+    k_lane = 4
+    n_lane = 16
+    dwords_per_chunk = c_m1 * c_k1 * k_lane * n_lane
+    total_work = n_chunks * dwords_per_chunk
+    total_threads = n_ctas * threads
+
+    scale_nbytes = TOKEN * a_scale_cols
+    sorted_nbytes = max_sorted * 4
+    cumsum_nbytes = 4
+    out_nbytes = max_sorted * a_scale_cols * 2
+
+    @flyc.kernel(
+        name="flydsl_kimi_mxfp4_sort_scales_NE385_H7168_E512_M16384_BM128_v0",
+        known_block_size=[threads, 1, 1],
+    )
+    def sort_scales(
+        arg_a_scale: fx.Pointer,
+        arg_sorted_token_ids: fx.Pointer,
+        arg_cumsum_tensor: fx.Pointer,
+        arg_a_scale_sorted_shuffled: fx.Pointer,
+    ):
+        i8 = T.i8
+        i32 = T.i32
+        tx = gpu.thread_id("x")
+        bx = gpu.block_id("x")
+
+        scale_rsrc = _ptr_buffer_resource(arg_a_scale, scale_nbytes)
+        sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes)
+        cumsum_rsrc = _ptr_buffer_resource(arg_cumsum_tensor, cumsum_nbytes)
+        out_rsrc = _ptr_buffer_resource(arg_a_scale_sorted_shuffled, out_nbytes)
+
+        c0_i32 = arith.constant(0, type=i32)
+        c8_i32 = arith.constant(8, type=i32)
+        c_mask_token = arith.constant(0x00FFFFFF, type=i32)
+        c_token = arith.constant(TOKEN, type=i32)
+
+        actual_sorted = buffer_ops.buffer_load(cumsum_rsrc, c0_i32, vec_width=1, dtype=i32)
+        actual_n_chunks = (actual_sorted + arith.constant(block_m - 1, type=i32)) >> arith.constant(7, type=i32)
+        global_tid = bx * arith.constant(threads, index=True) + tx
+
+        for work in range(global_tid, arith.index(total_work), arith.index(total_threads)):
+            work_i32 = arith.index_cast(i32, work)
+            buffer_ops.buffer_store(c0_i32, out_rsrc, work_i32)
+
+            r0 = work_i32
+            n_lane_v = r0 % arith.constant(n_lane, type=i32)
+            r1 = r0 // arith.constant(n_lane, type=i32)
+            k_lane_v = r1 % arith.constant(k_lane, type=i32)
+            r2 = r1 >> arith.constant(2, type=i32)
+            ku = r2 % arith.constant(c_k1, type=i32)
+            r3 = r2 // arith.constant(c_k1, type=i32)
+            mi = r3 % arith.constant(c_m1, type=i32)
+            chunk = r3 // arith.constant(c_m1, type=i32)
+
+            valid_chunk = arith.cmpi(CmpIPredicate.slt, chunk, actual_n_chunks)
+            _if = scf.IfOp(valid_chunk)
+            with ir.InsertionPoint(_if.then_block):
+                tok_ids = []
+                for im_a in range_constexpr(mn_pack):
+                    sorted_row = (
+                        chunk * arith.constant(block_m, type=i32)
+                        + (mi * arith.constant(mn_pack, type=i32) + arith.constant(im_a, type=i32))
+                        * arith.constant(16, type=i32)
+                        + n_lane_v
+                    )
+                    row_valid = arith.cmpi(CmpIPredicate.slt, sorted_row, actual_sorted)
+                    sti = buffer_ops.buffer_load(sorted_rsrc, sorted_row, vec_width=1, dtype=i32, mask=row_valid)
+                    tid = sti & c_mask_token
+                    tid = arith.select(arith.cmpi(CmpIPredicate.slt, tid, c_token), tid, c0_i32)
+                    tok_ids.append(tid)
+
+                packed = c0_i32
+                for ikxdl in range_constexpr(k_pack):
+                    for im_a in range_constexpr(mn_pack):
+                        k_idx = (
+                            ku * arith.constant(k_pack * 4, type=i32)
+                            + arith.constant(ikxdl * 4, type=i32)
+                            + k_lane_v
+                        )
+                        scale_idx = tok_ids[im_a] * arith.constant(a_scale_cols, type=i32) + k_idx
+                        b = buffer_ops.buffer_load(scale_rsrc, scale_idx, vec_width=1, dtype=i8, cache_modifier=4)
+                        b_i32 = ArithValue(b).extui(i32)
+                        packed = packed | (b_i32 << arith.constant((ikxdl * mn_pack + im_a) * 8, type=i32))
+
+                buffer_ops.buffer_store(packed, out_rsrc, work_i32)
+                scf.YieldOp([])
+
+    @flyc.jit
+    def launch_sort_scales(
+        a_scale: fx.Pointer,
+        sorted_token_ids: fx.Pointer,
+        cumsum_tensor: fx.Pointer,
+        a_scale_sorted_shuffled: fx.Pointer,
+        stream: fx.Stream,
+    ):
+        sort_scales(
+            a_scale,
+            sorted_token_ids,
+            cumsum_tensor,
+            a_scale_sorted_shuffled,
+        ).launch(grid=(n_ctas, 1, 1), block=(threads, 1, 1), stream=stream)
+
+    return launch_sort_scales
+
+
+def kimi_mxfp4_sort_scales_16384(
+    a_scale: torch.Tensor,
+    sorted_token_ids: torch.Tensor,
+    cumsum_tensor: torch.Tensor,
+    a_scale_sorted_shuffled: torch.Tensor,
+) -> torch.Tensor:
+    """FlyDSL port of aiter.mxfp4_moe_sort_scales for the fixed Kimi shape."""
+    args = (
+        _ptr_view_safe(_as_u8_storage(a_scale).view(-1)),
+        _ptr_view_safe(sorted_token_ids.view(-1)),
+        _ptr_view_safe(cumsum_tensor.view(-1)),
+        _ptr_view_safe(_as_u8_storage(a_scale_sorted_shuffled).view(-1)),
+        torch.cuda.current_stream(),
+    )
+    _run_compiled(compile_kimi_mxfp4_sort_scales_16384(), args)
+    return a_scale_sorted_shuffled
 
 
 def expand_mxfp4_expert_ids_for_flydsl(
@@ -1949,6 +2736,9 @@ def _run_mxfp4_pipeline_16384(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     *,
+    use_flydsl_sort: bool = False,
+    use_flydsl_quant: bool = False,
+    use_flydsl_sort_scales: bool = False,
     use_flydsl_gemm1: bool = False,
     use_flydsl_gemm2: bool = False,
     use_flydsl_scatter_reduce_q: bool = False,
@@ -1957,20 +2747,23 @@ def _run_mxfp4_pipeline_16384(
     device = hidden_states.device
     w1_u8 = _as_u8_storage(w1)
     w2_u8 = _as_u8_storage(w2)
-    sort = kimi_mxfp4_sort_16384(topk_ids, topk_weight)
+    sort = kimi_mxfp4_sort_16384(topk_ids, topk_weight, use_flydsl=use_flydsl_sort)
 
     a_quant = torch.empty((TOKEN, MODEL_DIM // 2), device=device, dtype=torch.uint8)
     a_scale = torch.empty((TOKEN, MODEL_DIM // 32), device=device, dtype=torch.uint8)
-    aiter.mxfp4_moe_quant(
-        a_input=hidden_states,
-        a_quant=a_quant,
-        a_scale=a_scale,
-        bf16_zero_out=_empty_bf16(device),
-        NE=EXPERTS,
-        TOPK=TOPK,
-        D_HIDDEN=MODEL_DIM,
-        MB=sort.block_m,
-    )
+    if use_flydsl_quant:
+        kimi_mxfp4_quant_16384(hidden_states, a_quant, a_scale)
+    else:
+        aiter.mxfp4_moe_quant(
+            a_input=hidden_states,
+            a_quant=a_quant,
+            a_scale=a_scale,
+            bf16_zero_out=_empty_bf16(device),
+            NE=EXPERTS,
+            TOPK=TOPK,
+            D_HIDDEN=MODEL_DIM,
+            MB=sort.block_m,
+        )
 
     padded_rows = ((sort.max_sorted + 31) // 32) * 32
     a_scale_sorted_shuffled = torch.empty(
@@ -1978,18 +2771,26 @@ def _run_mxfp4_pipeline_16384(
         device=device,
         dtype=torch.uint8,
     )
-    aiter.mxfp4_moe_sort_scales(
-        a_scale=a_scale,
-        sorted_token_ids=sort.sorted_token_ids,
-        cumsum_tensor=sort.cumsum_tensor,
-        a_scale_sorted_shuffled=a_scale_sorted_shuffled,
-        NE=EXPERTS,
-        TOPK=TOPK,
-        D_HIDDEN=MODEL_DIM,
-        D_INTER=INTER_DIM,
-        MB=sort.block_m,
-        max_sorted=sort.max_sorted,
-    )
+    if use_flydsl_sort_scales:
+        kimi_mxfp4_sort_scales_16384(
+            a_scale,
+            sort.sorted_token_ids,
+            sort.cumsum_tensor,
+            a_scale_sorted_shuffled,
+        )
+    else:
+        aiter.mxfp4_moe_sort_scales(
+            a_scale=a_scale,
+            sorted_token_ids=sort.sorted_token_ids,
+            cumsum_tensor=sort.cumsum_tensor,
+            a_scale_sorted_shuffled=a_scale_sorted_shuffled,
+            NE=EXPERTS,
+            TOPK=TOPK,
+            D_HIDDEN=MODEL_DIM,
+            D_INTER=INTER_DIM,
+            MB=sort.block_m,
+            max_sorted=sort.max_sorted,
+        )
 
     inter_sorted_quant = torch.empty(
         (sort.max_sorted, INTER_DIM // 2),
@@ -2111,6 +2912,9 @@ def run_kimi_fp4_mxfp4_moe_16384_aiter_ref(
         topk_weight,
         w1_scale,
         w2_scale,
+        use_flydsl_sort=False,
+        use_flydsl_quant=False,
+        use_flydsl_sort_scales=False,
         use_flydsl_gemm1=False,
         use_flydsl_gemm2=False,
         use_flydsl_scatter_reduce_q=False,
@@ -2135,6 +2939,9 @@ def run_kimi_fp4_mxfp4_moe_16384_opt(
         topk_weight,
         w1_scale,
         w2_scale,
+        use_flydsl_sort=False,
+        use_flydsl_quant=False,
+        use_flydsl_sort_scales=False,
         use_flydsl_gemm1=False,
         use_flydsl_gemm2=False,
         use_flydsl_scatter_reduce_q=True,
@@ -2159,6 +2966,9 @@ def run_kimi_fp4_mxfp4_moe_16384_opt_gemm1(
         topk_weight,
         w1_scale,
         w2_scale,
+        use_flydsl_sort=False,
+        use_flydsl_quant=False,
+        use_flydsl_sort_scales=False,
         use_flydsl_gemm1=True,
         use_flydsl_gemm2=False,
         use_flydsl_scatter_reduce_q=True,
@@ -2183,7 +2993,37 @@ def run_kimi_fp4_mxfp4_moe_16384_opt_gemm2(
         topk_weight,
         w1_scale,
         w2_scale,
+        use_flydsl_sort=False,
+        use_flydsl_quant=False,
+        use_flydsl_sort_scales=False,
         use_flydsl_gemm1=False,
+        use_flydsl_gemm2=True,
+        use_flydsl_scatter_reduce_q=True,
+    )
+
+
+def run_kimi_fp4_mxfp4_moe_16384_all_flydsl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weight: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Initial full FlyDSL mxfp4 pipeline port for fixed Kimi M=16384."""
+    return _run_mxfp4_pipeline_16384(
+        hidden_states,
+        w1,
+        w2,
+        topk_ids,
+        topk_weight,
+        w1_scale,
+        w2_scale,
+        use_flydsl_sort=True,
+        use_flydsl_quant=True,
+        use_flydsl_sort_scales=True,
+        use_flydsl_gemm1=True,
         use_flydsl_gemm2=True,
         use_flydsl_scatter_reduce_q=True,
     )

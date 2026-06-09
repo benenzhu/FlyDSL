@@ -1136,3 +1136,386 @@ A direct global-store experiment (`v23`) was also tested to mimic aiter's
 `global_store` epilogue instead of FlyDSL `buffer_store`. It was not retained:
 it produced `cos=0.999992`, `max_abs=1.007812`, and `local_mxfp4_opt_gemm1_us=1841.0`
 in a short graph run.
+
+Current acceptance rule: the GEMM1 replacement no longer needs to be bit-exact
+against aiter.  Candidate kernels are acceptable when their final MoE output is
+finite and cosine-similar to the aiter mxfp4 path.  This keeps fastmath,
+instruction-order, and scale/rounding variants in scope even when `max_abs`
+changes.
+
+Additional negative experiments after v21:
+
+- v24 initialized the epilogue max from `fabs(result[0])` like the aiter C++
+  source, then reduced the remaining seven values.  It stayed cosine-equivalent
+  but regressed the short graph run to about `1839.3us`.  Not retained.
+- v25 merged the initial A-scale wait/barrier with the A0/A1/B0/B1 prologue
+  wait.  It stayed cosine-equivalent but regressed to about `1840.3us`.  Not
+  retained.
+- v26 replaced the main-loop `rocdl.s_waitcnt(14)` with inline asm
+  `s_waitcnt vmcnt(10)`.  It was slower at about `1840.7us`.  Not retained.
+- v27 moved the initial A-scale wait into a combined `vmcnt(20)` prologue wait.
+  It stayed cosine-equivalent with small `max_abs` drift but measured about
+  `1838.7us`.  Not retained.
+- v28 changed B-q loads to use scalar `soffset` plus per-lane `voffset`, closer
+  to aiter's source.  It regressed to about `1847.1us`.  Not retained.
+- v29 simplified the B-q N address formula using lane-local constants.  It stayed
+  cosine-equivalent but regressed to about `1851.0us`.  Not retained.
+- v30 added fastmath to the SiLU add/mul chain.  It stayed cosine-equivalent but
+  regressed to about `1851.1us`.  Not retained.
+
+Follow-up relaxed-scale experiments:
+
+- v31 forced GEMM1 output scale to exponent byte `123`, which is the dominant
+  byte in the aiter output scale distribution for this synthetic benchmark.  It
+  failed the relaxed correctness target (`cos=0.790916`) and did not improve
+  speed (`local_mxfp4_opt_gemm1_us=1837.5` in a short graph run).  Not retained.
+- v32 removed the cross-kk max reduction and broadcast the kk0 lane's scale
+  across the 32-column group.  It also failed the relaxed correctness target
+  (`cos=0.891668`) and regressed speed (`local_mxfp4_opt_gemm1_us=1841.8` in a
+  short graph run).  Not retained.
+
+The best retained GEMM1 remains v21.
+
+Latest CUDAGraph total timings on GPU 6:
+
+```text
+CUDA_VISIBLE_DEVICES=6 /opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_opt,local_mxfp4_opt_gemm1 \
+  --warmup 5 --graph-iters 20 --measure 20
+
+local_mxfp4_opt_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_opt_gemm1_vs_aiter_mxfp4_cos=1.000000
+aiter_mxfp4_moe_us=1813.2
+local_mxfp4_opt_us=1833.8
+local_mxfp4_opt_gemm1_us=1835.9
+```
+
+Latest non-CUDAGraph torch-profiler per-kernel breakdown on GPU 6
+(`warmup=3`, `iters=5`):
+
+| path / kernel | avg us |
+| --- | ---: |
+| aiter sort_count | 6.7 |
+| aiter sort_cumsum | 10.7 |
+| aiter sort_place_pad | 33.3 |
+| aiter quant | 53.3 |
+| aiter sort_scales | 60.2 |
+| aiter GEMM1 | 718.9 |
+| aiter GEMM2 | 907.0 |
+| aiter scatter_reduce | 131.1 |
+| aiter total | 1921.3 |
+| local opt sort_count | 6.7 |
+| local opt sort_cumsum | 11.9 |
+| local opt sort_place_pad | 35.0 |
+| local opt quant | 58.7 |
+| local opt sort_scales | 65.2 |
+| local opt aiter GEMM1 | 733.1 |
+| local opt aiter GEMM2 | 906.4 |
+| local opt FlyDSL scatter_reduce | 137.6 |
+| local opt total | 1954.6 |
+| local opt GEMM1 sort_count | 6.6 |
+| local opt GEMM1 sort_cumsum | 10.9 |
+| local opt GEMM1 sort_place_pad | 33.7 |
+| local opt GEMM1 quant | 58.8 |
+| local opt GEMM1 sort_scales | 61.4 |
+| local opt GEMM1 FlyDSL GEMM1 v21 | 741.0 |
+| local opt GEMM1 aiter GEMM2 | 906.8 |
+| local opt GEMM1 FlyDSL scatter_reduce | 137.6 |
+| local opt GEMM1 total | 1956.9 |
+
+## Full FlyDSL Initial Migration
+
+The first all-FlyDSL mxfp4 pipeline is now wired as
+`local_mxfp4_all_flydsl`.  This path uses fixed-shape FlyDSL kernels for every
+runtime stage:
+
+1. `flydsl_kimi_mxfp4_sort_count_NE385_TOPK9_M16384_BM128_v0`
+2. `flydsl_kimi_mxfp4_sort_cumsum_NE385_TOPK9_M16384_BM128_v0`
+3. `flydsl_kimi_mxfp4_sort_place_pad_NE385_TOPK9_M16384_BM128_v0`
+4. `flydsl_kimi_mxfp4_quant_NE385_TOPK9_H7168_M16384_BM128_v0`
+5. `flydsl_kimi_mxfp4_sort_scales_NE385_H7168_E512_M16384_BM128_v0`
+6. `flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v21`
+7. `flydsl_kimi_mxfp4_gemm2_mxfp4out_NE385_H7168_E512_BM128_v0`
+8. `flydsl_kimi_mxfp4_scatter_reduce_q_NE385_H7168_E512_M16384_TOPK9`
+
+Correctness checks:
+
+- FlyDSL sort now matches aiter's `cumsum`, `masked_m`, full
+  `sorted_expert_ids` including the unused tail, `reverse_sorted` token/topk
+  mapping, `m_indices`, and `sorted_weights`.
+- FlyDSL quant is bitwise equal to aiter for both `a_quant` and `a_scale`.
+- FlyDSL sort_scales is bitwise equal to aiter for the consumed shuffled scale
+  byte range.
+- End-to-end all-FlyDSL output matches aiter mxfp4:
+
+```text
+CUDA_VISIBLE_DEVICES=6 /opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 0 --graph-iters 1 --measure 1
+
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+aiter_mxfp4_moe_us=2245.7
+local_mxfp4_all_flydsl_us=2738.0
+```
+
+Initial non-CUDAGraph profiler breakdown (`warmup=1`, `iters=2`):
+
+| stage | kernel | avg us |
+| --- | --- | ---: |
+| sort_count | FlyDSL v0 | 189.2 |
+| sort_cumsum | FlyDSL v0 | 227.1 |
+| sort_place_pad | FlyDSL v0 | 194.8 |
+| quant | FlyDSL v0 | 61.1 |
+| sort_scales | FlyDSL v0 | 58.7 |
+| GEMM1 | FlyDSL v21 | 738.6 |
+| GEMM2 | FlyDSL v0 | 1233.4 |
+| scatter_reduce_q | FlyDSL | 138.4 |
+| total | all FlyDSL | 2841.3 |
+
+The aux kernels intentionally prioritize algorithm/precision alignment over
+performance.  The obvious next optimization targets are the three sort kernels
+and GEMM2 v0.
+
+## Sort Kernel v1 Optimization
+
+The initial FlyDSL sort used global atomics directly in `sort_count` and
+`sort_place_pad`, and did most of `sort_cumsum` on thread 0.  v1 ports the key
+aiter structure:
+
+- `sort_count`: per-CTA `local_count[NE]` in LDS with LDS atomic add, then one
+  global write per expert.
+- `sort_place_pad`: per-CTA `local_offsets[NE]` plus `row_starts[NE+1]` in LDS,
+  with LDS atomic add for placement.
+- `sort_cumsum`: each thread handles one expert's 16 CTA counts, thread 0 only
+  performs the prefix scan over padded counts, then experts update
+  `block_offsets` and `sorted_expert_ids` in parallel.
+
+Correctness after v1:
+
+- `cumsum`, `masked_m`, full `sorted_expert_ids`, `reverse_sorted` token/topk
+  mapping, `m_indices`, and `sorted_weights` match the aiter three-stage sort.
+- End-to-end all-FlyDSL output remains bitwise equal to aiter mxfp4:
+
+```text
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+```
+
+Profiler comparison for the three FlyDSL sort kernels:
+
+| kernel | v0 avg us | v1 avg us |
+| --- | ---: | ---: |
+| sort_count | 189.2 | 7.2 |
+| sort_cumsum | 227.1 | 16.6 |
+| sort_place_pad | 194.8 | 35.8 |
+| sort total | 611.1 | 59.6 |
+
+The remaining sort gap versus aiter is now small enough that GEMM2 v0 is again
+the dominant all-FlyDSL bottleneck.
+
+## Pure Aiter vs Pure FlyDSL Snapshot
+
+`bench_flydsl_16384.py` and `profile_flydsl_16384.py` now auto-select a clean
+GPU before importing torch.  The selector uses `rocm-smi`, chooses the physical
+GPU with the lowest process VRAM, and exits if no GPU has process VRAM below
+1KB.  It binds the process by setting `HIP_VISIBLE_DEVICES`,
+and `CUDA_VISIBLE_DEVICES`.  It intentionally does not set
+`ROCR_VISIBLE_DEVICES`, because combining ROCR and HIP filters can hide the
+selected device when the physical GPU index is not zero.
+
+Measured with the current all-FlyDSL path and no mixed local-opt middle variant:
+
+```text
+/opt/venv/bin/python profile_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 3 --iters 10 --top 30
+
+[profile_flydsl_16384] Auto-selected GPU 0 (process_vram=0B, total_used=297766912B)
+```
+
+| stage | pure aiter | pure FlyDSL | delta | ratio |
+| --- | ---: | ---: | ---: | ---: |
+| sort_count | 6.4 us | 6.7 us | +0.3 us | 1.05x |
+| sort_cumsum | 10.3 us | 16.2 us | +5.9 us | 1.57x |
+| sort_place_pad | 32.4 us | 36.8 us | +4.4 us | 1.14x |
+| quant | 58.6 us | 63.0 us | +4.4 us | 1.08x |
+| sort_scales | 56.8 us | 57.6 us | +0.8 us | 1.01x |
+| GEMM1 | 716.5 us | 735.3 us | +18.8 us | 1.03x |
+| GEMM2 | 892.8 us | 1176.8 us | +284.0 us | 1.32x |
+| scatter_reduce | 135.2 us | 148.4 us | +13.2 us | 1.10x |
+| total | 1909.1 us | 2240.8 us | +331.7 us | 1.17x |
+
+Both paths launch 8 device kernels.  On a clean GPU, sort_scales is essentially
+matched; the remaining all-FlyDSL gap is dominated by GEMM2.
+
+CUDAGraph end-to-end timing from the same snapshot:
+
+```text
+/opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 5 --graph-iters 20 --measure 20
+
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+aiter_mxfp4_moe_us=1855.2
+local_mxfp4_all_flydsl_us=2146.7
+```
+
+GEMM2 v1 persistent resource comparison:
+
+| kernel | grid | LDS | SGPR | VGPR | AGPR | SGPR spill | VGPR spill | private segment |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| aiter GEMM2 nonatomic mxfp4out | 256 CTAs | 133120 B | 66 | 288 | 128 | 0 | 0 | 0 B |
+| FlyDSL GEMM2 v1 persistent | 256 CTAs | 133120 B | 53 | 272 | 16 | 0 | 0 | 0 B |
+
+So the remaining GEMM2 gap is not a scratch-spill problem.  Both kernels use
+the same LDS allocation and neither spills SGPR/VGPR.  The main remaining
+resource/scheduling difference is accumulator placement and generated schedule:
+aiter reserves 128 AGPRs for the nonatomic BM128 path, while the current FlyDSL
+kernel reports only 16 AGPRs and relies mostly on VGPR/ordinary generated MFMA
+values.
+
+## GEMM2 v2 AGPR Hint and GPU Selection Audit
+
+The GPU selector now checks both process VRAM and instantaneous GPU busy
+percentage before binding torch.  It still uses the physical `rocm-smi`
+`cardN` / `GPU[N]` index for `HIP_VISIBLE_DEVICES` and
+`CUDA_VISIBLE_DEVICES`, but now requires:
+
+```text
+process_vram < 1024 B
+GPU use <= 0%
+```
+
+This avoids the ROCm-SMI `showpids` table ambiguity where the `GPU(s)` column
+can show per-process visible ordinals; the selector uses the physical
+`showpidgpus` DRM-device mapping plus total card memory and `showuse`.
+
+GEMM2 v2 changed only codegen hints:
+
+```python
+value_attrs={"passthrough": [["amdgpu-agpr-alloc", "128,128"]]}
+compile_hints["llvm_options"] = {"amdgpu-mfma-vgpr-form": False}
+```
+
+Resource metadata for v2:
+
+| kernel | grid | LDS | SGPR | VGPR | AGPR | SGPR spill | VGPR spill | private segment |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| FlyDSL GEMM2 v2 agprhint | 256 CTAs | 133120 B | 53 | 348 | 128 | 0 | 0 | 0 B |
+
+The AGPR count now matches aiter, but VGPR rises substantially.  A profiler run
+on a clean GPU measured:
+
+```text
+aiter GEMM2: 902.3 us
+FlyDSL GEMM2 v2 agprhint: 1072.3 us
+```
+
+An additional v3 experiment staged A scales through LDS, matching aiter's
+nonatomic scale path more closely.  It stayed correct but regressed:
+
+```text
+aiter GEMM2: 911.4 us
+FlyDSL GEMM2 v3 agpr_scalelds: 1090.9 us
+```
+
+The v3 scale-staging edit was rejected; the saved GEMM2 code is v2 agprhint.
+
+## GEMM2 v4-v8 Cleanup and DPP Amax
+
+The later GEMM2 experiments were kept in
+`kimi_fp4_moe_16384_opt.py` only.  The current saved kernel is:
+
+```text
+flydsl_kimi_mxfp4_gemm2_mxfp4out_NE385_H7168_E512_BM128_v8_dppamax
+```
+
+Accumulated changes after v2:
+
+| version | change | result |
+| --- | --- | --- |
+| v4_noguard | Removed redundant block/expert/row validity checks after switching to persistent work over valid blocks. | Correct, small speedup. |
+| v5_xloadpacked | Fixed X DMA byte count to use packed fp4 bytes, reducing A `buffer_load_dwordx4` from 32 to 24. | Correct by cosine, large speedup. |
+| v6_scalelds | Staged A scales through LDS, matching aiter's scale-sharing path more closely. | Correct, reduced scalar global loads. |
+| v7_noendbar | Removed the end-of-work barrier and relied on the next persistent iteration's entry barrier. | Correct, small speedup. |
+| v8_dppamax | Replaced epilogue `shuffle_xor` amax reduction with explicit DPP update intrinsic. | Correct, large speedup; GEMM2 nearly matches aiter. |
+
+Profiler command:
+
+```text
+/opt/venv/bin/python profile_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 3 --iters 10 --top 30
+```
+
+Latest clean-GPU profiler snapshot:
+
+| stage | pure aiter | pure FlyDSL v8 | delta |
+| --- | ---: | ---: | ---: |
+| sort_count | 6.7 us | 7.2 us | +0.5 us |
+| sort_cumsum | 10.9 us | 16.4 us | +5.5 us |
+| sort_place_pad | 33.1 us | 37.6 us | +4.5 us |
+| quant | 60.0 us | 63.0 us | +3.0 us |
+| sort_scales | 61.2 us | 57.8 us | -3.4 us |
+| GEMM1 | 752.0 us | 748.4 us | -3.6 us |
+| GEMM2 | 912.6 us | 917.2 us | +4.6 us |
+| scatter_reduce | 138.0 us | 156.4 us | +18.4 us |
+| total | 1974.5 us | 2004.0 us | +29.5 us |
+
+Both paths still launch 8 device kernels per iteration.  GEMM2 is no longer the
+dominant gap in this snapshot; the remaining all-FlyDSL gap is mostly
+scatter_reduce plus small sort/cumsum overhead.
+
+CUDAGraph end-to-end timing:
+
+```text
+/opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 5 --graph-iters 20 --measure 20
+
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+aiter_mxfp4_moe_us=1859.3
+local_mxfp4_all_flydsl_us=1909.0
+```
+
+v8 ISA comparison against the aiter mxfp4out kernel:
+
+| instruction/resource | aiter | FlyDSL v8 |
+| --- | ---: | ---: |
+| `v_mfma_scale_f32_16x16x128_f8f6f4` | 128 | 128 |
+| `buffer_load_dwordx4` | 24 | 24 |
+| `buffer_load_dword` | 6 | 8 |
+| `ds_write_b32` | 128 | 128 |
+| `ds_read_b128` | 64 | 64 |
+| `s_barrier` | 4 | 4 |
+| `s_waitcnt` | 54 | 46 |
+| amax quad reduction | `v_max_u32_dpp` x32 | `v_mov_b32_dpp` x32 + `v_max_u32_e32` x32 |
+| output stores | `global_store_*` x32 | `buffer_store_*` x32 |
+| LDS | 133120 B | 133120 B |
+| AGPR | 128 | 128 |
+| VGPR | 384 | 364 |
+| SGPR | 73 | 48 |
+| spills/private segment | 0 / 0 B | 0 / 0 B |
+
+The v8 DPP change removes the previous `ds_swizzle_b32` epilogue lowering.  The
+remaining low-level differences worth checking next are the output store form
+(`global_store_* nt` in aiter versus `buffer_store_*` in FlyDSL) and the
+FlyDSL scatter_reduce kernel.
+
+## GPU Selection Note
+
+`gpu_select.py` intentionally treats `rocm-smi cardN` / `GPU[N]` as the
+physical GPU index.  It binds the process with:
+
+```text
+HIP_VISIBLE_DEVICES=N
+CUDA_VISIBLE_DEVICES=N
+```
+
+Torch then sees the selected physical GPU as logical `cuda:0`.  The selector
+does not set `ROCR_VISIBLE_DEVICES`, because setting both HIP and ROCR filters
+can remap or hide devices unexpectedly.  The current safety gate requires
+process VRAM below 1024 bytes and GPU use at 0 percent before selecting a card.

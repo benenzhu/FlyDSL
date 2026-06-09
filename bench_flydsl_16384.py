@@ -1,5 +1,9 @@
 import os
 os.system("rm -rf ~/.flydsl")
+from gpu_select import bind_empty_gpu_for_torch
+
+bind_empty_gpu_for_torch("bench_flydsl_16384")
+
 import argparse
 import sys
 from dataclasses import dataclass
@@ -37,6 +41,7 @@ from kimi_fp4_moe_16384_opt import (  # noqa: E402
     run_kimi_fp4_flydsl_atomic_stage2_16384,
     run_kimi_fp4_flydsl_mxfp4_sort_16384,
     run_kimi_fp4_mxfp4_moe_16384_aiter_ref,
+    run_kimi_fp4_mxfp4_moe_16384_all_flydsl,
     run_kimi_fp4_mxfp4_moe_16384_opt,
     run_kimi_fp4_mxfp4_moe_16384_opt_gemm1,
     run_kimi_fp4_mxfp4_moe_16384_opt_gemm2,
@@ -239,6 +244,18 @@ def run_local_mxfp4_aiter_ref(hidden, topk_ids, topk_weight, weights):
     )
 
 
+def run_local_mxfp4_all_flydsl(hidden, topk_ids, topk_weight, weights):
+    return run_kimi_fp4_mxfp4_moe_16384_all_flydsl(
+        hidden,
+        weights["w1"],
+        w2=weights["w2"],
+        topk_ids=topk_ids,
+        topk_weight=topk_weight,
+        w1_scale=weights["w1_scale"],
+        w2_scale=weights["w2_scale"],
+    )
+
+
 def make_runners(hidden, topk_ids, topk_weight, weights):
     return {
         "aiter_moe": lambda: run_aiter_moe(
@@ -290,6 +307,12 @@ def make_runners(hidden, topk_ids, topk_weight, weights):
             weights["mxfp4"],
         ),
         "local_mxfp4_opt_gemm2": lambda: run_local_mxfp4_opt_gemm2(
+            hidden,
+            topk_ids,
+            topk_weight,
+            weights["mxfp4"],
+        ),
+        "local_mxfp4_all_flydsl": lambda: run_local_mxfp4_all_flydsl(
             hidden,
             topk_ids,
             topk_weight,
@@ -390,6 +413,7 @@ def main():
         ("local_mxfp4_opt_vs_aiter_mxfp4", "local_mxfp4_opt", "aiter_mxfp4_moe"),
         ("local_mxfp4_opt_gemm1_vs_aiter_mxfp4", "local_mxfp4_opt_gemm1", "aiter_mxfp4_moe"),
         ("local_mxfp4_opt_gemm2_vs_aiter_mxfp4", "local_mxfp4_opt_gemm2", "aiter_mxfp4_moe"),
+        ("local_mxfp4_all_flydsl_vs_aiter_mxfp4", "local_mxfp4_all_flydsl", "aiter_mxfp4_moe"),
     ]
     for name, lhs_name, rhs_name in check_specs:
         if lhs_name not in outputs or rhs_name not in outputs:

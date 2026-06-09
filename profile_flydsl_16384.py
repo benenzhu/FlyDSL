@@ -3,6 +3,10 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from gpu_select import bind_empty_gpu_for_torch
+
+bind_empty_gpu_for_torch("profile_flydsl_16384")
+
 import torch
 from torch.profiler import ProfilerActivity, profile
 
