@@ -992,3 +992,71 @@ level. Static load counts still match aiter (`buffer_load=408`, `MFMA=1792`).
 The remaining GEMM1 difference is now small and is likely in lower-level
 scheduling details, MFMA operand/register allocation, and the FlyDSL lowering
 around waits/barriers rather than missing Python-level work.
+
+## GEMM1 Grid / Resource Audit
+
+The current saved code is commit `1af39d1f Optimize Kimi mxfp4 GEMM1 scheduling`.
+The code state intentionally remains v11 after later experiments did not give a
+stable win.
+
+GEMM1 launch/resource comparison from rocprof kernel traces:
+
+| kernel | workgroup | grid reported by rocprof | CTA count | LDS | VGPR | AGPR | SGPR |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| aiter GEMM1 | 256 | `(1570816, 1, 1)` | `1570816 / 256 = 6136` | 131072 | 168 | 0 | 112 |
+| FlyDSL GEMM1 v11 | 256 | `(1024, 1534, 1)` | `(1024 / 256) * 1534 = 6136` | 131072 | 168 | 0 | 112 |
+| FlyDSL GEMM1 v18 experiment | 256 | `(1024, 1534, 1)` | `(1024 / 256) * 1534 = 6136` | 131072 | 168 | 0 | 112 |
+
+So the grid shape differs (`aiter` flattens to 1D, FlyDSL uses `(N block, M
+block)`), but the physical CTA count and resource numbers match. Since `N`
+has four blocks, FlyDSL's 2D launch maps to the same logical tile order aiter
+gets from `pid / 4` and `pid % 4`; changing to 1D would mainly add block-id
+decode arithmetic unless the backend scheduler treats 1D/2D dispatch
+differently.
+
+Static ATT instruction counts also show that the suspected extra preshuffle
+loads are not the remaining issue:
+
+| instruction group | aiter | FlyDSL v11/v18 |
+| --- | ---: | ---: |
+| `v_mfma` | 1792 | 1792 |
+| `buffer_load_dwordx4` | 340 | 340 |
+| `buffer_load_dword` | 68 | 68 |
+| `global_load` | 4 | 4 |
+
+Remaining notable static differences:
+
+| group | aiter | FlyDSL v11 |
+| --- | ---: | ---: |
+| total instructions | 4368 | 4479 |
+| `s_waitcnt` | 320 | 375 |
+| `s_barrier` | 30 | 31 |
+| `ds_read` | 536 | 543 |
+| `ds_write` | 128 | 96 |
+| `v_add*` bucket | 143 | 255 |
+| `v_or*` bucket | 55 | 133 |
+| max ops | `v_max_f32/v_max3_f32` | `v_maximum3_f32` |
+
+Negative experiments after v11:
+
+- v18 changed MFMA operand packing from padded `i32x8` to direct `i32x4`.
+  It stayed bit-exact, but static ISA stayed effectively unchanged and long
+  CUDAGraph/profiler runs were not consistently faster. Not retained.
+- Waitcnt bitfield encoder experiments with explicit `vmcnt=15/13` were
+  bit-exact but slower than the existing raw wait values. Not retained.
+- Epilogue `local_max = fabs(result[0])` matched aiter source more closely but
+  slowed the measured GEMM1 path. Not retained.
+- v20 forced volatile scalar LDS stores in the C-shuffle epilogue to avoid
+  `ds_write2_b32`. Without an explicit wait it was numerically unstable; with
+  the wait it was bit-exact but slower (`aiter_mxfp4_moe_us=1815.6`,
+  `local_mxfp4_opt_gemm1_us=1838.0` in a short graph run). Not retained.
+
+Next optimization targets:
+
+1. Reduce FlyDSL's extra epilogue/address arithmetic (`v_add*`, `v_or*`) if it
+   can be done without changing correctness.
+2. Investigate why FlyDSL emits more `s_waitcnt` and one extra barrier in the
+   generated ISA.
+3. Treat the Python-level GEMM1 schedule as close to the current ceiling until
+   a lowering/pass or targeted inline-asm change removes static instruction
+   differences.
