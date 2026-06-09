@@ -1,4 +1,5 @@
 import argparse
+import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -40,7 +41,7 @@ def _profile_runner(fn, *, warmup: int, iters: int, trace_path: Path | None):
         fn()
     torch.cuda.synchronize()
 
-    with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
+    with profile(activities=[ProfilerActivity.CUDA], record_shapes=False, acc_events=True) as prof:
         for _ in range(iters):
             fn()
         torch.cuda.synchronize()
@@ -86,7 +87,7 @@ def _profile_runner_graph(
 ):
     graph = _capture_graph(fn, warmup=warmup, graph_iters=graph_iters)
 
-    with profile(activities=[ProfilerActivity.CUDA], record_shapes=False) as prof:
+    with profile(activities=[ProfilerActivity.CUDA], record_shapes=False, acc_events=True) as prof:
         for _ in range(replays):
             graph.replay()
         torch.cuda.synchronize()
@@ -115,40 +116,79 @@ def _split_by_iteration(events, iters: int):
     return chunks
 
 
-def _print_ordered_report(name: str, events, iters: int, top: int | None):
+STAGE_NAMES = (
+    "sort_count",
+    "sort_cumsum",
+    "sort_place_pad",
+    "quant",
+    "sort_scales",
+    "GEMM1",
+    "GEMM2",
+    "scatter_reduce",
+)
+
+
+def _median(values) -> float:
+    return float(statistics.median(values)) if values else 0.0
+
+
+def _ordered_rows(events, iters: int):
     chunks = _split_by_iteration(events, iters)
     total_us = sum(us for _, us in events) / iters if iters else 0.0
-
-    print()
-    print(f"== {name} ==")
-    print(f"device_total_us_per_iter={total_us:.1f}")
-
     if not chunks:
-        print(f"device_kernel_events={len(events)}")
-        print("warning=kernel sequence could not be evenly split by iteration")
-        return
-
-    per_iter = len(chunks[0])
-    print(f"device_kernel_calls_per_iter={per_iter}")
-    print("ordered kernels:")
-    print(f"{'idx':>3} {'avg_us':>9} {'pct':>6}  kernel")
+        return None
 
     rows = []
-    for idx in range(per_iter):
+    for idx in range(len(chunks[0])):
         names = [chunk[idx][0] for chunk in chunks]
         times = [chunk[idx][1] for chunk in chunks]
         same_name = all(item == names[0] for item in names)
         kernel = names[0] if same_name else "<mixed sequence>"
         avg_us = sum(times) / len(times)
         pct = 100.0 * avg_us / total_us if total_us else 0.0
-        rows.append((idx, avg_us, pct, kernel))
+        rows.append(
+            {
+                "idx": idx,
+                "avg_us": avg_us,
+                "pct": pct,
+                "kernel": kernel,
+            }
+        )
+    return {
+        "events": events,
+        "total_us": total_us,
+        "kernel_calls_per_iter": len(chunks[0]),
+        "rows": rows,
+    }
+
+
+def _print_ordered_report(name: str, events, iters: int, top: int | None):
+    report = _ordered_rows(events, iters)
+    total_us = sum(us for _, us in events) / iters if iters else 0.0
+    print()
+    print(f"== {name} ==")
+    print(f"device_total_us_per_iter={total_us:.1f}")
+
+    if report is None:
+        print(f"device_kernel_events={len(events)}")
+        print("warning=kernel sequence could not be evenly split by iteration")
+        return
+
+    per_iter = report["kernel_calls_per_iter"]
+    print(f"device_kernel_calls_per_iter={per_iter}")
+    print("ordered kernels:")
+    print(f"{'idx':>3} {'avg_us':>9} {'pct':>6}  kernel")
+    rows = report["rows"]
 
     rows_to_print = rows if top is None else rows[:top]
-    for idx, avg_us, pct, kernel in rows_to_print:
-        print(f"{idx:3d} {avg_us:9.1f} {pct:5.1f}%  {kernel}")
+    for row in rows_to_print:
+        print(
+            f"{row['idx']:3d} {row['avg_us']:9.1f} "
+            f"{row['pct']:5.1f}%  {row['kernel']}"
+        )
 
     if top is not None and len(rows) > top:
-        hidden_us = sum(row[1] for row in rows[top:])
+        hidden_us = sum(row["avg_us"] for row in rows[top:])
         print(f"... hidden_tail_us={hidden_us:.1f}")
 
     grouped = defaultdict(lambda: [0, 0.0])
@@ -174,6 +214,141 @@ def _print_ordered_report(name: str, events, iters: int, top: int | None):
         )
 
 
+def _collect_reports(
+    name: str,
+    fn,
+    *,
+    mode: str,
+    warmup: int,
+    iters: int,
+    graph_iters: int,
+    logical_iters: int,
+    repeat: int,
+    max_retries: int,
+    trace_dir: Path | None,
+    expected_kernel_calls: int | None,
+):
+    reports = []
+    attempts = 0
+    max_attempts = repeat + max_retries
+    while len(reports) < repeat and attempts < max_attempts:
+        attempts += 1
+        trace_path = None
+        if trace_dir is not None:
+            trace_path = trace_dir / f"profile_16384_{name}_sample{len(reports) + 1}.json.gz"
+        if mode == "graph":
+            events = _profile_runner_graph(
+                fn,
+                warmup=warmup,
+                graph_iters=graph_iters,
+                replays=iters,
+                trace_path=trace_path,
+            )
+        else:
+            events = _profile_runner(
+                fn,
+                warmup=warmup,
+                iters=iters,
+                trace_path=trace_path,
+            )
+        report = _ordered_rows(events, logical_iters)
+        if report is None:
+            print(
+                f"{name} sample attempt {attempts}: dropped "
+                f"(device_kernel_events={len(events)})"
+            )
+            continue
+        if (
+            expected_kernel_calls is not None
+            and report["kernel_calls_per_iter"] != expected_kernel_calls
+        ):
+            print(
+                f"{name} sample attempt {attempts}: dropped "
+                f"(kernels/iter={report['kernel_calls_per_iter']}, "
+                f"expected={expected_kernel_calls})"
+            )
+            continue
+        reports.append(report)
+        print(
+            f"{name} sample {len(reports)}/{repeat}: "
+            f"device_total_us_per_iter={report['total_us']:.1f}, "
+            f"kernels/iter={report['kernel_calls_per_iter']}"
+        )
+        if trace_path is not None:
+            print(f"trace={trace_path}")
+
+    if len(reports) < repeat:
+        raise RuntimeError(
+            f"{name}: only collected {len(reports)} valid profiler samples "
+            f"after {attempts} attempts"
+        )
+    return reports
+
+
+def _summarize_reports(name: str, reports, top: int | None):
+    total_us = _median([report["total_us"] for report in reports])
+    per_iter = reports[0]["kernel_calls_per_iter"]
+    rows = []
+    for idx in range(per_iter):
+        values = [report["rows"][idx]["avg_us"] for report in reports]
+        kernels = [report["rows"][idx]["kernel"] for report in reports]
+        kernel = kernels[0] if all(item == kernels[0] for item in kernels) else "<mixed sequence>"
+        avg_us = _median(values)
+        rows.append(
+            {
+                "idx": idx,
+                "stage": STAGE_NAMES[idx] if idx < len(STAGE_NAMES) else f"kernel_{idx}",
+                "avg_us": avg_us,
+                "pct": 100.0 * avg_us / total_us if total_us else 0.0,
+                "kernel": kernel,
+                "min_us": min(values),
+                "max_us": max(values),
+            }
+        )
+
+    print()
+    print(f"== {name} median over {len(reports)} samples ==")
+    print(f"device_total_us_per_iter={total_us:.1f}")
+    print(f"device_kernel_calls_per_iter={per_iter}")
+    print(f"{'idx':>3} {'stage':<15} {'median_us':>10} {'range_us':>17} {'pct':>6}  kernel")
+    rows_to_print = rows if top is None else rows[:top]
+    for row in rows_to_print:
+        range_text = f"{row['min_us']:.1f}..{row['max_us']:.1f}"
+        print(
+            f"{row['idx']:3d} {row['stage']:<15} {row['avg_us']:10.1f} "
+            f"{range_text:>17} {row['pct']:5.1f}%  {row['kernel']}"
+        )
+    if top is not None and len(rows) > top:
+        hidden_us = sum(row["avg_us"] for row in rows[top:])
+        print(f"... hidden_tail_us={hidden_us:.1f}")
+    return {"name": name, "total_us": total_us, "rows": rows}
+
+
+def _print_diff_report(base, candidate):
+    if len(base["rows"]) != len(candidate["rows"]):
+        print()
+        print("== kernel diff ==")
+        print("warning=runner kernel counts differ; ordered diff skipped")
+        return
+
+    print()
+    print(f"== kernel diff: {candidate['name']} - {base['name']} ==")
+    print(f"{'stage':<15} {'base_us':>9} {'cand_us':>9} {'diff_us':>9} {'diff_pct':>9}")
+    for base_row, cand_row in zip(base["rows"], candidate["rows"]):
+        diff_us = cand_row["avg_us"] - base_row["avg_us"]
+        diff_pct = 100.0 * diff_us / base_row["avg_us"] if base_row["avg_us"] else 0.0
+        print(
+            f"{base_row['stage']:<15} {base_row['avg_us']:9.1f} "
+            f"{cand_row['avg_us']:9.1f} {diff_us:9.1f} {diff_pct:8.1f}%"
+        )
+    total_diff = candidate["total_us"] - base["total_us"]
+    total_pct = 100.0 * total_diff / base["total_us"] if base["total_us"] else 0.0
+    print(
+        f"{'total':<15} {base['total_us']:9.1f} "
+        f"{candidate['total_us']:9.1f} {total_diff:9.1f} {total_pct:8.1f}%"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -187,7 +362,7 @@ def main():
         default="graph",
         help="profile CUDA/HIP graph replay by default; use eager for normal launch profiling",
     )
-    parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument(
         "--iters",
         type=int,
@@ -199,6 +374,24 @@ def main():
         type=int,
         default=20,
         help="pipeline iterations captured inside each graph replay",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=5,
+        help="valid profiler samples to collect per runner",
+    )
+    parser.add_argument(
+        "--max-retries",
+        type=int,
+        default=10,
+        help="extra profiler attempts allowed when event sequences are incomplete",
+    )
+    parser.add_argument(
+        "--expected-kernels",
+        type=int,
+        default=8,
+        help="expected device kernels per logical iteration; set 0 to disable",
     )
     parser.add_argument("--top", type=int, default=None)
     parser.add_argument(
@@ -218,12 +411,16 @@ def main():
         raise ValueError("--graph-iters must be positive in graph mode")
     if args.iters <= 0:
         raise ValueError("--iters must be positive")
+    if args.repeat <= 0:
+        raise ValueError("--repeat must be positive")
+    if args.max_retries < 0:
+        raise ValueError("--max-retries must be non-negative")
 
     logical_iters = args.iters * args.graph_iters if args.mode == "graph" else args.iters
     print(
         f"mode={args.mode} warmup={args.warmup} "
         f"iters={args.iters} graph_iters={args.graph_iters if args.mode == 'graph' else 0} "
-        f"logical_iters={logical_iters}"
+        f"logical_iters={logical_iters} repeat={args.repeat}"
     )
 
     weights = build_weights(SHAPE, device)
@@ -236,26 +433,25 @@ def main():
         raise ValueError(f"unknown runners: {', '.join(unknown)}")
 
     trace_dir = Path(args.trace_dir) if args.trace_dir else None
+    summaries = []
     for name in requested:
-        trace_path = trace_dir / f"profile_16384_{name}.json.gz" if trace_dir else None
-        if args.mode == "graph":
-            events = _profile_runner_graph(
-                runners[name],
-                warmup=args.warmup,
-                graph_iters=args.graph_iters,
-                replays=args.iters,
-                trace_path=trace_path,
-            )
-        else:
-            events = _profile_runner(
-                runners[name],
-                warmup=args.warmup,
-                iters=args.iters,
-                trace_path=trace_path,
-            )
-        _print_ordered_report(name, events, logical_iters, args.top)
-        if trace_path is not None:
-            print(f"trace={trace_path}")
+        reports = _collect_reports(
+            name,
+            runners[name],
+            mode=args.mode,
+            warmup=args.warmup,
+            iters=args.iters,
+            graph_iters=args.graph_iters,
+            logical_iters=logical_iters,
+            repeat=args.repeat,
+            max_retries=args.max_retries,
+            trace_dir=trace_dir,
+            expected_kernel_calls=args.expected_kernels or None,
+        )
+        summaries.append(_summarize_reports(name, reports, args.top))
+
+    if len(summaries) >= 2:
+        _print_diff_report(summaries[0], summaries[1])
 
 
 if __name__ == "__main__":

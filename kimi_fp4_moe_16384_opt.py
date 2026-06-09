@@ -200,7 +200,7 @@ def _lds_atomic_add_i32(lds_memref, elem_offset, value):
     ).result
 
 
-def _dpp_xor_f32(src, offset: int):
+def _dpp_xor_f32(src, offset: int, *, bound_ctrl: bool = False):
     src_i32 = src.bitcast(T.i32) if hasattr(src, "bitcast") else ArithValue(src).bitcast(T.i32)
     if offset == 1:
         dpp_ctrl = 0xB1
@@ -217,7 +217,7 @@ def _dpp_xor_f32(src, offset: int):
             arith.constant(dpp_ctrl, type=T.i32),
             arith.constant(0xF, type=T.i32),
             arith.constant(0xF, type=T.i32),
-            arith.constant(False, type=ir.IntegerType.get_signless(1)),
+            arith.constant(bound_ctrl, type=ir.IntegerType.get_signless(1)),
         ],
         [],
         [],
@@ -225,7 +225,7 @@ def _dpp_xor_f32(src, offset: int):
     return out_i32.bitcast(T.f32)
 
 
-def _dpp_xor_i32(src, offset: int):
+def _dpp_xor_i32(src, offset: int, *, bound_ctrl: bool = False):
     src_i32 = src if hasattr(src, "ir_value") else ArithValue(src)
     if offset == 1:
         dpp_ctrl = 0xB1
@@ -242,7 +242,7 @@ def _dpp_xor_i32(src, offset: int):
             arith.constant(dpp_ctrl, type=T.i32),
             arith.constant(0xF, type=T.i32),
             arith.constant(0xF, type=T.i32),
-            arith.constant(False, type=ir.IntegerType.get_signless(1)),
+            arith.constant(bound_ctrl, type=ir.IntegerType.get_signless(1)),
         ],
         [],
         [],
@@ -515,7 +515,7 @@ def compile_kimi_mxfp4_gemm1_16384():
     # Output scale layout consumed by GEMM2 for K=INTER_DIM=512.
     k_out_as_per_chunk_dw = ((INTER_DIM // 32) // 4 // 2) * 64
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v21"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v34_dppbound"
 
     @flyc.kernel(name=module_name)
     def gemm1(
@@ -1112,9 +1112,9 @@ def compile_kimi_mxfp4_gemm1_16384():
                     abs_v = llvm.call_intrinsic(f32, "llvm.fabs.f32", [res], [], [])
                     local_max = _fmax_num(local_max, abs_v)
 
-                peer1 = _dpp_xor_f32(local_max, 1)
+                peer1 = _dpp_xor_f32(local_max, 1, bound_ctrl=True)
                 local_max = _fmax_num(local_max, peer1)
-                peer2 = _dpp_xor_f32(local_max, 2)
+                peer2 = _dpp_xor_f32(local_max, 2, bound_ctrl=True)
                 local_max = _fmax_num(local_max, peer2)
 
                 amax_i32 = local_max.bitcast(i32)

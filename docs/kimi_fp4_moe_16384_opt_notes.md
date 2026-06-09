@@ -1174,7 +1174,59 @@ Follow-up relaxed-scale experiments:
   (`cos=0.891668`) and regressed speed (`local_mxfp4_opt_gemm1_us=1841.8` in a
   short graph run).  Not retained.
 
-The best retained GEMM1 remains v21.
+The best retained GEMM1 was v21 until the later DPP bound-control cleanup below.
+
+### GEMM1 v34 DPP Bound Control
+
+The saved GEMM1 kernel is now:
+
+```text
+flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM128_v34_dppbound
+```
+
+This keeps the v21 schedule and f32 amax reduction, but changes the explicit
+DPP exchange used by the epilogue quad reduction to request `bound_ctrl:1`.
+That matches the DPP form emitted by aiter GEMM1:
+
+```text
+v_mov_b32_dpp ... quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf bound_ctrl:1
+v_mov_b32_dpp ... quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf bound_ctrl:1
+```
+
+The change is deliberately narrow: MFMA schedule, global/LDS load counts,
+wait/barrier placement, and the scale math stay unchanged.  The DPP helper now
+accepts an optional `bound_ctrl` argument; existing GEMM2/scatter uses keep the
+old default.
+
+Validation:
+
+```text
+/opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 5 --graph-iters 20 --measure 20
+
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+aiter_mxfp4_moe_us=1853.5
+local_mxfp4_all_flydsl_us=1872.0
+```
+
+Graph-profiler GEMM1 samples after the change landed around `705-706us`
+(`705.9us` in the last valid ordered run).  For comparison, the previous v21
+snapshots in the same graph-profiling setup were typically in the `714-723us`
+range.  End-to-end graph replay still has several microseconds of run-to-run
+noise, so this is treated as a small GEMM1-local win rather than a full pipeline
+match.
+
+Rejected follow-up checks:
+
+- `v33_i32dppamax` replaced the two post-DPP f32 max ops with unsigned integer
+  max on the nonnegative f32 bit patterns.  It sometimes measured similarly to
+  v34, but it changed the scale-selection path more than necessary and was not
+  more stable end-to-end.
+- `v34_i32dpp_noexpguard` removed the expert-id validity check after the same
+  i32 DPP change.  It stayed correct for the fixed benchmark but did not improve
+  GEMM1 timing, so the guard was restored.
 
 Latest CUDAGraph total timings on GPU 6:
 
@@ -1661,3 +1713,59 @@ Torch then sees the selected physical GPU as logical `cuda:0`.  The selector
 does not set `ROCR_VISIBLE_DEVICES`, because setting both HIP and ROCR filters
 can remap or hide devices unexpectedly.  The current safety gate requires
 process VRAM below 1024 bytes and GPU use at 0 percent before selecting a card.
+
+## Graph Replay Measurement Defaults
+
+`bench_flydsl_16384.py` now defaults to a longer graph replay measurement:
+
+```text
+--warmup 20 --graph-iters 40 --measure 40 --repeat 3
+```
+
+Each repeat captures a fresh graph and reports the median elapsed time per
+logical MoE invocation.  The printed `<runner>_us` value is the median across
+the repeats, with `<runner>_samples_us` showing the individual sample medians.
+
+`profile_flydsl_16384.py` now profiles graph replay by default with:
+
+```text
+--warmup 20 --iters 5 --graph-iters 20 --repeat 5 --expected-kernels 8
+```
+
+The profiler keeps the per-sample window at 100 logical iterations because
+larger windows on this setup often drop device events.  The script rejects
+samples whose device event stream cannot be split into exactly 8 kernels per
+logical iteration, then reports median per-kernel timings and an ordered kernel
+diff.
+
+Latest graph replay end-to-end timing on auto-selected GPU/card 3:
+
+```text
+/opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl
+
+aiter_mxfp4_moe_samples_us=1847.5,1841.6,1841.3 range_us=1841.3..1847.5
+aiter_mxfp4_moe_us=1841.6
+local_mxfp4_all_flydsl_samples_us=1864.0,1865.8,1863.5 range_us=1863.5..1865.8
+local_mxfp4_all_flydsl_us=1864.0
+```
+
+Latest graph replay profiler median over 5 valid samples:
+
+| stage | aiter | FlyDSL all | delta |
+| --- | ---: | ---: | ---: |
+| sort_count | 6.4 us | 6.4 us | +0.1 us |
+| sort_cumsum | 10.3 us | 9.6 us | -0.7 us |
+| sort_place_pad | 32.0 us | 35.0 us | +3.0 us |
+| quant | 59.8 us | 59.8 us | -0.0 us |
+| sort_scales | 55.2 us | 54.5 us | -0.7 us |
+| GEMM1 | 698.9 us | 703.9 us | +5.0 us |
+| GEMM2 | 855.0 us | 852.0 us | -3.0 us |
+| scatter_reduce | 135.6 us | 139.7 us | +4.1 us |
+| total kernel sum | 1853.2 us | 1861.2 us | +8.0 us |
+
+The profiler kernel sum is useful for stage attribution, but the event-timed
+bench graph replay remains the authoritative end-to-end number.  In this
+snapshot the main remaining profiler-visible gaps are `GEMM1`, `scatter_reduce`,
+and `sort_place_pad`; `GEMM2`, `sort_cumsum`, and `sort_scales` are roughly
+matched or slightly ahead in FlyDSL.

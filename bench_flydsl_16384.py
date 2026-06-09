@@ -5,6 +5,7 @@ from gpu_select import bind_empty_gpu_for_torch
 bind_empty_gpu_for_torch("bench_flydsl_16384")
 
 import argparse
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -364,15 +365,18 @@ def max_abs(a, b):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--graph-iters", type=int, default=5)
-    parser.add_argument("--measure", type=int, default=5)
+    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--graph-iters", type=int, default=40)
+    parser.add_argument("--measure", type=int, default=40)
+    parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument(
         "--runners",
         default=None,
         help="comma-separated runner names; defaults to all runners",
     )
     args = parser.parse_args()
+    if args.repeat <= 0:
+        raise ValueError("--repeat must be positive")
 
     device = torch.device("cuda")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -426,7 +430,17 @@ def main():
         )
 
     for name, fn in runners.items():
-        us = bench_cudagraph(fn, args.warmup, args.graph_iters, args.measure)
+        samples = [
+            bench_cudagraph(fn, args.warmup, args.graph_iters, args.measure)
+            for _ in range(args.repeat)
+        ]
+        us = float(statistics.median(samples))
+        if len(samples) > 1:
+            formatted = ",".join(f"{sample:.1f}" for sample in samples)
+            print(
+                f"{name}_samples_us={formatted} "
+                f"range_us={min(samples):.1f}..{max(samples):.1f}"
+            )
         print(f"{name}_us={us:.1f}")
 
 
