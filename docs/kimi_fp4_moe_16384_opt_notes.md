@@ -1580,6 +1580,73 @@ weight/scale/q values before decode to increase ILP, but it measured
 instruction scheduling: aiter spends many more VGPRs to keep more memory results
 live, while the current FlyDSL version is still more serialized around waits.
 
+## Sort Cumsum v2-v4
+
+After committing scatter v4, the sort-cumsum path was optimized in
+`kimi_fp4_moe_16384_opt.py`.  The saved cumsum kernel is now:
+
+```text
+flydsl_kimi_mxfp4_sort_cumsum_NE385_TOPK9_M16384_BM128_v4_globalio
+```
+
+Changes:
+
+- v2 removed the global `expert_starts` scratch buffer.  `sort_cumsum` now keeps
+  expert starts only in LDS, and `sort_place_pad` reads the final row start from
+  `cumsum_tensor[0]`, matching aiter's data flow more closely.
+- v2 also removed the single-thread tail clear of `sorted_expert_ids`; aiter
+  does not clear blocks after `cumsum_tensor[0]`.
+- v3 changed the tid0 prefix scan over `NE=385` experts from a fully unrolled
+  `range_constexpr` to an explicit dynamic `scf.for`, reducing the huge unrolled
+  LDS read/write sequence.
+- v4 switched `sort_cumsum` I/O from buffer resources to raw global pointer
+  loads/stores.  The first pass over `block_offsets[e, 0:16]` uses
+  `vector<4xi32>` loads, lowering closer to aiter's `global_load_dwordx4`.
+
+Validation:
+
+```text
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_cos=1.000000
+local_mxfp4_all_flydsl_vs_aiter_mxfp4_max_abs=0.000000
+```
+
+Profiler snapshot:
+
+```text
+/opt/venv/bin/python profile_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 5 --iters 30 --top 30
+```
+
+| stage | aiter | FlyDSL after cumsum v4 | delta |
+| --- | ---: | ---: | ---: |
+| sort_count | 5.9 us | 6.8 us | +0.9 us |
+| sort_cumsum | 10.2 us | 9.6 us | -0.6 us |
+| sort_place_pad | 32.4 us | 35.7 us | +3.3 us |
+| quant | 58.4 us | 59.5 us | +1.1 us |
+| sort_scales | 55.9 us | 55.1 us | -0.8 us |
+| GEMM1 | 702.5 us | 723.5 us | +21.0 us |
+| GEMM2 | 863.4 us | 871.0 us | +7.6 us |
+| scatter_reduce | 134.9 us | 140.6 us | +5.7 us |
+| total | 1863.6 us | 1901.7 us | +38.1 us |
+
+The cumsum kernel itself moved from the previous `~15.6us` range to `9.6us`,
+slightly faster than aiter in this run.  v4 was kept; v2/v3 were intermediate.
+
+CUDAGraph end-to-end timing after cumsum v4:
+
+```text
+/opt/venv/bin/python bench_flydsl_16384.py \
+  --runners aiter_mxfp4_moe,local_mxfp4_all_flydsl \
+  --warmup 5 --graph-iters 20 --measure 20
+
+aiter_mxfp4_moe_us=1851.1
+local_mxfp4_all_flydsl_us=1878.7
+```
+
+At this point `sort_cumsum` is no longer a remaining gap.  The still-visible
+sort-side delta is mostly `sort_place_pad`.
+
 ## GPU Selection Note
 
 `gpu_select.py` intentionally treats `rocm-smi cardN` / `GPU[N]` as the

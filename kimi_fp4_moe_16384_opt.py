@@ -144,6 +144,14 @@ def _global_store_vec4_i32(global_ptr, elem_offset, value, *, nontemporal: bool 
     return llvm.StoreOp(raw_value, ptr, alignment=16, nontemporal=nontemporal)
 
 
+def _global_store_i32(global_ptr, elem_offset, value, *, nontemporal: bool = False):
+    elem_offset_i64 = _elem_offset_to_i64(elem_offset)
+    byte_offset_i64 = elem_offset_i64 * arith.constant(4, type=T.i64)
+    ptr = buffer_ops.get_element_ptr(global_ptr, byte_offset=byte_offset_i64, elem_type=T.i8)
+    raw_value = value.ir_value() if hasattr(value, "ir_value") else value
+    return llvm.StoreOp(raw_value, ptr, alignment=4, nontemporal=nontemporal)
+
+
 def _elem_offset_to_i64(elem_offset):
     if isinstance(elem_offset, int):
         return arith.constant(elem_offset, type=T.i64)
@@ -1894,7 +1902,6 @@ def compile_kimi_mxfp4_sort_16384():
     masked_nbytes = EXPERTS * 4
     block_offsets_nbytes = EXPERTS * sort_ctas * 4
     real_counts_nbytes = EXPERTS * 4
-    expert_starts_nbytes = (EXPERTS + 1) * 4
 
     gpu_arch = get_hip_arch()
     allocator = SmemAllocator(None, arch=gpu_arch, global_sym_name="smem_mxfp4_sort")
@@ -1955,14 +1962,13 @@ def compile_kimi_mxfp4_sort_16384():
             scf.YieldOp([])
 
     @flyc.kernel(
-        name="flydsl_kimi_mxfp4_sort_cumsum_NE385_TOPK9_M16384_BM128_v1",
+        name="flydsl_kimi_mxfp4_sort_cumsum_NE385_TOPK9_M16384_BM128_v4_globalio",
         known_block_size=[threads, 1, 1],
     )
     def sort_cumsum(
         arg_block_offsets: fx.Pointer,
         arg_masked_m: fx.Pointer,
         arg_real_counts: fx.Pointer,
-        arg_expert_starts: fx.Pointer,
         arg_cumsum_tensor: fx.Pointer,
         arg_sorted_expert_ids: fx.Pointer,
     ):
@@ -1970,12 +1976,11 @@ def compile_kimi_mxfp4_sort_16384():
         tx = gpu.thread_id("x")
         tx_i32 = arith.index_cast(i32, tx)
 
-        offsets_rsrc = _ptr_buffer_resource(arg_block_offsets, block_offsets_nbytes)
-        masked_rsrc = _ptr_buffer_resource(arg_masked_m, masked_nbytes)
-        real_rsrc = _ptr_buffer_resource(arg_real_counts, real_counts_nbytes)
-        starts_rsrc = _ptr_buffer_resource(arg_expert_starts, expert_starts_nbytes)
-        cumsum_rsrc = _ptr_buffer_resource(arg_cumsum_tensor, cumsum_nbytes)
-        expert_rsrc = _ptr_buffer_resource(arg_sorted_expert_ids, expert_nbytes)
+        offsets_ptr = _extract_global_ptr(arg_block_offsets)
+        masked_ptr = _extract_global_ptr(arg_masked_m)
+        real_ptr = _extract_global_ptr(arg_real_counts)
+        cumsum_ptr = _extract_global_ptr(arg_cumsum_tensor)
+        expert_ptr = _extract_global_ptr(arg_sorted_expert_ids)
         base_ptr = allocator.get_base()
         total_count = SmemPtr(base_ptr, lds_count_offset, T.i32, shape=(EXPERTS,)).get()
         padded_count = SmemPtr(base_ptr, lds_padded_offset, T.i32, shape=(EXPERTS,)).get()
@@ -1990,42 +1995,49 @@ def compile_kimi_mxfp4_sort_16384():
         _if_sum = scf.IfOp(e_valid)
         with ir.InsertionPoint(_if_sum.then_block):
             total = c0_i32
-            for c in range_constexpr(sort_ctas):
-                cnt = buffer_ops.buffer_load(
-                    offsets_rsrc,
-                    tx_i32 * c_sort_ctas + arith.constant(c, type=i32),
-                    vec_width=1,
-                    dtype=i32,
+            e_offsets_base = tx_i32 * c_sort_ctas
+            for c_group in range_constexpr(sort_ctas // 4):
+                cnts = _global_load_i32_vec(
+                    offsets_ptr,
+                    e_offsets_base + arith.constant(c_group * 4, type=i32),
+                    4,
                 )
-                total = total + cnt
+                for c_lane in range_constexpr(4):
+                    cnt = ArithValue(
+                        vector.extract(
+                            cnts,
+                            static_position=[c_lane],
+                            dynamic_position=[],
+                        )
+                    )
+                    total = total + cnt
             padded = (total + c_bm_minus_1) & c_bm_mask
             memref.store(total, total_count, [tx])
             memref.store(padded, padded_count, [tx])
-            buffer_ops.buffer_store(total, real_rsrc, tx_i32)
-            buffer_ops.buffer_store(padded, masked_rsrc, tx_i32)
+            _global_store_i32(real_ptr, tx_i32, total)
+            _global_store_i32(masked_ptr, tx_i32, padded)
             scf.YieldOp([])
         gpu.barrier()
 
         _if_t0 = scf.IfOp(arith.cmpi(CmpIPredicate.eq, tx_i32, c0_i32))
         with ir.InsertionPoint(_if_t0.then_block):
-            acc = c0_i32
-            for e in range_constexpr(EXPERTS):
-                e_i32 = arith.constant(e, type=i32)
-                padded = memref.load(padded_count, [arith.index(e)])
-                memref.store(acc, expert_starts, [arith.index(e)])
-                buffer_ops.buffer_store(acc, starts_rsrc, e_i32)
-                acc = acc + padded
-
-            memref.store(acc, expert_starts, [arith.index(EXPERTS)])
-            buffer_ops.buffer_store(acc, starts_rsrc, arith.constant(EXPERTS, type=i32))
-            buffer_ops.buffer_store(acc, cumsum_rsrc, c0_i32)
-            tail_b0 = acc >> arith.constant(7, type=i32)
-            for b in range(
-                ArithValue(tail_b0).index_cast(T.index),
-                arith.index(max_blocks),
+            scan = scf.ForOp(
+                arith.index(0),
+                arith.index(EXPERTS),
                 arith.index(1),
-            ):
-                buffer_ops.buffer_store(c0_i32, expert_rsrc, arith.index_cast(i32, b))
+                [arith._to_raw(c0_i32)],
+            )
+            with ir.InsertionPoint(scan.body):
+                e = scan.induction_variable
+                acc_iter = ArithValue(scan.inner_iter_args[0])
+                padded = ArithValue(memref.load(padded_count, [e]))
+                memref.store(arith._to_raw(acc_iter), expert_starts, [e])
+                next_acc = acc_iter + padded
+                scf.YieldOp([arith._to_raw(next_acc)])
+
+            acc = ArithValue(scan.results[0])
+            memref.store(arith._to_raw(acc), expert_starts, [arith.index(EXPERTS)])
+            _global_store_i32(cumsum_ptr, c0_i32, acc)
             scf.YieldOp([])
         gpu.barrier()
 
@@ -2034,8 +2046,8 @@ def compile_kimi_mxfp4_sort_16384():
             acc = memref.load(expert_starts, [tx])
             for c in range_constexpr(sort_ctas):
                 off = tx_i32 * c_sort_ctas + arith.constant(c, type=i32)
-                cnt = buffer_ops.buffer_load(offsets_rsrc, off, vec_width=1, dtype=i32)
-                buffer_ops.buffer_store(acc, offsets_rsrc, off)
+                cnt = ArithValue(_global_load_i32(offsets_ptr, off))
+                _global_store_i32(offsets_ptr, off, acc)
                 acc = acc + cnt
 
             start = memref.load(expert_starts, [tx])
@@ -2047,11 +2059,11 @@ def compile_kimi_mxfp4_sort_16384():
                 ArithValue(b1).index_cast(T.index),
                 arith.index(1),
             ):
-                buffer_ops.buffer_store(tx_i32, expert_rsrc, arith.index_cast(i32, b))
+                _global_store_i32(expert_ptr, arith.index_cast(i32, b), tx_i32)
             scf.YieldOp([])
 
     @flyc.kernel(
-        name="flydsl_kimi_mxfp4_sort_place_pad_NE385_TOPK9_M16384_BM128_v1",
+        name="flydsl_kimi_mxfp4_sort_place_pad_NE385_TOPK9_M16384_BM128_v2_cumsumtail",
         known_block_size=[threads, 1, 1],
     )
     def sort_place_pad(
@@ -2059,7 +2071,7 @@ def compile_kimi_mxfp4_sort_16384():
         arg_topk_weight: fx.Pointer,
         arg_block_offsets: fx.Pointer,
         arg_real_counts: fx.Pointer,
-        arg_expert_starts: fx.Pointer,
+        arg_cumsum_tensor: fx.Pointer,
         arg_sorted_token_ids: fx.Pointer,
         arg_reverse_sorted: fx.Pointer,
         arg_sorted_weights: fx.Pointer,
@@ -2076,7 +2088,7 @@ def compile_kimi_mxfp4_sort_16384():
         topk_weight_rsrc = _ptr_buffer_resource(arg_topk_weight, weight_nbytes)
         offsets_rsrc = _ptr_buffer_resource(arg_block_offsets, block_offsets_nbytes)
         real_rsrc = _ptr_buffer_resource(arg_real_counts, real_counts_nbytes)
-        starts_rsrc = _ptr_buffer_resource(arg_expert_starts, expert_starts_nbytes)
+        cumsum_rsrc = _ptr_buffer_resource(arg_cumsum_tensor, cumsum_nbytes)
         sorted_rsrc = _ptr_buffer_resource(arg_sorted_token_ids, sorted_nbytes)
         reverse_rsrc = _ptr_buffer_resource(arg_reverse_sorted, reverse_nbytes)
         weights_rsrc = _ptr_buffer_resource(arg_sorted_weights, sorted_nbytes)
@@ -2109,7 +2121,7 @@ def compile_kimi_mxfp4_sort_16384():
 
         _if_last_start = scf.IfOp(arith.cmpi(CmpIPredicate.eq, tx_i32, c0_i32))
         with ir.InsertionPoint(_if_last_start.then_block):
-            last = buffer_ops.buffer_load(starts_rsrc, arith.constant(EXPERTS, type=i32), vec_width=1, dtype=i32)
+            last = buffer_ops.buffer_load(cumsum_rsrc, c0_i32, vec_width=1, dtype=i32)
             memref.store(last, row_starts, [arith.index(EXPERTS)])
             scf.YieldOp([])
         gpu.barrier()
@@ -2170,7 +2182,6 @@ def compile_kimi_mxfp4_sort_16384():
         m_indices: fx.Pointer,
         block_offsets: fx.Pointer,
         real_counts: fx.Pointer,
-        expert_starts: fx.Pointer,
         stream: fx.Stream,
     ):
         allocator.finalized = False
@@ -2182,7 +2193,6 @@ def compile_kimi_mxfp4_sort_16384():
             block_offsets,
             masked_m,
             real_counts,
-            expert_starts,
             cumsum_tensor,
             sorted_expert_ids,
         ).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
@@ -2191,7 +2201,7 @@ def compile_kimi_mxfp4_sort_16384():
             topk_weight,
             block_offsets,
             real_counts,
-            expert_starts,
+            cumsum_tensor,
             sorted_token_ids,
             reverse_sorted,
             sorted_weights,
@@ -2237,7 +2247,6 @@ def kimi_mxfp4_sort_16384(
             raise ValueError(f"FlyDSL mxfp4 sort only supports block_m={MXFP4_BLOCK_M}")
         block_offsets = torch.empty((EXPERTS * 16,), device=device, dtype=dtypes.i32)
         real_counts = torch.empty((EXPERTS,), device=device, dtype=dtypes.i32)
-        expert_starts = torch.empty((EXPERTS + 1,), device=device, dtype=dtypes.i32)
         args = (
             _ptr_view_safe(topk_ids.view(-1)),
             _ptr_view_safe(topk_weight.view(-1)),
@@ -2250,7 +2259,6 @@ def kimi_mxfp4_sort_16384(
             _ptr_view_safe(m_indices.view(-1)),
             _ptr_view_safe(block_offsets.view(-1)),
             _ptr_view_safe(real_counts.view(-1)),
-            _ptr_view_safe(expert_starts.view(-1)),
             torch.cuda.current_stream(),
         )
         _run_compiled(compile_kimi_mxfp4_sort_16384(), args)
