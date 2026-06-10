@@ -2745,3 +2745,91 @@ Rejected follow-up:
   pull the pair-internal VMEM wait forward.  Static ISA moved the wait before the
   two MFMA instructions, but total `s_waitcnt` increased from 126 to 151, so it
   was not retained.
+
+## BM16 GEMM2 v8 J-Major MFMA Trial
+
+Tried changing the FlyDSL BM16 GEMM2 compute order to mirror aiter's local
+`issue_a_ds_read()` / `issue_mfma_cluster()` shape more closely.  The trial
+preloaded both A LDS packs for a K-stage first, then iterated by output J so
+each J consumed the two K half-tiles back-to-back:
+
+```text
+old v3: for k in [0,1]: ds_read A[k]; for J in [0..3]: mfma(J,k)
+trial:  ds_read A[0]; ds_read A[1]; for J in [0..3]: mfma(J,0); mfma(J,1)
+```
+
+Correctness was within the accepted cosine band:
+
+```text
+M=4   cos=0.999997795 max_abs=0.015625
+M=8   cos=0.999998868 max_abs=0.015625
+M=16  cos=0.999998808 max_abs=0.015625
+M=32  cos=0.999997795 max_abs=0.031250
+M=64  cos=0.999998808 max_abs=0.031250
+M=128 cos=0.999998569 max_abs=0.031250
+min_cos=0.999997795
+```
+
+However, the graph-mode profiler did not show a runtime win.  With
+`profile_small_bm16.py -M 64 --runners aiter,gemm1fly_aiter,allfly` and the
+current long profiler defaults, the M=64 allfly trial measured:
+
+| stage | aiter | allfly v8 trial | delta |
+| --- | ---: | ---: | ---: |
+| sort_zero_init | 6.632 us | 7.267 us | +0.635 us |
+| GEMM1 v9 | 130.987 us | 135.174 us | +4.187 us |
+| GEMM2 v8 trial | 65.428 us | 67.808 us | +2.380 us |
+| total | 203.381 us | 210.253 us | +6.872 us |
+
+This is effectively equal to the retained GEMM2 v3 baseline
+(`~67.7 us` on M=64), so the j-major compute order was reverted.  The next
+GEMM2 work still needs to address the full VMEM wait/barrier schedule rather
+than only the local MFMA loop order.
+
+## BM16 GEMM1 v11 Tail J-Major Trial
+
+Tried applying the same J-major idea only to GEMM1's final two drain/tail
+K-tiles: preload both A LDS packs with `load_a128_tile()`, then iterate by
+output J and issue the two K-half MFMA instructions back-to-back.  This matched
+the aiter source shape more closely for the tail path while leaving the main
+pipeline unchanged.
+
+Correctness stayed in the accepted band:
+
+```text
+M=4   cos=0.999997139 max_abs=0.015625
+M=8   cos=0.999998391 max_abs=0.015625
+M=16  cos=0.999998689 max_abs=0.023438
+M=32  cos=0.999998629 max_abs=0.015625
+M=64  cos=0.999998689 max_abs=0.031250
+M=128 cos=0.999998927 max_abs=0.031250
+min_cos=0.999997139
+```
+
+Graph-mode profiler checks with `repeat=101` measured:
+
+| M | aiter GEMM1 | FlyDSL trial GEMM1 | delta |
+| ---: | ---: | ---: | ---: |
+| 64 | 130.333 us | 135.311 us | +4.977 us |
+| 128 | 163.324 us | 169.223 us | +5.899 us |
+
+The trial did not give a meaningful runtime win versus the retained v9 numbers.
+The static ISA diff between v9 and the trial contained only the kernel symbol
+rename; instruction counts, VGPR/SGPR usage, waits, MFMA count, and barriers
+were identical:
+
+```text
+                 aiter   FlyDSL v9   FlyDSL trial
+s_waitcnt          126        126          126
+v_mfma             224        224          224
+ds_read             94         88           88
+ds_write            92         92           92
+s_barrier           30         30           30
+s_setprio          208        208          208
+VGPR               139        140          140
+SGPR                41         34           34
+spills               0          0            0
+```
+
+Because the compiler already emitted the same ISA for the retained v9 schedule,
+the source-only tail reorder was reverted.
