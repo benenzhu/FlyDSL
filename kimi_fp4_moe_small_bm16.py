@@ -258,11 +258,11 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
         c0_f32 = arith.constant(0.0, type=f32)
 
         is_sort_cta = arith.cmpi(CmpIPredicate.eq, bx_i32, c0_i32)
+        sort_total_pairs_i32 = ArithValue(i32_m) * c_topk
 
         # CTA0 does the single-CTA sort. All CTAs also participate in zero-init
         # below, matching aiter's sort_quant_kernel_impl prologue=0 path.
-        sort_if = scf.IfOp(is_sort_cta)
-        with ir.InsertionPoint(sort_if.then_block):
+        if is_sort_cta:
             zero_valid = arith.cmpi(CmpIPredicate.ult, tx, c_experts_idx)
             if_zero = scf.IfOp(zero_valid)
             with ir.InsertionPoint(if_zero.then_block):
@@ -270,26 +270,20 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
                 scf.YieldOp([])
             gpu.barrier()
 
-            m_idx = ArithValue(i32_m).index_cast(T.index)
-            total_pairs_idx = m_idx * arith.constant(TOPK, index=True)
-
             # Supported BM16 M buckets are multiples of 4, so TOPK routes are
             # 4-aligned. Match aiter's int4 count path instead of issuing one
             # scalar global load per route.
-            count_loop = scf.ForOp(
+            for idx in range(
                 tx * arith.constant(4, index=True),
-                total_pairs_idx,
+                sort_total_pairs_i32,
                 c_threads_idx * arith.constant(4, index=True),
-            )
-            with ir.InsertionPoint(count_loop.body):
-                idx = count_loop.induction_variable
+            ):
                 ids = _global_load_i32_vec(topk_ptr, idx, 4)
                 for lane in range_constexpr(4):
                     eid = ArithValue(
                         vector.extract(ids, static_position=[lane], dynamic_position=[])
                     )
                     _lds_atomic_add_i32(count, eid, c1_i32)
-                scf.YieldOp([])
             gpu.barrier()
 
             lane_i32 = tx_i32 % arith.constant(64, type=i32)
@@ -316,15 +310,12 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
                 _global_store_i32(masked_ptr, tx_i32, padded)
                 b0 = start // c_block_m
                 b1 = inclusive // c_block_m
-                fill_experts = scf.ForOp(
+                for b in range(
                     ArithValue(b0).index_cast(T.index),
                     ArithValue(b1).index_cast(T.index),
                     arith.index(1),
-                )
-                with ir.InsertionPoint(fill_experts.body):
-                    b = fill_experts.induction_variable
+                ):
                     _global_store_i32(expert_ptr, arith.index_cast(i32, b), tx_i32)
-                    scf.YieldOp([])
                 scf.YieldOp([])
 
             if_first = scf.IfOp(arith.cmpi(CmpIPredicate.eq, tx_i32, c0_i32))
@@ -345,7 +336,7 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
             topk_id_init = tx_i32 % c_topk
             place_loop = scf.ForOp(
                 tx,
-                total_pairs_idx,
+                ArithValue(sort_total_pairs_i32).index_cast(T.index),
                 c_threads_idx,
                 [arith._to_raw(token_id_init), arith._to_raw(topk_id_init)],
             )
@@ -383,20 +374,16 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
                 end = ArithValue(memref.load(cumsum, [e + arith.index(1)]))
                 real_end = start + cnt
                 pad = i32_m & c_token_mask
-                pad_loop = scf.ForOp(
+                for j in range(
                     ArithValue(real_end).index_cast(T.index),
                     ArithValue(end).index_cast(T.index),
                     arith.index(1),
-                )
-                with ir.InsertionPoint(pad_loop.body):
-                    j = pad_loop.induction_variable
+                ):
                     j_i32 = arith.index_cast(i32, j)
                     _global_store_i32(sorted_ptr, j_i32, pad)
                     _global_store_i32(mindices_ptr, j_i32, pad)
                     _global_store_f32(sorted_weight_ptr, j_i32, c0_f32)
-                    scf.YieldOp([])
                 scf.YieldOp([])
-            scf.YieldOp([])
 
         # Full-grid zero-init: int4 stores over M * H * sizeof(bf16).
         zero_vec = vector.from_elements(vec4_i32, [c0_i32, c0_i32, c0_i32, c0_i32])

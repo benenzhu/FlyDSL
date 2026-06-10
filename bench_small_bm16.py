@@ -8,8 +8,8 @@ from kimi_fp4_moe_small_bm16 import (
 
 
 RUNNER_ORDER = (
-    "aiter",
     "allfly",
+    "aiter",
 )
 
 # Accuracy-first defaults for the tiny BM16 path. Capture enough calls per graph
