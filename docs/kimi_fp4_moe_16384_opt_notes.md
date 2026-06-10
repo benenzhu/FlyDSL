@@ -2947,3 +2947,60 @@ reject it:
 
 The GEMM2 time is effectively unchanged from retained v3 (`~67.72 us`), so the
 schedule barrier was reverted.
+
+## BM16 GEMM2 v11 B-Scale Cache Modifier
+
+Changed the retained BM16 GEMM2 B-scale scalar load from non-temporal
+`cache_modifier=2` to normal cached `cache_modifier=0`:
+
+```text
+flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v11
+```
+
+This matches the aiter GEMM2 ISA shape more closely for the scale path: aiter's
+B-scale `buffer_load_dword` does not carry the non-temporal modifier. Correctness
+remained within the accepted cosine band for `M=4,8,16,32,64,128`
+(`min_cos=0.9999963045120239`).
+
+The profiler was also updated with a `by-kernel` aggregation mode. Ordered graph
+event slicing requires every captured replay event to be present; on this ROCm
+stack torch profiler can drop some CUDA events in large replay windows. The
+`by-kernel` mode still profiles graph replay, but aggregates each kernel name's
+captured per-call average, making the default long window usable for `M=128`.
+
+Default `profile_small_bm16.py` settings after the update:
+
+```text
+warmup=3000
+graph_iters=128
+replays=4
+repeat=101
+logical_iters_per_runner=51712
+aggregation=by-kernel
+```
+
+Graph-profiler comparisons against pure aiter:
+
+| M | stage | aiter | allfly v11 | delta |
+| ---: | --- | ---: | ---: | ---: |
+| 4 | sort_zero_init | 4.289 us | 4.140 us | -0.149 us |
+| 4 | GEMM1 v9 | 24.504 us | 25.984 us | +1.480 us |
+| 4 | GEMM2 v11 | 10.949 us | 12.351 us | +1.402 us |
+| 4 | total | 39.720 us | 42.469 us | +2.749 us |
+| 16 | sort_zero_init | 4.530 us | 4.604 us | +0.075 us |
+| 16 | GEMM1 v9 | 60.845 us | 63.897 us | +3.052 us |
+| 16 | GEMM2 v11 | 30.970 us | 30.967 us | -0.003 us |
+| 16 | total | 96.359 us | 99.477 us | +3.118 us |
+| 64 | sort_zero_init | 4.956 us | 7.213 us | +2.257 us |
+| 64 | GEMM1 v9 | 130.204 us | 135.310 us | +5.106 us |
+| 64 | GEMM2 v11 | 65.075 us | 65.078 us | +0.003 us |
+| 64 | total | 200.233 us | 207.638 us | +7.405 us |
+| 128 | sort_zero_init | 8.422 us | 8.430 us | +0.007 us |
+| 128 | GEMM1 v9 | 169.249 us | 169.200 us | -0.049 us |
+| 128 | GEMM2 v11 | 82.199 us | 82.440 us | +0.241 us |
+| 128 | total | 259.858 us | 260.048 us | +0.189 us |
+
+Conclusion: keep GEMM2 v11.  It effectively closes the retained GEMM2 gap for
+`M=16,64` and keeps `M=128` within `+0.241 us` on GEMM2.  The remaining BM16
+work should start with `M=64` GEMM1, then the `M=64` sort gap.  `M=4` still has
+a GEMM2 fixed-cost gap, but it is no longer the main throughput bucket.

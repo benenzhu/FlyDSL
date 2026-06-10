@@ -1386,7 +1386,7 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
     lds_offset = allocator._align(allocator.ptr, 16)
     allocator.ptr = lds_offset + max(lds_a_bytes, lds_acc_bytes)
 
-    module_name = "flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v3"
+    module_name = "flydsl_kimi_mxfp4_gemm2_NE385_H7168_E512_TOPK9_BM16_ATOMIC_NT_v11"
 
     @flyc.kernel(name=module_name)
     def gemm2_atomic(
@@ -1595,7 +1595,7 @@ def compile_kimi_mxfp4_gemm2_atomic_bm16():
                     + arith.constant(kt * k_bs_stride_k0_dw, index=True)
                     + lane_word
                 )
-                s = buffer_ops.buffer_load(b_scale_rsrc, scale_idx, vec_width=1, dtype=i32, cache_modifier=2)
+                s = buffer_ops.buffer_load(b_scale_rsrc, scale_idx, vec_width=1, dtype=i32, cache_modifier=0)
                 vals.append(vector.from_elements(T.vec(1, i32), [s]))
             return vals
 
