@@ -2852,3 +2852,34 @@ sample, the no-NT v5 sort measured:
 
 The normal store variant did not improve the retained v2 behavior, so v5 was
 reverted to the v2 kernel name and non-temporal zero-fill store.
+
+## BM16 Sort v6 Seven-Wave Cross-Prefix Trial
+
+Tried reducing the retained v2 cross-wave LDS prefix loop from all 16 CTA waves
+to only the `ceil(385 / 64) = 7` waves that can contain valid expert rows.  This
+kept the v2 DPP plus `ds_bpermute` wave-local scan shape and did not add the
+extra wave-total scan barrier from the rejected v3 trial.
+
+Correctness stayed in the accepted cosine band:
+
+```text
+M=4   cos=0.999997497 max_abs=0.015625
+M=8   cos=0.999997973 max_abs=0.023438
+M=16  cos=0.999997675 max_abs=0.023438
+M=32  cos=0.999998569 max_abs=0.015625
+M=64  cos=0.999998808 max_abs=0.031250
+M=128 cos=0.999998927 max_abs=0.023438
+min_cos=0.999997497
+```
+
+The graph profiler did not show a runtime win.  On an otherwise idle GPU 3,
+`profile_small_bm16.py -M 64 --runners aiter,sort_aiter` measured:
+
+| stage | aiter | FlyDSL sort v6 path | delta |
+| --- | ---: | ---: | ---: |
+| sort_zero_init | 4.970 us | 7.451 us | +2.481 us |
+| total | 201.295 us | 207.391 us | +6.096 us |
+
+The v6 sort median was worse than the retained v2/v5 measurements, so it was
+reverted.  The remaining sort gap is not fixed by simply trimming unused
+cross-wave LDS reads.
