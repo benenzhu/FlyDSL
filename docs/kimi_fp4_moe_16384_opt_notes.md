@@ -2913,3 +2913,37 @@ min_cos=0.993382812
 The trial was reverted.  This reinforces the prior ATT conclusion: GEMM2 wait
 optimization has to transplant the full aiter schedule, including the
 per-MFMA `vmcnt` ladder, rather than only splitting the coarse barrier.
+
+## BM16 GEMM2 v10 A-Load Schedule Barrier Trial
+
+Tried adding `rocdl.sched_barrier(0)` immediately after the two GEMM2 A
+direct-to-LDS loads, matching the source-level aiter atomic BM16 sequence before
+issuing scale and B loads.  This does not relax the retained full
+`s_waitcnt(0); s_barrier()` correctness fence; it only nudges compiler
+scheduling.
+
+Correctness stayed in the accepted cosine band:
+
+```text
+M=4   cos=0.999996245 max_abs=0.031250
+M=8   cos=0.999998748 max_abs=0.031250
+M=16  cos=0.999998868 max_abs=0.015625
+M=32  cos=0.999998331 max_abs=0.015625
+M=64  cos=0.999999106 max_abs=0.031250
+M=128 cos=0.999999225 max_abs=0.031250
+min_cos=0.999996245
+```
+
+M=64 graph-profiler comparison with
+`profile_small_bm16.py -M 64,128 --runners gemm1fly_aiter,allfly` was enough to
+reject it:
+
+| stage | gemm1fly_aiter | allfly v10 | delta |
+| --- | ---: | ---: | ---: |
+| sort_zero_init | 7.085 us | 7.079 us | -0.006 us |
+| GEMM1 | 135.224 us | 135.091 us | -0.133 us |
+| GEMM2 | 64.880 us | 67.731 us | +2.852 us |
+| total | 207.179 us | 209.894 us | +2.715 us |
+
+The GEMM2 time is effectively unchanged from retained v3 (`~67.72 us`), so the
+schedule barrier was reverted.
