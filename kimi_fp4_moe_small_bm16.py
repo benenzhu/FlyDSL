@@ -203,7 +203,7 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
     allocator.ptr = lds_scratch_offset + 16 * 4
 
     @flyc.kernel(
-        name="flydsl_kimi_mxfp4_sort_zero_init_NE385_TOPK9_H7168_BM16_v4_ifelse",
+        name="flydsl_kimi_mxfp4_sort_zero_init_NE385_TOPK9_H7168_BM16_v7_scan_pycmp",
         known_block_size=[threads, 1, 1],
     )
     def sort_zero_init(
@@ -264,11 +264,8 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
         # int4 stores.
         sort_if = scf.IfOp(is_sort_cta, has_else=True)
         with ir.InsertionPoint(sort_if.then_block):
-            zero_valid = arith.cmpi(CmpIPredicate.ult, tx, c_experts_idx)
-            if_zero = scf.IfOp(zero_valid)
-            with ir.InsertionPoint(if_zero.then_block):
+            if tx < c_experts_idx:
                 memref.store(c0_i32, count, [tx])
-                scf.YieldOp([])
             gpu.barrier()
 
             m_idx = ArithValue(i32_m).index_cast(T.index)
@@ -295,7 +292,7 @@ def compile_kimi_mxfp4_sort_zero_init_bm16():
 
             lane_i32 = tx_i32 % arith.constant(64, type=i32)
             wave_i32 = tx_i32 // arith.constant(64, type=i32)
-            scan_valid = arith.cmpi(CmpIPredicate.ult, tx, c_experts_idx)
+            scan_valid = tx < c_experts_idx
             cnt = ArithValue(
                 arith.select(scan_valid, memref.load(count, [tx]), arith._to_raw(c0_i32))
             )
@@ -2051,3 +2048,6 @@ def run_kimi_fp4_mxfp4_moe_small_bm16_flydsl_sort_aiter_gemm(
         inter_sorted_shuffled_scale,
     )
     return sort.atomic_output
+
+if __name__ == "__main__":
+    compile_kimi_mxfp4_sort_zero_init_bm16()
