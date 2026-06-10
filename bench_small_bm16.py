@@ -4,27 +4,23 @@ import statistics
 import bench as b
 from kimi_fp4_moe_small_bm16 import (
     run_kimi_fp4_mxfp4_moe_small_bm16_all_flydsl,
-    run_kimi_fp4_mxfp4_moe_small_bm16_flydsl_gemm1_aiter_gemm2,
-    run_kimi_fp4_mxfp4_moe_small_bm16_flydsl_sort_aiter_gemm,
 )
 
 
 RUNNER_ORDER = (
     "aiter",
-    "sort_aiter",
-    "gemm1fly_aiter",
     "allfly",
 )
 
 # Accuracy-first defaults for the tiny BM16 path. Capture enough calls per graph
 # to amortize event/replay noise, but keep the default run finite for iterative
 # kernel work. Override downward only for smoke tests.
-DEFAULT_SMALL_WARMUP = 20000
+DEFAULT_SMALL_WARMUP = 1000
 DEFAULT_SMALL_EAGER_ITERS = 500000
-DEFAULT_SMALL_GRAPH_ITERS = 2048
+DEFAULT_SMALL_GRAPH_ITERS = 1024
 DEFAULT_SMALL_GRAPH_MEASURE = 101
 DEFAULT_SMALL_GRAPH_WARMUP_REPLAYS = 20
-DEFAULT_REPEAT = 21
+DEFAULT_REPEAT = 1
 
 
 def _time_fn(fn, args):
@@ -33,6 +29,7 @@ def _time_fn(fn, args):
         if args.eager:
             samples.append(b.bench(fn, warmup=args.warmup, iters=args.iters))
         else:
+            print(f"{args.warmup} {args.graph_iters} {args.measure} {args.graph_warmup_replays}")
             samples.append(
                 b.bench_cudagraph(
                     fn,
@@ -62,28 +59,6 @@ def _make_runners(shape, m, hidden, topk_ids, topk_weight, weights, device):
         shape, m, hidden, topk_ids, topk_weight, w, device
     )
 
-    def sort_aiter():
-        return run_kimi_fp4_mxfp4_moe_small_bm16_flydsl_sort_aiter_gemm(
-            hidden,
-            w["w1"],
-            w["w2"],
-            topk_weight,
-            topk_ids,
-            w1_scale=w["w1_scale"],
-            w2_scale=w["w2_scale"],
-        )
-
-    def gemm1fly_aiter():
-        return run_kimi_fp4_mxfp4_moe_small_bm16_flydsl_gemm1_aiter_gemm2(
-            hidden,
-            w["w1"],
-            w["w2"],
-            topk_weight,
-            topk_ids,
-            w1_scale=w["w1_scale"],
-            w2_scale=w["w2_scale"],
-        )
-
     def allfly():
         return run_kimi_fp4_mxfp4_moe_small_bm16_all_flydsl(
             hidden,
@@ -97,8 +72,6 @@ def _make_runners(shape, m, hidden, topk_ids, topk_weight, weights, device):
 
     return {
         "aiter": aiter_fn,
-        "sort_aiter": sort_aiter,
-        "gemm1fly_aiter": gemm1fly_aiter,
         "allfly": allfly,
     }
 
@@ -145,11 +118,7 @@ def main():
     print("Preparing weights...", flush=True)
     weights = b.build_weights(shape, device)
 
-    header = (
-        "M,aiter_us,sort_aiter_us,gemm1fly_aiter_us,allfly_us,"
-        "sort_delta_us,gemm1_delta_us,gemm2_delta_us,"
-        "cos_sort,cos_gemm1,cos_all,max_abs_all"
-    )
+    header = "M,aiter_us,allfly_us,allfly_delta_us,cos_all,max_abs_all"
     print(header)
 
     for m in ms:
@@ -158,19 +127,17 @@ def main():
             shape, m, hidden, topk_ids, topk_weight, weights, device
         )
 
-        cos = {"sort_aiter": float("nan"), "gemm1fly_aiter": float("nan"), "allfly": float("nan")}
+        cos_all = float("nan")
         max_abs_all = float("nan")
         if not args.no_check:
             ref = runners["aiter"]().float()
             b.torch.cuda.synchronize()
-            for name in ("sort_aiter", "gemm1fly_aiter", "allfly"):
-                out = runners[name]().float()
-                b.torch.cuda.synchronize()
-                if not b.torch.isfinite(out).all().item():
-                    raise RuntimeError(f"{name} M={m} produced non-finite output")
-                cos[name] = b.cosine(ref, out)
-                if name == "allfly":
-                    max_abs_all = (ref - out).abs().max().item()
+            out = runners["allfly"]().float()
+            b.torch.cuda.synchronize()
+            if not b.torch.isfinite(out).all().item():
+                raise RuntimeError(f"allfly M={m} produced non-finite output")
+            cos_all = b.cosine(ref, out)
+            max_abs_all = (ref - out).abs().max().item()
 
         timings = {}
         for name in RUNNER_ORDER:
@@ -180,15 +147,10 @@ def main():
                 flush=True,
             )
 
-        sort_delta = timings["sort_aiter"] - timings["aiter"]
-        gemm1_delta = timings["gemm1fly_aiter"] - timings["sort_aiter"]
-        gemm2_delta = timings["allfly"] - timings["gemm1fly_aiter"]
+        allfly_delta = timings["allfly"] - timings["aiter"]
         print(
-            f"{m},{timings['aiter']:.3f},{timings['sort_aiter']:.3f},"
-            f"{timings['gemm1fly_aiter']:.3f},{timings['allfly']:.3f},"
-            f"{sort_delta:.3f},{gemm1_delta:.3f},{gemm2_delta:.3f},"
-            f"{cos['sort_aiter']:.9f},{cos['gemm1fly_aiter']:.9f},"
-            f"{cos['allfly']:.9f},{max_abs_all:.6f}",
+            f"{m},{timings['aiter']:.3f},{timings['allfly']:.3f},"
+            f"{allfly_delta:.3f},{cos_all:.9f},{max_abs_all:.6f}",
             flush=True,
         )
 
