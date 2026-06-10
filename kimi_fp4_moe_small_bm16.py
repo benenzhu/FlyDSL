@@ -577,9 +577,9 @@ def compile_kimi_mxfp4_gemm1_inline_bm16():
     lds_scale_offset = lds_offset + lds_x_bytes
     allocator.ptr = lds_offset + max(lds_x_bytes + lds_scale_bytes, lds_acc_bytes)
 
-    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v12"
+    module_name = "flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v13_knownblock"
 
-    @flyc.kernel(name=module_name)
+    @flyc.kernel(name=module_name, known_block_size=[total_threads, 1, 1])
     def gemm1_inline(
         arg_inter_sorted_quant: fx.Pointer,
         arg_inter_sorted_scale: fx.Pointer,

@@ -3043,3 +3043,54 @@ Conclusion: keep v12.  The previous retained M=64 GEMM1 gap was about
 `+5.106 us`; v12 reduces the isolated GEMM1 gap to about `+0.651 us` in the
 graph-profiler run.  The remaining M=64 work is now small enough that further
 GEMM1 changes should be validated with the full default profile window.
+
+## BM16 GEMM1 v13 Known Block Size
+
+Added an explicit FlyDSL kernel block-size declaration to the retained BM16
+GEMM1:
+
+```python
+@flyc.kernel(name=module_name, known_block_size=[256, 1, 1])
+```
+
+The retained kernel name is now:
+
+```text
+flydsl_kimi_mxfp4_gemm1_NE385_H7168_E512_BM16_INLINEQUANT_v13_knownblock
+```
+
+This is a codegen metadata change only; the GEMM schedule and math are
+unchanged.  The goal is to make the backend's flat workgroup-size knowledge
+match the actual launch more explicitly.
+
+Default graph-profiler comparison for `M=64`:
+
+```text
+/opt/venv/bin/python profile_small_bm16.py -M 64 --runners sort_aiter,gemm1fly_aiter
+```
+
+| runner | sort_zero_init | GEMM1 | GEMM2 | total |
+| --- | ---: | ---: | ---: | ---: |
+| `sort_aiter` | 7.112 us | 130.750 us | 65.342 us | 203.199 us |
+| `gemm1fly_aiter` | 7.110 us | 130.943 us | 65.335 us | 203.389 us |
+| delta | -0.002 us | +0.193 us | -0.007 us | +0.189 us |
+
+Smoke correctness with `M=4,16,64` stayed within the accepted cosine band:
+
+```text
+M=4  cos_all=0.999995410 max_abs_all=0.031250
+M=16 cos_all=0.999998987 max_abs_all=0.015625
+M=64 cos_all=0.999998987 max_abs_all=0.031250
+```
+
+Rejected related trials:
+
+- `v13_scalar_scale`: kept A-scale/B-scale as raw scalar SSA values instead of
+  wrapping them in `vec<1xi32>`.  It was correct but measured M=64 GEMM1 at
+  `+0.764 us` versus aiter, worse than retained v12/v13.
+- `v13_noexpguard`: removed the explicit `expert_i32 < EXPERTS` guard.  It was
+  correct on the tested data but measured M=64 GEMM1 at `+0.669 us`, and the
+  safety tradeoff was not worth keeping.
+
+Conclusion: keep v13 known-block.  It reduces the retained M=64 GEMM1 gap from
+about `+0.651 us` to about `+0.193 us` in the default graph-profiler window.
