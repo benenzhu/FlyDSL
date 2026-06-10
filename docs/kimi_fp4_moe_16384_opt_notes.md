@@ -2407,27 +2407,27 @@ the kernels are short and launch/event overhead can otherwise move the conclusio
 ```text
 bench.py shared defaults:
   warmup=5000
-  eager_iters=100000
-  graph_iters=32768
-  measure=701
-  graph_warmup_replays=160
-  repeat=11
+  eager_iters=200000
+  graph_iters=512
+  measure=101
+  graph_warmup_replays=20
+  repeat=15
 
 bench_small_bm16.py defaults:
-  warmup=10000
-  eager_iters=200000
-  graph_iters=49152
-  measure=701
-  graph_warmup_replays=240
-  repeat=31
+  warmup=20000
+  eager_iters=500000
+  graph_iters=2048
+  measure=101
+  graph_warmup_replays=20
+  repeat=21
 
 profile_small_bm16.py defaults:
-  warmup=2000
-  graph_iters=64
-  replays=2
-  logical_iters_per_sample=128
-  repeat=201
-  max_retries=4000
+  warmup=3000
+  graph_iters=128
+  replays=4
+  logical_iters_per_sample=512
+  repeat=101
+  max_retries=2000
 ```
 
 Use the default commands for final comparison:
@@ -2438,12 +2438,11 @@ Use the default commands for final comparison:
 ```
 
 For smoke checks only, override these values explicitly with small numbers.
-The defaults are intentionally slow: for BM16 the end-to-end bench measures
-`49152 * 701` graph calls per sample and reports 31 independent graph captures.
-The profiler uses `64 * 2` logical graph iterations per sample and `repeat=201`.
-This keeps the profiler sample window in the previously stable event-capture
-range, while increasing the total number of graph-replay observations for small
-kernels.
+The defaults are intentionally slower than smoke tests: for BM16 the end-to-end
+bench measures `2048 * 101` graph calls per sample and reports 21 independent
+graph captures.  The profiler uses `128 * 4` logical graph iterations per
+sample and `repeat=101`.  This is large enough to stabilize small-kernel
+medians while still finishing during iterative kernel work.
 
 `bench.py` now also has a `--repeat` loop and prints the per-backend timing
 samples. This makes the root sweep usable for final conclusions without relying
@@ -2833,3 +2832,23 @@ spills               0          0            0
 
 Because the compiler already emitted the same ISA for the retained v9 schedule,
 the source-only tail reorder was reverted.
+
+## BM16 Sort v5 Normal Zero-Store Trial
+
+Tried changing the BM16 fused sort/zero-init kernel from non-temporal int4
+stores back to normal int4 stores for the bf16 atomic output zero-fill.  This
+was motivated by the aiter C++ source using plain `out_v[i] = zero` in
+`zero_init_bf16_out_impl`.
+
+The graph-mode profiler did not show a win.  With
+`profile_small_bm16.py -M 64,128 --runners aiter,sort_aiter` after increasing
+the default profiler graph window to 128 captured calls and 4 graph replays per
+sample, the no-NT v5 sort measured:
+
+| M | aiter sort | FlyDSL sort v5 | sort delta | total delta |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 5.068 us | 7.270 us | +2.202 us | +2.175 us |
+| 128 | 6.602 us | 8.742 us | +2.140 us | +2.889 us |
+
+The normal store variant did not improve the retained v2 behavior, so v5 was
+reverted to the v2 kernel name and non-temporal zero-fill store.

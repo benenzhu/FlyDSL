@@ -16,15 +16,15 @@ RUNNER_ORDER = (
     "allfly",
 )
 
-# Accuracy-first defaults for the tiny BM16 path. These kernels are short, so
-# use a large captured graph and many replay measurements by default; override
-# downward only for smoke tests.
+# Accuracy-first defaults for the tiny BM16 path. Capture enough calls per graph
+# to amortize event/replay noise, but keep the default run finite for iterative
+# kernel work. Override downward only for smoke tests.
 DEFAULT_SMALL_WARMUP = 20000
 DEFAULT_SMALL_EAGER_ITERS = 500000
-DEFAULT_SMALL_GRAPH_ITERS = 65536
-DEFAULT_SMALL_GRAPH_MEASURE = 1001
-DEFAULT_SMALL_GRAPH_WARMUP_REPLAYS = 320
-DEFAULT_REPEAT = 41
+DEFAULT_SMALL_GRAPH_ITERS = 2048
+DEFAULT_SMALL_GRAPH_MEASURE = 101
+DEFAULT_SMALL_GRAPH_WARMUP_REPLAYS = 20
+DEFAULT_REPEAT = 21
 
 
 def _time_fn(fn, args):

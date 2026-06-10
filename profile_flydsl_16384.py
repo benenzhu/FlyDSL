@@ -29,11 +29,11 @@ from bench_flydsl_16384 import (  # noqa: E402
 # Profiler windows need to be longer than smoke tests for stable per-kernel
 # averages, especially in graph mode where the interesting unit is one logical
 # pipeline iteration inside the captured graph.
-DEFAULT_PROFILE_WARMUP = 100
-DEFAULT_PROFILE_ITERS = 8
-DEFAULT_PROFILE_GRAPH_ITERS = 64
-DEFAULT_PROFILE_REPEAT = 21
-DEFAULT_PROFILE_MAX_RETRIES = 400
+DEFAULT_PROFILE_WARMUP = 300
+DEFAULT_PROFILE_ITERS = 12
+DEFAULT_PROFILE_GRAPH_ITERS = 128
+DEFAULT_PROFILE_REPEAT = 31
+DEFAULT_PROFILE_MAX_RETRIES = 800
 
 
 def _is_cuda_event(evt) -> bool:

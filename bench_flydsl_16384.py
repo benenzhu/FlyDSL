@@ -48,10 +48,10 @@ M = TOKEN
 # The 16k-M pipeline is much longer than the small BM16 path, but the previous
 # defaults were smoke-test sized. Keep the graph large enough to amortize event
 # noise while avoiding an unbounded multi-hour default run.
-DEFAULT_WARMUP = 200
-DEFAULT_GRAPH_ITERS = 256
+DEFAULT_WARMUP = 500
+DEFAULT_GRAPH_ITERS = 512
 DEFAULT_GRAPH_MEASURE = 101
-DEFAULT_REPEAT = 9
+DEFAULT_REPEAT = 11
 
 
 @dataclass(frozen=True)

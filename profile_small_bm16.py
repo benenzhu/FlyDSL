@@ -8,13 +8,15 @@ from torch.profiler import ProfilerActivity, profile
 
 
 STAGE_NAMES = ("sort_zero_init", "GEMM1", "GEMM2")
-# Keep the profiler graph window bounded: larger single profiler windows have
-# dropped CUDA kernel events on this stack. Use many accepted samples instead.
-DEFAULT_PROFILE_WARMUP = 2000
-DEFAULT_PROFILE_GRAPH_ITERS = 64
-DEFAULT_PROFILE_REPLAYS = 2
-DEFAULT_PROFILE_REPEAT = 201
-DEFAULT_PROFILE_MAX_RETRIES = 4000
+# Keep the profiler graph window bounded: very large single profiler windows can
+# drop CUDA kernel events on this stack. For BM16, make each accepted sample
+# larger than a smoke test while relying on repeated accepted samples for the
+# median.
+DEFAULT_PROFILE_WARMUP = 3000
+DEFAULT_PROFILE_GRAPH_ITERS = 128
+DEFAULT_PROFILE_REPLAYS = 4
+DEFAULT_PROFILE_REPEAT = 101
+DEFAULT_PROFILE_MAX_RETRIES = 2000
 
 
 def _is_cuda_event(evt) -> bool:
