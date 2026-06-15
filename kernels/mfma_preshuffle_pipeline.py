@@ -705,19 +705,19 @@ def xcd_remap_bx_by(
     if xcd_swizzle <= 0:
         return bx, by
 
-    _c1 = fx.arith.constant(1, index=True)
-    _c_tm = fx.arith.constant(tile_m, index=True)
-    _gx = fx.arith.constant(N // tile_n, index=True)
+    _c1 = fx.Index()
+    _c_tm = fx.Index(tile_m)
+    _gx = fx.Index(N // tile_n)
     _gy = (c_m + _c_tm - _c1) / _c_tm
 
     _linear_id = bx * _gx + by
     _num_wgs = _gx * _gy
 
-    _c_xcds = fx.arith.constant(num_xcds, index=True)
+    _c_xcds = fx.Index(num_xcds)
     _wgs_per_xcd = _num_wgs / _c_xcds
     _wgid = (_linear_id % _c_xcds) * _wgs_per_xcd + (_linear_id / _c_xcds)
 
-    _c_wgm = fx.arith.constant(xcd_swizzle, index=True)
+    _c_wgm = fx.Index(xcd_swizzle)
     _num_wgid_in_group = _c_wgm * _gx
     _group_id = _wgid / _num_wgid_in_group
     _first_pid_m = _group_id * _c_wgm

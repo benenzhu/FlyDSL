@@ -36,7 +36,7 @@ from kimi_fp4_moe_16384 import (  # noqa: E402
     TOPK,
     run_kimi_fp4_flydsl_moe_16384,
 )
-from kimi_fp4_moe_16384_opt import (  # noqa: E402
+from kimi_fp4_moe_16384_opt_simplify import (  # noqa: E402
     MXFP4_STAGE1_KERNEL,
     MXFP4_STAGE2_KERNEL,
     run_kimi_fp4_mxfp4_moe_16384_all_flydsl,
