@@ -37,6 +37,10 @@ class WmmaHalfBase(ABC):
     def __call__(self, a_frag, b_frag, c_frag):
         pass
 
+    def init(self, a_frag, b_frag):
+        zero = arith.constant_vector(0.0, T.vec(self.WMMA_C_FRAG_VALUES, T.f32))
+        return self(a_frag, b_frag, zero)
+
 
 class WmmaHalf_m16n16k16(WmmaHalfBase):
     WMMA_M = 16
@@ -70,16 +74,49 @@ class WmmaHalf_m16n16k32(WmmaHalfBase):
     WMMA_B_FRAG_VALUES = 8
     WMMA_C_FRAG_VALUES = 4
 
-    def __init__(self, dtype: str):
+    def __init__(self, dtype: str, use_agpr_inline: bool = False):
         self.dtype = dtype
+        self.use_agpr_inline = use_agpr_inline
 
     def __call__(self, a_frag, b_frag, c_frag):
         res_ty = T.vec(self.WMMA_C_FRAG_VALUES, T.f32)
-        operands = [a_frag, b_frag, c_frag, 0, 0, 0]
         if self.dtype == "bf16":
+            if self.use_agpr_inline:
+                a_i32x4 = vector.bitcast(T.i32x4, a_frag)
+                b_i32x4 = vector.bitcast(T.i32x4, b_frag)
+                return llvm.inline_asm(
+                    res_ty,
+                    [
+                        arith._to_raw(a_i32x4),
+                        arith._to_raw(b_i32x4),
+                        arith._to_raw(c_frag),
+                    ],
+                    "v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0",
+                    "=a,v,v,0",
+                    has_side_effects=True,
+                )
+            operands = [a_frag, b_frag, c_frag, 0, 0, 0]
             return rocdl.mfma_f32_16x16x32_bf16(res_ty, operands)
         else:
+            operands = [a_frag, b_frag, c_frag, 0, 0, 0]
             return rocdl.mfma_f32_16x16x32_f16(res_ty, operands)
+
+    def init(self, a_frag, b_frag):
+        res_ty = T.vec(self.WMMA_C_FRAG_VALUES, T.f32)
+        if self.dtype == "bf16" and self.use_agpr_inline:
+            a_i32x4 = vector.bitcast(T.i32x4, a_frag)
+            b_i32x4 = vector.bitcast(T.i32x4, b_frag)
+            return llvm.inline_asm(
+                res_ty,
+                [
+                    arith._to_raw(a_i32x4),
+                    arith._to_raw(b_i32x4),
+                ],
+                "v_mfma_f32_16x16x32_bf16 $0, $1, $2, 0",
+                "=a,v,v",
+                has_side_effects=True,
+            )
+        return super().init(a_frag, b_frag)
 
 
 class OnlineScheduler:
@@ -136,7 +173,7 @@ def compile_hgemm_kernel(
         MFMA_PER_WARP_K = 2
         ASYNC_COPY = True
     else:
-        WMMA_IMPL = WmmaHalf_m16n16k32(dtype)
+        WMMA_IMPL = WmmaHalf_m16n16k32(dtype, use_agpr_inline=(GPU_ARCH == "gfx950" and dtype == "bf16"))
         DMA_BYTES = 16
         MFMA_PER_WARP_K = 1
         ASYNC_COPY = True
@@ -276,6 +313,7 @@ def compile_hgemm_kernel(
         ldmatrix_b_k_vec_idx = w_tid // WMMA_N * WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K
         warp_k_slice_base = wid_k * K_SLICE
         C_FRAGS_LEN = WARP_M_STEPS * WARP_N_STEPS
+        B_INITIAL_READS_CONST = 4 if WARP_N_STEPS > 4 else WARP_N_STEPS
         c_frags = [acc_init] * C_FRAGS_LEN
 
         def __barrier(vmcnt=0, use_s_barrier=True):
@@ -431,67 +469,65 @@ def compile_hgemm_kernel(
                 raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
             llvm.InlineAsmOp(None, [lds_ptr, global_offset, rsrc], asm, "s,v,s", has_side_effects=True)
 
+        def get_async_lds_ptr(lds_tensor, lds_stage, i):
+            lds_offset = lds_tensor.linear_offset((fx.Index(lds_stage), 0, 0)) * DTYPE_BYTES
+            lds_base = memref.extract_aligned_pointer_as_index(lds_tensor.memptr) + lds_offset
+            lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
+            return buffer_ops.get_element_ptr(
+                lds_ptr_base,
+                warp_offset,
+                static_byte_offset=i * BLOCK_THREADS * DMA_BYTES,
+            )
+
+        def ldg_sts_a_async_one(k_offset, lds_stage, i):
+            global_tid = BLOCK_THREADS * i + tid
+            m_local_idx = global_tid // LDG_A_X_THREADS_AS
+            k_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
+            col_in_bytes = k_local_idx * DTYPE_BYTES
+            col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
+            row_idx = m_offset + fx.Index(m_local_idx)
+            safe_row_idx = arith.select(
+                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
+                row_idx,
+                fx.Index(0),
+            )
+            col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
+            global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
+            global_offset = arith.index_cast(T.i32, global_offset)
+            lds_ptr = get_async_lds_ptr(as_, lds_stage, i)
+            buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
+
         def ldg_sts_a_async(k_offset, lds_stage):
             for i in range_constexpr(LDG_REG_A_COUNT_AS):
-                global_tid = BLOCK_THREADS * i + tid
-                m_local_idx = global_tid // LDG_A_X_THREADS_AS
-                k_local_idx = global_tid % LDG_A_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, k_blocks16)
-                row_idx = m_offset + fx.Index(m_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(m)),
-                    row_idx,
-                    fx.Index(0),
-                )
-                col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
-                # get offset
-                global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-                global_offset = arith.index_cast(T.i32, global_offset)
-                # get lds ptr
-                if const_expr(i == 0):
-                    lds_offset = as_.linear_offset((fx.Index(lds_stage), 0, 0)) * DTYPE_BYTES
-                    lds_base = memref.extract_aligned_pointer_as_index(as_.memptr) + lds_offset
-                    lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(
-                        lds_ptr,
-                        static_byte_offset=BLOCK_THREADS * DMA_BYTES,
-                    )
-                # dma copy
-                buffer_load_lds_inline(A_.rsrc, lds_ptr, global_offset)
+                ldg_sts_a_async_one(k_offset, lds_stage, i)
+
+        def ldg_sts_b_async_one(k_offset, lds_stage, i):
+            global_tid = BLOCK_THREADS * i + tid
+            n_local_idx = global_tid // LDG_B_X_THREADS_AS
+            k_local_idx = global_tid % LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
+            col_in_bytes = k_local_idx * DTYPE_BYTES
+            col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
+            row_idx = n_offset + fx.Index(n_local_idx)
+            safe_row_idx = arith.select(
+                arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
+                row_idx,
+                fx.Index(0),
+            )
+            col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
+            global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
+            global_offset = arith.index_cast(T.i32, global_offset)
+            lds_ptr = get_async_lds_ptr(bs_, lds_stage, i)
+            buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
 
         def ldg_sts_b_async(k_offset, lds_stage):
             for i in range_constexpr(LDG_REG_B_COUNT_AS):
-                global_tid = BLOCK_THREADS * i + tid
-                n_local_idx = global_tid // LDG_B_X_THREADS_AS
-                k_local_idx = global_tid % LDG_B_X_THREADS_AS * LDG_ASYNC_VEC_SIZE
-                col_in_bytes = k_local_idx * DTYPE_BYTES
-                col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, k_blocks16)
-                row_idx = n_offset + fx.Index(n_local_idx)
-                safe_row_idx = arith.select(
-                    arith.cmpi(arith.CmpIPredicate.ult, row_idx, fx.Index(n)),
-                    row_idx,
-                    fx.Index(0),
-                )
-                col_idx = fx.Index(k_offset + col_in_bytes // DTYPE_BYTES)
-                # get offset
-                global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
-                global_offset = arith.index_cast(T.i32, global_offset)
-                # get lds ptr
-                if const_expr(i == 0):
-                    lds_offset = bs_.linear_offset((fx.Index(lds_stage), 0, 0)) * DTYPE_BYTES
-                    lds_base = memref.extract_aligned_pointer_as_index(bs_.memptr) + lds_offset
-                    lds_ptr_base = buffer_ops.create_llvm_ptr(arith.index_cast(T.i64, lds_base), address_space=3)
-                    lds_ptr = buffer_ops.get_element_ptr(lds_ptr_base, warp_offset)
-                else:
-                    lds_ptr = buffer_ops.get_element_ptr(
-                        lds_ptr,
-                        static_byte_offset=BLOCK_THREADS * DMA_BYTES,
-                    )
-                # dma copy
-                buffer_load_lds_inline(B_.rsrc, lds_ptr, global_offset)
+                ldg_sts_b_async_one(k_offset, lds_stage, i)
+
+        def ldg_sts_async_one(k_offset, lds_stage, i):
+            if const_expr(i < LDG_REG_B_COUNT_AS):
+                ldg_sts_b_async_one(k_offset, lds_stage, i)
+            else:
+                ldg_sts_a_async_one(k_offset, lds_stage, i - LDG_REG_B_COUNT_AS)
 
         def ldg_matrix_b(k_offset):
             vecs = []
@@ -505,58 +541,171 @@ def compile_hgemm_kernel(
                     vecs.append(vec)
             return vecs
 
-        def ldmatrix_compute_tile_streaming(lds_stage, c_frags, initial_b_frags=None):
+        def spread_counts(numer: int, denom: int):
+            out = []
+            prev = 0
+            for i in range_constexpr(denom):
+                cur = ((i + 1) * numer + denom - 1) // denom
+                out.append(cur - prev)
+                prev = cur
+            return out
+
+        def load_a_frag_from(lds_stage, warp_atom_k_idx, ii):
+            s = lds_stage if isinstance(lds_stage, fx.Index) else fx.Index(lds_stage)
+            warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
+            row = warp_atom_m_idx + ldmatrix_a_m_idx
+            col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * DTYPE_BYTES
+            col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
+            return as_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K)
+
+        def load_b_frag_from(lds_stage, warp_atom_k_idx, jj):
+            s = lds_stage if isinstance(lds_stage, fx.Index) else fx.Index(lds_stage)
+            warp_atom_n_idx = warp_n_idx + jj * WARP_ATOM_N
+            row = warp_atom_n_idx + ldmatrix_b_n_idx
+            col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
+            col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
+            return bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
+
+        def load_initial_frags_from(lds_stage):
+            b_frags = []
+            for jj in range_constexpr(B_INITIAL_READS_CONST):
+                b_frags.append(load_b_frag_from(lds_stage, warp_k_slice_base, jj))
+            a_frag = load_a_frag_from(lds_stage, warp_k_slice_base, 0)
+            return a_frag, b_frags
+
+        def ldmatrix_compute_tile_streaming(
+            lds_stage,
+            c_frags,
+            initial_b_frags=None,
+            prefetched_initial_a_frag=None,
+            prefetched_initial_b_frags=None,
+            prefetch_k_offset=None,
+            prefetch_lds_stage=0,
+            init_zero=False,
+        ):
             s = fx.Index(lds_stage)
             c_frags_new = [cx for cx in c_frags]
+            async_load_idx = 0
+            row_group = 0
+            ldg_total = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
+            # Finish the next-tile VMEM earlier so the loop-top vmcnt wait has
+            # more MFMA distance to hide global-to-LDS latency.
+            prefetch_rows = (ldg_total + 1) // 2
+            if const_expr(prefetch_rows > WARP_K_STEPS * WARP_M_STEPS):
+                prefetch_rows = WARP_K_STEPS * WARP_M_STEPS
+            prefetch_split_1 = WARP_N_STEPS // 2
+            a_prefetch_jj = 1 if const_expr(WARP_N_STEPS > 1) else 0
+            b_initial_reads = B_INITIAL_READS_CONST
+
+            def load_a_frag(warp_atom_k_idx, ii):
+                return load_a_frag_from(s, warp_atom_k_idx, ii)
+
+            def load_b_frag(warp_atom_k_idx, jj):
+                return load_b_frag_from(s, warp_atom_k_idx, jj)
+
+            def do_mfma(ii, jj, a_frag, b_frag):
+                if const_expr(MFMA_PER_WARP_K == 2):
+                    # split a
+                    a_i64x2 = vector.bitcast(T.i64x2, a_frag)
+                    a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
+                    a1_i64 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
+                    a_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a0_i64]))
+                    a_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a1_i64]))
+                    # split b
+                    b_i64x2 = vector.bitcast(T.i64x2, b_frag)
+                    b0_i64 = vector.extract(b_i64x2, static_position=[0], dynamic_position=[])
+                    b1_i64 = vector.extract(b_i64x2, static_position=[1], dynamic_position=[])
+                    b_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b0_i64]))
+                    b_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b1_i64]))
+                    c_idx = ii * WARP_N_STEPS + jj
+                    acc_in = c_frags_new[c_idx]
+                    acc_mid = WMMA_IMPL(a_v0, b_v0, acc_in)
+                    c_frags_new[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
+                elif const_expr(MFMA_PER_WARP_K == 1):
+                    c_idx = ii * WARP_N_STEPS + jj
+                    c_frags_new[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags_new[c_idx])
+                else:
+                    raise NotImplementedError(f"MFMA_PER_WARP_K={MFMA_PER_WARP_K} not supported")
+
+            next_k_a_frag = None
+            next_k_b_frags = [None] * WARP_N_STEPS
+            next_k_prefetch_ii = WARP_M_STEPS - 2 if const_expr(WARP_M_STEPS > 1) else 0
+            next_k_prefetch_a_jj = b_initial_reads if const_expr(b_initial_reads < WARP_N_STEPS) else WARP_N_STEPS - 1
+
             for kk in range_constexpr(WARP_K_STEPS):
                 warp_atom_k_idx = warp_k_slice_base + kk * WARP_ATOM_K
-                if const_expr(initial_b_frags is None):
+                if const_expr(initial_b_frags is None and kk == 0 and prefetched_initial_b_frags is not None):
                     b_frags = [0] * WARP_N_STEPS
-                    for ii in range_constexpr(WARP_N_STEPS):
-                        warp_atom_n_idx = warp_n_idx + ii * WARP_ATOM_N
-                        row = warp_atom_n_idx + ldmatrix_b_n_idx
-                        col_in_bytes = (warp_atom_k_idx + ldmatrix_b_k_vec_idx) * DTYPE_BYTES
-                        col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                        vec = bs_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_B_FRAG_VALUES * MFMA_PER_WARP_K)
-                        b_frags[ii] = vec
+                    for jj in range_constexpr(b_initial_reads):
+                        b_frags[jj] = prefetched_initial_b_frags[jj]
+                elif const_expr(initial_b_frags is None and kk > 0):
+                    b_frags = [0] * WARP_N_STEPS
+                    for jj in range_constexpr(b_initial_reads):
+                        b_frags[jj] = next_k_b_frags[jj]
+                elif const_expr(initial_b_frags is None):
+                    b_frags = [0] * WARP_N_STEPS
+                    for jj in range_constexpr(b_initial_reads):
+                        b_frags[jj] = load_b_frag(warp_atom_k_idx, jj)
                 else:
                     b_frags = [initial_b_frags[i] for i in range_constexpr(kk * WARP_N_STEPS, (kk + 1) * WARP_N_STEPS)]
-                a_frags = [0] * WARP_M_STEPS
-                for ii in range_constexpr(WARP_M_STEPS):
-                    warp_atom_m_idx = warp_m_idx + ii * WARP_ATOM_M
-                    row = warp_atom_m_idx + ldmatrix_a_m_idx
-                    col_in_bytes = (warp_atom_k_idx + ldmatrix_a_k_vec_idx) * DTYPE_BYTES
-                    col_in_bytes = swizzle_xor16(row, col_in_bytes, k_blocks16)
-                    vec = as_.vec_load((s, row, col_in_bytes // DTYPE_BYTES), WMMA_A_FRAG_VALUES * MFMA_PER_WARP_K)
-                    a_frags[ii] = vec
+                if const_expr(initial_b_frags is None and kk == 0 and prefetched_initial_a_frag is not None):
+                    a_frag = prefetched_initial_a_frag
+                elif const_expr(initial_b_frags is None and kk > 0):
+                    a_frag = next_k_a_frag
+                else:
+                    a_frag = load_a_frag(warp_atom_k_idx, 0)
+                next_k_a_frag = None
+                next_k_b_frags = [None] * WARP_N_STEPS
                 rocdl.sched_barrier(0)
                 for ii in range_constexpr(WARP_M_STEPS):
-                    a_frag = a_frags[ii]
+                    a_frag_next = a_frag
                     for jj in range_constexpr(WARP_N_STEPS):
                         b_frag = b_frags[jj]
-                        if const_expr(MFMA_PER_WARP_K == 2):
-                            # split a
-                            a_i64x2 = vector.bitcast(T.i64x2, a_frag)
-                            a0_i64 = vector.extract(a_i64x2, static_position=[0], dynamic_position=[])
-                            a1_i64 = vector.extract(a_i64x2, static_position=[1], dynamic_position=[])
-                            a_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a0_i64]))
-                            a_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [a1_i64]))
-                            # split b
-                            b_i64x2 = vector.bitcast(T.i64x2, b_frag)
-                            b0_i64 = vector.extract(b_i64x2, static_position=[0], dynamic_position=[])
-                            b1_i64 = vector.extract(b_i64x2, static_position=[1], dynamic_position=[])
-                            b_v0 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b0_i64]))
-                            b_v1 = vector.bitcast(T.f16x4, vector.from_elements(T.vec(1, T.i64), [b1_i64]))
-                            # wmma
-                            c_idx = ii * WARP_N_STEPS + jj
-                            acc_in = c_frags_new[c_idx]
-                            acc_mid = WMMA_IMPL(a_v0, b_v0, acc_in)
-                            c_frags_new[c_idx] = WMMA_IMPL(a_v1, b_v1, acc_mid)
-                        elif const_expr(MFMA_PER_WARP_K == 1):
-                            c_idx = ii * WARP_N_STEPS + jj
-                            c_frags_new[c_idx] = WMMA_IMPL(a_frag, b_frag, c_frags_new[c_idx])
+                        if const_expr(init_zero and kk == 0):
+                            c_frags_new[ii * WARP_N_STEPS + jj] = WMMA_IMPL.init(a_frag, b_frag)
                         else:
-                            raise NotImplementedError(f"MFMA_PER_WARP_K={MFMA_PER_WARP_K} not supported")
+                            do_mfma(ii, jj, a_frag, b_frag)
+                        if const_expr(
+                            initial_b_frags is None
+                            and ii == 0
+                            and jj + b_initial_reads < WARP_N_STEPS
+                        ):
+                            b_frags[jj + b_initial_reads] = load_b_frag(warp_atom_k_idx, jj + b_initial_reads)
+                        if const_expr(ii + 1 < WARP_M_STEPS and jj == a_prefetch_jj):
+                            a_frag_next = load_a_frag(warp_atom_k_idx, ii + 1)
+                        if const_expr(
+                            initial_b_frags is None
+                            and kk + 1 < WARP_K_STEPS
+                            and ii == next_k_prefetch_ii
+                            and jj == 0
+                        ):
+                            next_k_b_frags = [None] * WARP_N_STEPS
+                        if const_expr(
+                            initial_b_frags is None
+                            and kk + 1 < WARP_K_STEPS
+                            and ii == next_k_prefetch_ii
+                            and jj < b_initial_reads
+                        ):
+                            next_k_warp_atom_k_idx = warp_k_slice_base + (kk + 1) * WARP_ATOM_K
+                            next_k_b_frags[jj] = load_b_frag(next_k_warp_atom_k_idx, jj)
+                        if const_expr(
+                            initial_b_frags is None
+                            and kk + 1 < WARP_K_STEPS
+                            and ii == next_k_prefetch_ii
+                            and jj == next_k_prefetch_a_jj
+                        ):
+                            next_k_warp_atom_k_idx = warp_k_slice_base + (kk + 1) * WARP_ATOM_K
+                            next_k_a_frag = load_a_frag(next_k_warp_atom_k_idx, 0)
+                        if const_expr(
+                            prefetch_k_offset is not None
+                            and row_group < prefetch_rows
+                            and async_load_idx < ldg_total
+                            and (jj == 0 or jj == prefetch_split_1)
+                        ):
+                            ldg_sts_async_one(prefetch_k_offset, prefetch_lds_stage, async_load_idx)
+                            async_load_idx += 1
+                    a_frag = a_frag_next
+                    row_group += 1
             return c_frags_new
 
         warp_offset = get_dma_copy_warp_offset()
@@ -571,41 +720,103 @@ def compile_hgemm_kernel(
                 ldg_sts_a_async(ks_begin + s * BLOCK_K, s)
             rocdl.sched_barrier(0)
 
-            def hot_loop_scheduler():
-                # ================ Ordered ================
-                for i in range_constexpr(LDG_REG_B_COUNT_AS):
-                    rocdl.sched_vmem(1)  # ldg_sts_b_async next
-                for i in range_constexpr(LDG_REG_A_COUNT_AS):
-                    rocdl.sched_vmem(1)  # ldg_sts_a_async next
+            def hot_loop_scheduler(prefetched_initial=False, tail_prefetch_initial=False):
+                LDG_TOTAL = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
+                MFMA_PER_ROW = WARP_N_STEPS * MFMA_PER_WARP_K
+                PREFETCH_ROWS = (LDG_TOTAL + 1) // 2
+                if const_expr(PREFETCH_ROWS > WARP_K_STEPS * WARP_M_STEPS):
+                    PREFETCH_ROWS = WARP_K_STEPS * WARP_M_STEPS
+                PREFETCH_SPLIT_1 = WARP_N_STEPS // 2
+                A_PREFETCH_JJ = 1 if const_expr(WARP_N_STEPS > 1) else 0
+                B_INITIAL_READS = 4 if const_expr(WARP_N_STEPS > 4) else WARP_N_STEPS
+                NEXT_K_PREFETCH_II = WARP_M_STEPS - 2 if const_expr(WARP_M_STEPS > 1) else 0
+                NEXT_K_PREFETCH_A_JJ = B_INITIAL_READS if const_expr(B_INITIAL_READS < WARP_N_STEPS) else WARP_N_STEPS - 1
+                row_group = 0
                 for ki in range_constexpr(WARP_K_STEPS):
-                    for i in range_constexpr(WARP_N_STEPS):
-                        rocdl.sched_dsrd(1)  # lds_matrix_b current
+                    if const_expr(ki == 0 and not prefetched_initial):
+                        for i in range_constexpr(B_INITIAL_READS):
+                            rocdl.sched_dsrd(1)  # lds_matrix_b current
+                        rocdl.sched_dsrd(1)  # first lds_matrix_a current
                     for i in range_constexpr(WARP_M_STEPS):
-                        rocdl.sched_dsrd(1)  # lds_matrix_a current
-                    for i in range_constexpr(WARP_M_STEPS):
-                        rocdl.sched_mfma(WARP_N_STEPS)
-                # ================ Reordered ================
+                        for j in range_constexpr(WARP_N_STEPS):
+                            rocdl.sched_mfma(MFMA_PER_WARP_K)
+                            if const_expr(i == 0 and j + B_INITIAL_READS < WARP_N_STEPS):
+                                rocdl.sched_dsrd(1)  # next lds_matrix_b current
+                            if const_expr(i + 1 < WARP_M_STEPS and j == A_PREFETCH_JJ):
+                                rocdl.sched_dsrd(1)  # next lds_matrix_a current
+                            if const_expr(ki + 1 < WARP_K_STEPS and i == NEXT_K_PREFETCH_II and j < B_INITIAL_READS):
+                                rocdl.sched_dsrd(1)  # first lds_matrix_b next k-slice
+                            if const_expr(ki + 1 < WARP_K_STEPS and i == NEXT_K_PREFETCH_II and j == NEXT_K_PREFETCH_A_JJ):
+                                rocdl.sched_dsrd(1)  # first lds_matrix_a next k-slice
+                            if const_expr(
+                                row_group < PREFETCH_ROWS
+                                and (j == 0 or j == PREFETCH_SPLIT_1)
+                            ):
+                                rocdl.sched_vmem(1)
+                        row_group += 1
                 rocdl.sched_barrier(0)
+                if const_expr(tail_prefetch_initial):
+                    for i in range_constexpr(B_INITIAL_READS):
+                        rocdl.sched_dsrd(1)  # first lds_matrix_b next BLOCK_K tile
+                    rocdl.sched_dsrd(1)  # first lds_matrix_a next BLOCK_K tile
 
-            init_state = [ks_begin, arith.constant(0, index=True)] + c_frags
-            for bki, state in range(0, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state):
+            __barrier((STAGES - 2) * LDG_WAIT_COUNT)
+            c_frags = ldmatrix_compute_tile_streaming(
+                arith.constant(0, index=True),
+                c_frags,
+                prefetch_k_offset=ks_begin + BLOCK_K,
+                prefetch_lds_stage=arith.constant((STAGES - 1) % STAGES, index=True),
+                init_zero=True,
+            )
+            hot_loop_scheduler(tail_prefetch_initial=True)
+            next_stage_init = arith.constant(1 % STAGES, index=True)
+            __barrier((STAGES - 2) * LDG_WAIT_COUNT)
+            prefetched_tile_a_frag, prefetched_tile_b_frags = load_initial_frags_from(next_stage_init)
+
+            init_state = (
+                [ks_begin + fx.Int32(BLOCK_K), next_stage_init]
+                + c_frags
+                + [prefetched_tile_a_frag]
+                + prefetched_tile_b_frags
+            )
+            for bki, state in range(1, BLOCK_K_LOOPS - (STAGES - 1), 1, init=init_state):
                 k_offset = state[0]
                 current_stage = fx.Index(state[1])
-                c_frags = state[2:]
+                c_frags = state[2 : 2 + C_FRAGS_LEN]
+                prefetched_tile_a_frag = state[2 + C_FRAGS_LEN]
+                prefetched_tile_b_frags = state[3 + C_FRAGS_LEN : 3 + C_FRAGS_LEN + B_INITIAL_READS_CONST]
                 next_stage = (current_stage + 1) % STAGES
                 write_stage = (current_stage + STAGES - 1) % STAGES
-                __barrier((STAGES - 2) * LDG_WAIT_COUNT)
-                ldg_sts_b_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
-                ldg_sts_a_async(k_offset + (STAGES - 1) * BLOCK_K, write_stage)
-                c_frags_new = ldmatrix_compute_tile_streaming(current_stage, c_frags)
+                prefetch_k_offset = k_offset + (STAGES - 1) * BLOCK_K
+                c_frags_new = ldmatrix_compute_tile_streaming(
+                    current_stage,
+                    c_frags,
+                    prefetched_initial_a_frag=prefetched_tile_a_frag,
+                    prefetched_initial_b_frags=prefetched_tile_b_frags,
+                    prefetch_k_offset=prefetch_k_offset,
+                    prefetch_lds_stage=write_stage,
+                )
                 k_offset_next = k_offset + fx.Int32(BLOCK_K)
-                hot_loop_scheduler()
-                results = yield [k_offset_next, next_stage] + c_frags_new
+                hot_loop_scheduler(prefetched_initial=True, tail_prefetch_initial=True)
+                __barrier((STAGES - 2) * LDG_WAIT_COUNT)
+                prefetched_tile_a_frag_next, prefetched_tile_b_frags_next = load_initial_frags_from(next_stage)
+                results = (
+                    yield [k_offset_next, next_stage]
+                    + c_frags_new
+                    + [prefetched_tile_a_frag_next]
+                    + prefetched_tile_b_frags_next
+                )
             current_stage = fx.Index(results[1])
-            c_frags = results[2:]
+            c_frags = results[2 : 2 + C_FRAGS_LEN]
+            prefetched_tile_a_frag = results[2 + C_FRAGS_LEN]
+            prefetched_tile_b_frags = results[3 + C_FRAGS_LEN : 3 + C_FRAGS_LEN + B_INITIAL_READS_CONST]
             for s in range_constexpr(0, STAGES - 1):
-                __barrier((STAGES - 2 - s) * LDG_WAIT_COUNT)
-                c_frags = ldmatrix_compute_tile_streaming(current_stage, c_frags)
+                c_frags = ldmatrix_compute_tile_streaming(
+                    current_stage,
+                    c_frags,
+                    prefetched_initial_a_frag=prefetched_tile_a_frag,
+                    prefetched_initial_b_frags=prefetched_tile_b_frags,
+                )
                 current_stage = (current_stage + 1) % STAGES
 
         else:
