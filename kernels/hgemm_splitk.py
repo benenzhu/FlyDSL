@@ -915,7 +915,9 @@ def compile_hgemm_kernel(
             # so their ~64-cyc latency hides fully under the 64 MFMAs. ds_reads are
             # spread front-loaded-but-interleaved so all land before the half's
             # trailing lgkmcnt(0).
-            def compute_slice_interleaved(a_frags, b_frags, read_k_idx, read_stage=None, zero_acc=False):
+            def compute_slice_interleaved(
+                a_frags, b_frags, read_k_idx, read_stage=None, zero_acc=False, bfld_tasks=None
+            ):
                 out_a = [0] * WARP_M_STEPS
                 out_b = [0] * WARP_N_STEPS
                 rstage = s if read_stage is None else fx.Index(read_stage)
@@ -929,7 +931,13 @@ def compile_hgemm_kernel(
                 # Distribute the reads across the MFMA grid; keep them in the first
                 # ~3/4 of the MFMAs so they all complete before the closing lgkmcnt.
                 read_at = spread_counts(n_reads, WARP_M_STEPS * WARP_N_STEPS)
-                cursor = 0
+                # bfld (global->LDS) prefetch is also dripped one-per-MFMA into the
+                # co-issue shadows instead of bursting at the region head.
+                tasks = bfld_tasks if bfld_tasks is not None else []
+                n_tasks = len(tasks)
+                bfld_at = spread_counts(n_tasks, WARP_M_STEPS * WARP_N_STEPS)
+                read_cursor = 0
+                bfld_cursor = 0
                 for ii in range_constexpr(WARP_M_STEPS):
                     for jj in range_constexpr(WARP_N_STEPS):
                         if const_expr(zero_acc):
@@ -937,13 +945,16 @@ def compile_hgemm_kernel(
                         else:
                             do_mfma(ii, jj, a_frags[ii], b_frags[jj])
                         step = ii * WARP_N_STEPS + jj
+                        for _ in range_constexpr(bfld_at[step]):
+                            tasks[bfld_cursor]()
+                            bfld_cursor += 1
                         for _ in range_constexpr(read_at[step]):
-                            kind, idx = reads[cursor]
+                            kind, idx = reads[read_cursor]
                             if const_expr(kind == "a"):
                                 out_a[idx] = load_a_frag_from(rstage, read_k_idx, idx)
                             else:
                                 out_b[idx] = load_b_frag_from(rstage, read_k_idx, idx)
-                            cursor += 1
+                            read_cursor += 1
                 return out_a, out_b
 
             # K0 operands of this tile are fully carried in on entry (a0/b0 full
@@ -952,22 +963,36 @@ def compile_hgemm_kernel(
             a0_frags = load_a_slice(k0_idx, prefetched_initial_a_frag)
             b0_frags = load_b_slice(k0_idx, prefetched_initial_b_frags)
 
-            # half-1: bfld next tile's K1 (lead 1); compute K0 while reading this
-            # tile's K1 operands for half-2.
-            if const_expr(prefetch_k_offset is not None):
-                ldg_sts_async_kgroup(prefetch_k_offset, prefetch_lds_stage, 1)
-            a1_frags, b1_frags = compute_slice_interleaved(a0_frags, b0_frags, k1_idx, zero_acc=init_zero)
+            def make_bfld_tasks(k_offset, lds_stage, k_group):
+                # One callable per buffer_load in this k-group (B rows then A rows),
+                # to be dripped into the MFMA loop instead of bursting up front.
+                tasks = []
+                for i in range_constexpr(B_LDS_ROW_GROUPS):
+                    tasks.append(lambda i=i: ldg_sts_b_async_one(k_offset, lds_stage, k_group * B_LDS_ROW_GROUPS + i))
+                for i in range_constexpr(A_LDS_ROW_GROUPS):
+                    tasks.append(lambda i=i: ldg_sts_a_async_one(k_offset, lds_stage, k_group * A_LDS_ROW_GROUPS + i))
+                return tasks
+
+            # half-1: bfld next tile's K1 (lead 1) dripped into the MFMAs; compute K0
+            # while reading this tile's K1 operands for half-2.
+            h1_bfld = make_bfld_tasks(prefetch_k_offset, prefetch_lds_stage, 1) if prefetch_k_offset is not None else None
+            a1_frags, b1_frags = compute_slice_interleaved(
+                a0_frags, b0_frags, k1_idx, zero_acc=init_zero, bfld_tasks=h1_bfld
+            )
 
             __barrier_lgkmcnt()
 
-            # half-2: bfld the tile-after-next's K0 (lead 2) into the just-consumed
-            # buffer; compute K1 while reading the NEXT tile's K0 group (from
+            # half-2: bfld the tile-after-next's K0 (lead 2) dripped into the MFMAs;
+            # compute K1 while reading the NEXT tile's K0 group (from
             # next_k0_read_stage) to carry into the next iteration.
-            if const_expr(k0_prefetch_k_offset is not None):
-                ldg_sts_async_kgroup(k0_prefetch_k_offset, k0_prefetch_lds_stage, 0)
+            h2_bfld = (
+                make_bfld_tasks(k0_prefetch_k_offset, k0_prefetch_lds_stage, 0)
+                if k0_prefetch_k_offset is not None
+                else None
+            )
             next_a0, next_b0 = compute_slice_interleaved(
                 a1_frags, b1_frags, k0_idx if next_k0_read_stage is not None else None,
-                read_stage=next_k0_read_stage,
+                read_stage=next_k0_read_stage, bfld_tasks=h2_bfld,
             )
             return c_frags_new, next_a0, next_b0
 
