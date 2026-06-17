@@ -64,3 +64,19 @@ Thumbs.db
 # Sphinx documentation build
 docs/_build/
 python/flydsl/_mlir
+
+
+*.hsaco
+core
+core.gpu
+*.mlir
+*.ll
+*.s
+*.out
+*.bc
+*.o
+*.s
+*.bc
+*.o
+*.stderr
+*.stdout
