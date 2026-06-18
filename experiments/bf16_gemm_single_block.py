@@ -202,11 +202,17 @@ def main() -> None:
         action="store_true",
         help="Preshuffle A/B so each [256, BLOCK_K] tile is contiguous in global memory.",
     )
+    parser.add_argument(
+        "--xcd-swizzle",
+        action="store_true",
+        help="Enable XCD-aware CTA tile remap for L2 reuse across the 8 gfx950 XCDs.",
+    )
     args = parser.parse_args()
     HGEMM_KWARGS["A_LDS_K32_BLOCKING"] = bool(args.a_lds_k32_blocking)
     HGEMM_KWARGS["B_LDS_K32_BLOCKING"] = bool(args.b_lds_k32_blocking)
     HGEMM_KWARGS["K32_REGISTER_PIPELINE"] = bool(args.k32_register_pipeline)
     HGEMM_KWARGS["PRESHUFFLE"] = bool(args.preshuffle)
+    HGEMM_KWARGS["XCD_SWIZZLE"] = bool(args.xcd_swizzle)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA/ROCm device is not available")

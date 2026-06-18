@@ -154,6 +154,8 @@ def compile_hgemm_kernel(
     B_LDS_K32_BLOCKING: bool = False,
     K32_REGISTER_PIPELINE: bool = False,
     PRESHUFFLE: bool = False,
+    XCD_SWIZZLE: bool = False,
+    XCD_WGM: int = 4,
     HAS_BIAS: bool = False,
 ):
     assert BLOCK_M_WARPS * BLOCK_N_WARPS * BLOCK_K_WARPS <= 16
@@ -393,8 +395,45 @@ def compile_hgemm_kernel(
         w_tid = tid % WARP_SIZE
 
         def swizzle_for_cache_reuse(pid):
-            # Do nothing currently
-            return pid // N_BLOCKS, pid % N_BLOCKS
+            if const_expr(not XCD_SWIZZLE):
+                return pid // N_BLOCKS, pid % N_BLOCKS
+            # XCD-aware tile remap (ported from fp8_gemm_4wave._xcd_swizzle). gfx950
+            # has 8 XCDs each with its own L2 slice; HW assigns CTAs round-robin
+            # (xcd = pid % 8). Invert that so each XCD owns a contiguous tile range,
+            # then super-group along M (WGM rows) so tiles on one XCD reuse the same
+            # A rows / B columns in that XCD's L2. Falls back to plain row-major for
+            # small grids or grids not divisible by NUM_XCDS.
+            NUM_XCDS = const_expr(8)
+            WGM = const_expr(XCD_WGM)  # M-major super-group size
+
+            pid_idx = fx.Index(pid)
+            num_pid_m = (fx.Index(m) + (BLOCK_M - 1)) // BLOCK_M
+            num_pid_n = N_BLOCKS
+            num_wg = num_pid_m * num_pid_n
+
+            simple_m = pid_idx // num_pid_n
+            simple_n = pid_idx % num_pid_n
+
+            intra_xcd = pid_idx // NUM_XCDS
+            xcd = pid_idx % NUM_XCDS
+            wgid_remap = xcd * (num_wg // NUM_XCDS) + intra_xcd
+            num_wgid_in_group = WGM * num_pid_n
+            group_id = wgid_remap // num_wgid_in_group
+            intra_group = wgid_remap % num_wgid_in_group
+            first_pid_m = group_id * WGM
+            gsm = num_pid_m - first_pid_m
+            group_size_m = arith.select(
+                arith.cmpi(arith.CmpIPredicate.slt, gsm, fx.Index(WGM)), gsm, fx.Index(WGM)
+            )
+            pid_n = intra_group // group_size_m
+            intra_group_m = intra_group % group_size_m
+            pid_m = first_pid_m + intra_group_m
+
+            use_simple = arith.cmpi(arith.CmpIPredicate.ne, num_wg % NUM_XCDS, fx.Index(0))
+            return (
+                arith.select(use_simple, simple_m, pid_m),
+                arith.select(use_simple, simple_n, pid_n),
+            )
 
         block_m_idx, block_n_idx = swizzle_for_cache_reuse(fx.block_idx.x)
         ks_idx = fx.Index(fx.block_idx.y)
