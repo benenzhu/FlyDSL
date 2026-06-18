@@ -610,12 +610,16 @@ def compile_hgemm_kernel(
             return warp_offset
 
         def buffer_load_lds_inline(rsrc, lds_ptr, global_offset):
+            # No sc0 (=glc) on these read-only A/B input loads: the inputs are not
+            # written during the kernel, so global coherence is unnecessary, and it
+            # matches the fp8_gemm_4wave path (which omits sc0). Avoids the extra L2
+            # coherence traffic glc can force under cache pressure.
             if const_expr(DMA_BYTES == 16):
-                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, 0 offen sc0 lds"
+                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, 0 offen lds"
             elif const_expr(DMA_BYTES == 8):
-                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dwordx2 $1, $2, 0 offen sc0 lds"
+                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dwordx2 $1, $2, 0 offen lds"
             elif const_expr(DMA_BYTES == 4):
-                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, 0 offen sc0 lds"
+                asm = "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, 0 offen lds"
             else:
                 raise NotImplementedError(f"DMA_BYTES={DMA_BYTES} not supported")
             llvm.InlineAsmOp(None, [lds_ptr, global_offset, rsrc], asm, "s,v,s", has_side_effects=True)
