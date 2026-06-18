@@ -1004,8 +1004,22 @@ def compile_hgemm_kernel(
             # so their ~64-cyc latency hides fully under the 64 MFMAs. ds_reads are
             # spread front-loaded-but-interleaved so all land before the half's
             # trailing lgkmcnt(0).
+            def _spread_from(numer, denom, start):
+                out = [0] * denom
+                if const_expr(numer <= 0):
+                    return out
+                span = denom - start
+                if const_expr(span < numer):
+                    start = denom - numer
+                    span = numer
+                sub = spread_counts(numer, span)
+                for i in range_constexpr(span):
+                    out[start + i] = sub[i]
+                return out
+
             def compute_slice_interleaved(
-                a_frags, b_frags, read_k_idx, read_stage=None, zero_acc=False, bfld_tasks=None
+                a_frags, b_frags, read_k_idx, read_stage=None, zero_acc=False, bfld_tasks=None,
+                bfld_start=0,
             ):
                 out_a = [0] * WARP_M_STEPS
                 out_b = [0] * WARP_N_STEPS
@@ -1024,7 +1038,10 @@ def compile_hgemm_kernel(
                 # co-issue shadows instead of bursting at the region head.
                 tasks = bfld_tasks if bfld_tasks is not None else []
                 n_tasks = len(tasks)
-                bfld_at = spread_counts(n_tasks, WARP_M_STEPS * WARP_N_STEPS)
+                if const_expr(bfld_start > 0):
+                    bfld_at = _spread_from(n_tasks, WARP_M_STEPS * WARP_N_STEPS, bfld_start)
+                else:
+                    bfld_at = spread_counts(n_tasks, WARP_M_STEPS * WARP_N_STEPS)
                 read_cursor = 0
                 bfld_cursor = 0
                 for ii in range_constexpr(WARP_M_STEPS):
@@ -1064,9 +1081,13 @@ def compile_hgemm_kernel(
 
             # half-1: bfld next tile's K1 (lead 1) dripped into the MFMAs; compute K0
             # while reading this tile's K1 operands for half-2.
+            # Delay the first half's bfld drip by 1 MFMA row so the previous half's
+            # in-flight DMAs drain off the VMEM queue before new ones issue; ATT
+            # showed this cuts the first half's buffer_load issue stalls ~80%.
             h1_bfld = make_bfld_tasks(prefetch_k_offset, prefetch_lds_stage, 1) if prefetch_k_offset is not None else None
             a1_frags, b1_frags = compute_slice_interleaved(
-                a0_frags, b0_frags, k1_idx, zero_acc=init_zero, bfld_tasks=h1_bfld
+                a0_frags, b0_frags, k1_idx, zero_acc=init_zero, bfld_tasks=h1_bfld,
+                bfld_start=WARP_N_STEPS,
             )
 
             __barrier_lgkmcnt(vmcnt=RP1_TAIL_VMCNT)
