@@ -250,10 +250,15 @@ def compile_hgemm_kernel(
     LDG_REG_B_COUNT_AS = BLOCK_NK_SIZE // LDG_ASYNC_VEC_SIZE // BLOCK_THREADS
     LDG_WAIT_COUNT = LDG_REG_B_COUNT_AS + LDG_REG_A_COUNT_AS
     assert ((STAGES - 2) * LDG_WAIT_COUNT) < 63
-    # RP1: how many in-flight global loads to leave un-drained at the loop tail.
-    # The next-read K0 was prefetched 2 tiles earlier (lead 2), so one k-group's
-    # worth (LDG_WAIT_COUNT) may stay in flight without a read-before-write hazard.
-    RP1_TAIL_VMCNT = LDG_WAIT_COUNT
+    # RP1: vmcnt(N) at the loop tail = "wait until <= N VMEM loads are in flight".
+    # Smaller N is safer (forces more loads to land) but slower; larger N is faster
+    # but risks reading not-yet-landed data. The tile read next (next_stage K0) was
+    # prefetched 2 tiles earlier; between that bfld and this read only one k-group's
+    # worth of newer bfld is issued (LDG_WAIT_COUNT // 2 loads), so that is the
+    # largest N that still guarantees the target batch has landed. Perf is identical
+    # to the looser LDG_WAIT_COUNT (the tail vmcnt is not the bottleneck), so use the
+    # tighter, provably-safe bound.
+    RP1_TAIL_VMCNT = LDG_WAIT_COUNT // 2
     # A is consumed one K32 slice at a time. Store A in a K32-blocked LDS view
     # when the shape supports it. For the gfx950 256x256x64 path this makes
     # each async A chunk 64x32 instead of 32x64.
