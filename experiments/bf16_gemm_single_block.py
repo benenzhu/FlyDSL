@@ -110,13 +110,22 @@ def assert_no_spills() -> None:
     print(f"spill_check=ok isa={isa_path}")
 
 
-def preshuffle_rows_k(t: torch.Tensor, tile_row: int, tile_k: int) -> torch.Tensor:
-    """Permute a row-major [R, K] tensor so each [tile_row, tile_k] block is
-    physically contiguous: [R, K] -> [R//tr, K//tk, tr, tk] -> flat. Matches the
-    kernel's preshuffle_off mapping (PRESHUFFLE=True)."""
+def preshuffle_rows_k(t: torch.Tensor, tile_row: int, tile_k: int, k_chunk: int = 32) -> torch.Tensor:
+    """Permute a row-major [R, K] tensor so each [tile_row, k_chunk] sub-block is
+    physically contiguous and the K32 sub-group (k_chunk) is the outer K axis:
+    [R, K] -> [R//tr, K//tk, tk//kc, tr, kc] -> flat.
+    This makes one buffer_load (a k_chunk = 32 elems = 64B per row, tile_row rows)
+    read a fully contiguous run, so each 128B L2 cache line is used in full instead
+    of half (which doubled L2 accesses). Matches kernel preshuffle_vaddr_soffset."""
     r, k = t.shape[-2:]
-    assert r % tile_row == 0 and k % tile_k == 0, f"need R%{tile_row}==0 K%{tile_k}==0, got R={r} K={k}"
-    return t.reshape(r // tile_row, tile_row, k // tile_k, tile_k).permute(0, 2, 1, 3).contiguous().view(r, k)
+    assert r % tile_row == 0 and k % tile_k == 0 and tile_k % k_chunk == 0
+    kg = tile_k // k_chunk
+    return (
+        t.reshape(r // tile_row, tile_row, k // tile_k, kg, k_chunk)
+        .permute(0, 2, 3, 1, 4)  # [R//tr, K//tk, kg, tr, kc]
+        .contiguous()
+        .view(r, k)
+    )
 
 
 def make_inputs(m: int, n: int, k: int, *, skip_init: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

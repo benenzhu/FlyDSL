@@ -341,49 +341,32 @@ def compile_hgemm_kernel(
         A_ = GTensor(A, dtype=dtype_, shape=(-1, k))
         B_ = GTensor(B, dtype=dtype_, shape=(n, k))
 
-        # Preshuffle: A/B are pre-permuted on the host so each [TILE_ROW, BLOCK_K]
-        # tile is physically contiguous in global memory. A row-major load of a
-        # tile then hits one contiguous run instead of TILE_ROW strided segments,
-        # improving L1/L2 line utilization. Map a logical (row, col) coordinate to
-        # the shuffled linear element offset.
-        _PRESH_TK = BLOCK_K  # K granularity of a contiguous tile
-        _K_TILES_SH = k // _PRESH_TK
-
-        def preshuffle_off(row, col, tile_row):
-            tm = row // tile_row
-            mi = row % tile_row
-            tk = col // _PRESH_TK
-            ki = col % _PRESH_TK
-            return ((tm * _K_TILES_SH + tk) * tile_row + mi) * _PRESH_TK + ki
-
-        def preshuffle_off_split(row, k_offset, within, tile_row):
-            # Same mapping as preshuffle_off but with the K coordinate pre-split into
-            # the loop-variant tile index (k_offset // TK) and the loop-invariant
-            # within-tile column (within in [0, TK)). The row/tm/mi term and `within`
-            # are per-thread constants, so only `tk * tile_row * TK` steps per K iter:
-            #   off = (tm*K_TILES*tile_row + mi)*TK + within  +  tk*(tile_row*TK)
-            row = fx.Index(row)
-            k_offset = fx.Index(k_offset)
-            within = fx.Index(within)
-            tm = row // tile_row
-            mi = row % tile_row
-            tk = k_offset // _PRESH_TK
-            invariant = (tm * _K_TILES_SH * tile_row + mi) * _PRESH_TK + within
-            return invariant + tk * (tile_row * _PRESH_TK)
+        # Preshuffle layout (host preshuffle_rows_k): A/B are pre-permuted to
+        #   [R//tile_row, K//BLOCK_K, KG, tile_row, K_CHUNK]
+        # i.e. the K32 sub-group (K_CHUNK=32 elems = 64B) is an OUTER K axis, so the
+        # tile_row rows of one k_group are contiguous. One buffer_load (one k_group,
+        # one row-block) then reads a fully contiguous run and each 128B L2 line is
+        # used in full -- halves L2 accesses vs a [.., tile_row, BLOCK_K] layout where
+        # a load only touched 64B of each 128B line.
+        _PRESH_KC = WARP_ATOM_K  # K_CHUNK = 32 (matches A/B_LDS_K_CHUNK)
+        _PRESH_KG = BLOCK_K // _PRESH_KC  # 2
+        _K_TILES_SH = k // BLOCK_K
 
         def preshuffle_vaddr_soffset(row, k_offset, within, tile_row):
-            # Split the preshuffle offset into a per-lane vaddr part (loop-invariant)
-            # and a wave-uniform soffset part (the K-step term tk*tile_row*TK). The
-            # soffset is the same for all lanes (depends only on k_offset), so it can
-            # ride the scalar soffset of buffer_load instead of being recomputed into
-            # each lane's vaddr every K tile (mirrors fp8_gemm_4wave's s33 usage).
+            # within in [0, BLOCK_K): kg = which K32 sub-group, wc = within-chunk col.
+            #   off = (((tm*K_TILES + ktile)*KG + kg)*tile_row + mi)*K_CHUNK + wc
+            # Split into a lane-constant vaddr part and a wave-uniform soffset (K step):
+            #   vaddr = (tm*K_TILES*KG*tile_row + kg*tile_row + mi)*K_CHUNK + wc
+            #   soff  = ktile*(KG*tile_row*K_CHUNK),  ktile = k_offset // BLOCK_K
             row = fx.Index(row)
             within = fx.Index(within)
             tm = row // tile_row
             mi = row % tile_row
-            vaddr = (tm * _K_TILES_SH * tile_row + mi) * _PRESH_TK + within
-            tk = fx.Index(k_offset) // _PRESH_TK
-            soff = tk * (tile_row * _PRESH_TK)
+            kg = within // _PRESH_KC
+            wc = within % _PRESH_KC
+            vaddr = (tm * _K_TILES_SH * _PRESH_KG * tile_row + kg * tile_row + mi) * _PRESH_KC + wc
+            ktile = fx.Index(k_offset) // BLOCK_K
+            soff = ktile * (_PRESH_KG * tile_row * _PRESH_KC)
             return vaddr, soff
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         if const_expr(HAS_BIAS):
