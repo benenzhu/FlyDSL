@@ -353,6 +353,21 @@ def compile_hgemm_kernel(
             tk = col // _PRESH_TK
             ki = col % _PRESH_TK
             return ((tm * _K_TILES_SH + tk) * tile_row + mi) * _PRESH_TK + ki
+
+        def preshuffle_off_split(row, k_offset, within, tile_row):
+            # Same mapping as preshuffle_off but with the K coordinate pre-split into
+            # the loop-variant tile index (k_offset // TK) and the loop-invariant
+            # within-tile column (within in [0, TK)). The row/tm/mi term and `within`
+            # are per-thread constants, so only `tk * tile_row * TK` steps per K iter:
+            #   off = (tm*K_TILES*tile_row + mi)*TK + within  +  tk*(tile_row*TK)
+            row = fx.Index(row)
+            k_offset = fx.Index(k_offset)
+            within = fx.Index(within)
+            tm = row // tile_row
+            mi = row % tile_row
+            tk = k_offset // _PRESH_TK
+            invariant = (tm * _K_TILES_SH * tile_row + mi) * _PRESH_TK + within
+            return invariant + tk * (tile_row * _PRESH_TK)
         C_ = GTensor(C, dtype=dtype_, shape=(-1, n))
         if const_expr(HAS_BIAS):
             BIAS_ = GTensor(BIAS, dtype=dtype_, shape=(n,))
@@ -591,7 +606,8 @@ def compile_hgemm_kernel(
                 m_local_idx = row_group * A_LDS_ROWS_PER_CHUNK_AS + row_in_group
                 col_in_bytes = k_local_idx * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(m_local_idx, col_in_bytes, fx.Int32(A_LDS_K_BLOCKS16))
-                col_idx = fx.Index(k_offset + k_group * A_LDS_K_CHUNK + col_in_bytes // DTYPE_BYTES)
+                a_within = k_group * A_LDS_K_CHUNK + col_in_bytes // DTYPE_BYTES
+                col_idx = fx.Index(k_offset + a_within)
                 lds_offset = as_k32_.linear_offset((fx.Index(lds_stage), k_group, row_group * A_LDS_ROWS_PER_CHUNK_AS, 0))
                 lds_ptr = get_async_lds_ptr_from_offset(as_k32_, lds_offset)
             else:
@@ -609,7 +625,7 @@ def compile_hgemm_kernel(
                 fx.Index(0),
             )
             if const_expr(PRESHUFFLE):
-                global_offset = preshuffle_off(safe_row_idx, col_idx, BLOCK_M) * DTYPE_BYTES
+                global_offset = preshuffle_off_split(safe_row_idx, fx.Index(k_offset), a_within, BLOCK_M) * DTYPE_BYTES
             else:
                 global_offset = A_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
@@ -628,7 +644,8 @@ def compile_hgemm_kernel(
                 n_local_idx = row_group * B_LDS_ROWS_PER_CHUNK_AS + row_in_group
                 col_in_bytes = k_local_idx * DTYPE_BYTES
                 col_in_bytes = swizzle_xor16(n_local_idx, col_in_bytes, fx.Int32(B_LDS_K_BLOCKS16))
-                col_idx = fx.Index(k_offset + k_group * B_LDS_K_CHUNK + col_in_bytes // DTYPE_BYTES)
+                b_within = k_group * B_LDS_K_CHUNK + col_in_bytes // DTYPE_BYTES
+                col_idx = fx.Index(k_offset + b_within)
                 lds_offset = bs_k32_.linear_offset((fx.Index(lds_stage), k_group, row_group * B_LDS_ROWS_PER_CHUNK_AS, 0))
                 lds_ptr = get_async_lds_ptr_from_offset(bs_k32_, lds_offset)
             else:
@@ -646,7 +663,7 @@ def compile_hgemm_kernel(
                 fx.Index(0),
             )
             if const_expr(PRESHUFFLE):
-                global_offset = preshuffle_off(safe_row_idx, col_idx, BLOCK_N) * DTYPE_BYTES
+                global_offset = preshuffle_off_split(safe_row_idx, fx.Index(k_offset), b_within, BLOCK_N) * DTYPE_BYTES
             else:
                 global_offset = B_.linear_offset((safe_row_idx, col_idx)) * DTYPE_BYTES
             global_offset = arith.index_cast(T.i32, global_offset)
