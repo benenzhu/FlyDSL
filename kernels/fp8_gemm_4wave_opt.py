@@ -106,6 +106,13 @@ def compile_fp8_gemm_4w_opt(
     assert BLOCK_M >= 64 and BLOCK_M % 64 == 0 and BLOCK_N >= 64 and BLOCK_N % 64 == 0
     assert K % BLOCK_K == 0
 
+    import os as _osv
+
+    # Extra vmcnt slack on the main-loop barriers. The 8-buffer pipeline keeps the
+    # read buffers many loads behind the write, so allowing more in-flight global
+    # loads (vmcnt 16 -> 32) at the barrier is safe and trims barrier wait a little.
+    _VMARGIN = int(_osv.environ.get("FP8_VMARGIN", "16"))
+
     K_ITERS = K // BLOCK_K
     # Number of 16-row 16x128 tiles per wave per A/B partition.
     N_TILES_A = BLOCK_M // 4 // 16
@@ -339,7 +346,7 @@ def compile_fp8_gemm_4w_opt(
         b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
 
         for k in range_constexpr(K_ITERS - 2):
-            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B) + _VMARGIN)
 
             c00_frag, b1_frag = _compute_block(
                 a_cur0,
@@ -364,7 +371,7 @@ def compile_fp8_gemm_4w_opt(
                 c01_frag,
             )
 
-            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B) + _VMARGIN)
 
             c10_frag, a0_frag = _compute_block(
                 b_cur1,
