@@ -65,7 +65,8 @@ def _min(a, b):
 
 def _xcd_swizzle(num_pid_m, num_pid_n):
     NUM_XCDS = 8
-    WGM = 4
+    import os as _osw
+    WGM = int(_osw.environ.get("FP8_WGM", "8"))
     NUM_CUS = 32 * NUM_XCDS
     SWIZZLE_THRESHOLD = 4 * NUM_CUS
 
@@ -86,7 +87,7 @@ def _xcd_swizzle(num_pid_m, num_pid_n):
     pid_n, intra_group_m = divmod(intra_group, group_size_m)
     pid_m = first_pid_m + intra_group_m
 
-    use_simple = (num_wg <= SWIZZLE_THRESHOLD) | (num_wg % NUM_XCDS != 0)
+    use_simple = (num_wg < SWIZZLE_THRESHOLD) | (num_wg % NUM_XCDS != 0)
     return (arith.select(use_simple, simple_m, pid_m), arith.select(use_simple, simple_n, pid_n))
 
 
@@ -111,7 +112,7 @@ def compile_fp8_gemm_4w_opt(
     # Extra vmcnt slack on the main-loop barriers. The 8-buffer pipeline keeps the
     # read buffers many loads behind the write, so allowing more in-flight global
     # loads (vmcnt 16 -> 32) at the barrier is safe and trims barrier wait a little.
-    _VMARGIN = int(_osv.environ.get("FP8_VMARGIN", "16"))
+    _VMARGIN = int(_osv.environ.get("FP8_VMARGIN", "0"))
 
     K_ITERS = K // BLOCK_K
     # Number of 16-row 16x128 tiles per wave per A/B partition.
