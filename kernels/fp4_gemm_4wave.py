@@ -295,13 +295,14 @@ class ScaleLoader:
 class StoreCFp4:
     """Epilogue: acc(f32x4) -> bf16, no scale mul (scale was applied in MFMA)."""
 
-    def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
+    def __init__(self, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b, mn_aligned=False):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
         self.c_idx_fn = c_idx_fn
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
+        self.mn_aligned = mn_aligned
         c_nbytes = c_rows * c_cols * 2
         gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
@@ -317,13 +318,21 @@ class StoreCFp4:
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
                 col = base_col + tj * 16 + self.lane_id % 16
-                col_valid = col < self.c_cols
-                oob = fx.Int32(self.c_rows * self.c_cols)
                 vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                for i in range_constexpr(4):
-                    scaled = vec_f32[i].to(fx.BFloat16)
-                    c_index = (row + i) * self.c_cols + col
-                    self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
+                if const_expr(self.mn_aligned):
+                    # M/N aligned to BLOCK -> every store in-bounds, no select.
+                    for i in range_constexpr(4):
+                        scaled = vec_f32[i].to(fx.BFloat16)
+                        self._store_bf16(scaled, (row + i) * self.c_cols + col)
+                else:
+                    # arbitrary M/N: guard each store; OOB redirected to a sentinel
+                    # index the bounded buffer resource drops.
+                    col_valid = col < self.c_cols
+                    oob = fx.Int32(self.c_rows * self.c_cols)
+                    for i in range_constexpr(4):
+                        scaled = vec_f32[i].to(fx.BFloat16)
+                        c_index = (row + i) * self.c_cols + col
+                        self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
 
 
 def compile_fp4_gemm_4w(
@@ -332,7 +341,12 @@ def compile_fp4_gemm_4w(
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
     use_xcd_remap: bool = True,
+    mn_aligned: bool = False,
 ):
+    # mn_aligned: caller asserts M % BLOCK_M == 0 and N % BLOCK_N == 0, so every
+    # epilogue store is in-bounds -> skip the per-store col-bounds select (saves
+    # 256 v_cmp+v_cndmask/wave). Leave False for arbitrary M/N (correctness via the
+    # explicit bounds select). Common alignment-fast-path optimization.
     # 256 fp4 per LDS K-step row = 128 bytes; reuse fp8's 128-byte LDS layout.
     BLOCK_K = 256  # fp4 elements
     BLOCK_K_BYTES = BLOCK_K // 2  # 128 bytes / row
@@ -453,7 +467,7 @@ def compile_fp4_gemm_4w(
         b_g2s = G2SLoader(gb_div, gl_off_b, N_TILES_B, I8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_i, N_TILES_A)
         b_s2r = S2RLoaderFp4(wave_j, N_TILES_B)
-        store_c = StoreCFp4(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        store_c = StoreCFp4(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, mn_aligned=mn_aligned)
 
         # Prologue.
         a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
