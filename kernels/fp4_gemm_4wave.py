@@ -412,14 +412,16 @@ def compile_fp4_gemm_4w(
         wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B))
         b0_frag = b_s2r.load(b_cur0, preshuffled=True)
 
+        # Step-0 scale (consumed in iter 0); each iter prefetches step k+1.
+        saR0, saR1, sbC0, sbC1 = _load_scales(0)
+
         for k in range_constexpr(K_ITERS - 2):
-            # Depth-0 scale: load this step's scales inside the iter (no carried
-            # prefetch). Carrying step k+1 kept 8 scale i32 live; arch VGPR is
-            # already full from fp4 data, so those 8 spilled to scratch and were
-            # reloaded per-MFMA (ISA: 348 scratch-loads fed MFMA scale operands).
-            # 4 live instead of 8 -> less spill; scale is L2-hot so the un-hidden
-            # load latency is cheap.
-            saR0, saR1, sbC0, sbC1 = _load_scales(k)
+            # Depth-1 scale prefetch: consume this step's carried scale, prefetch
+            # k+1. Now that the accumulator is AGPR-pinned (spill gone, VGPR
+            # headroom ~44) the +4 scale VGPR fit, and prefetching one step ahead
+            # lets the scale buffer_load land before its MFMA so the compiler keeps
+            # vmcnt(16) instead of dropping to vmcnt(8-13) waiting on scale.
+            saR0_n, saR1_n, sbC0_n, sbC1_n = _load_scales(k + 1)
 
             wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
             a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * A_K_STEP)
@@ -441,14 +443,14 @@ def compile_fp4_gemm_4w(
 
             a0_frag = a0n_frag
             b0_frag = b0n_frag
+            saR0, saR1, sbC0, sbC1 = saR0_n, saR1_n, sbC0_n, sbC1_n
 
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
 
-        # Tail step K_ITERS - 2.
-        saR0, saR1, sbC0, sbC1 = _load_scales(K_ITERS - 2)
+        # Tail step K_ITERS - 2 (scale carried from loop's last prefetch).
         wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
         b1_frag = b_s2r.load(b_cur1, preshuffled=True)
         c00_frag = _do_quad(a0_frag, b0_frag, c00_frag, saR0, sbC0)
