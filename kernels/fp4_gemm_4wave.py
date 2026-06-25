@@ -27,9 +27,11 @@ Scales: ``shuffle_scale_w4(scale, 1, False)``.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import buffer_ops as _buffer_ops
 from flydsl.expr import rocdl as _rocdl
+from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 from kernels.fp8_gemm_utils import (
     G2SLoader,
@@ -147,27 +149,54 @@ class Mfma16x16x128Fp4:
 
     def call(self, a, b, c, sa, sb):
         """``sa`` / ``sb`` are lists (len n_groups) of packed-E8M0 i32 scales
-        (4 sub-fields each, one full K=256 step for a 32-row pack-group). The
-        MFMA's opsel arg is a COMPILE-TIME byte-select:
-        ``opsel = ksub * pack + tile_in_pair`` (ksub = K_Pack high field,
-        tile_in_pair = N_Pack low field). Tile ``i`` uses group ``i // 2`` and
-        in-pair byte ``i % 2``; one i32 feeds 2x2x... MFMAs via opsel."""
-        # a[i] / b[j] are [i32x4_ksub0, i32x4_ksub1] from S2RLoaderFp4 -- the fp4
-        # MFMA K=128 operand IS i32x4, used directly (no split/pad round-trip).
+        (4 sub-fields each, one full K=256 step for a 32-row pack-group).
+
+        The accumulator is PINNED IN AGPR via inline asm (constraint ``=a,...,0``),
+        mirroring fp8's Mfma16x16x128AGPR. The plain ssa-lowered mfma_scale let the
+        compiler spill accumulators to arch VGPR and shuffle them with
+        v_accvgpr_mov/read (ISA: 1679 such ops, arch VGPR -> 256, scale spilled).
+        Pinning keeps the f32x4 acc in-place in AGPR -> arch VGPR drops, no spill.
+
+        opsel is a COMPILE-TIME byte-select baked into the asm string:
+          opsel_a = ksub*2 + (i%2), opsel_b = ksub*2 + (j%2).
+        AMD encoding: low bit -> op_sel[lane], high bit (=ksub) -> op_sel_hi[lane].
+        So op_sel=[i%2, j%2, 0], op_sel_hi=[ksub, ksub, 0]."""
+        # a[i] / b[j] are [i32x4_ksub0, i32x4_ksub1] from S2RLoaderFp4.
         for ksub in range_constexpr(_FP4_PACK):
             for i in range_constexpr(self.n_tiles_a):
                 a_op = a[i][ksub]
                 sa_v = sa[i // _FP4_PACK]
-                opsel_a = ksub * _FP4_PACK + (i % _FP4_PACK)
+                ia = i % _FP4_PACK
                 for j in range_constexpr(self.n_tiles_b):
                     b_op = b[j][ksub]
                     sb_v = sb[j // _FP4_PACK]
-                    opsel_b = ksub * _FP4_PACK + (j % _FP4_PACK)
-                    c[self.idx(i, j)] = _rocdl.mfma_scale_f32_16x16x128_f8f6f4(
-                        self.res_ty,
-                        [a_op, b_op, c[self.idx(i, j)], _FP4_CBSZ, _FP4_BLGP, opsel_a, sa_v, opsel_b, sb_v],
+                    jb = j % _FP4_PACK
+                    c[self.idx(i, j)] = self._mfma_agpr(
+                        a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb
                     )
         return c
+
+    def _mfma_agpr(self, a_op, b_op, acc, sa_v, sb_v, ksub, ia, jb):
+        # Build the op_sel / op_sel_hi suffix (compile-time). op_sel[2]/hi[2]=0.
+        opsel = f"op_sel:[{ia},{jb},0]"
+        opsel_hi = f"op_sel_hi:[{ksub},{ksub},0]"
+        asm = (
+            "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $3, $4 "
+            f"{opsel} {opsel_hi} cbsz:4 blgp:4"
+        )
+        return _llvm.inline_asm(
+            self.res_ty,
+            [
+                arith._to_raw(a_op),
+                arith._to_raw(b_op),
+                arith._to_raw(sa_v),
+                arith._to_raw(sb_v),
+                arith._to_raw(acc),
+            ],
+            asm,
+            "=a,v,v,v,v,0",
+            has_side_effects=True,
+        )
 
 
 class ScaleLoader:
