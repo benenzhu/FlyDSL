@@ -80,3 +80,16 @@ core.gpu
 *.o
 *.stderr
 *.stdout
+
+# Profiler / ATT trace outputs and packaged traces
+*.zip
+profiler_traces/
+profiler_traces_grid/
+.rocprofv3/
+resource_inspect/*_dump/
+resource_inspect/aiter_*/
+resource_inspect/bm16_*/
+
+# Agent / tooling scratch
+.agents/
+codexhook.sh
