@@ -89,6 +89,21 @@ class S2RLoaderFp4:
         return v.bitcast(fx.Int32)
 
 
+def _flat_frag(frag):
+    """fragment [tile][ksub] -> flat list of raw i32x4 ir.Values (2*n_tiles).
+    scf.for loop-carried args must be raw ir.Values (the dispatch reads .type),
+    so unwrap Vec/ArithValue via arith._to_raw."""
+    out = []
+    for t in frag:
+        out.append(arith._to_raw(t[0]))
+        out.append(arith._to_raw(t[1]))
+    return out
+
+
+def _unflat_frag(flat, n_tiles):
+    return [[flat[2 * i], flat[2 * i + 1]] for i in range(n_tiles)]
+
+
 def _g2s_thunks(g2s, dst, gl_off, n_steps):
     """Module-level (so the @kernel AST rewriter doesn't turn the `range` into
     scf.for): list of thunks, each issuing one g2s.load_one step."""
@@ -264,11 +279,15 @@ class ScaleLoader:
         self.rsrc = _buffer_ops.create_buffer_resource(scale_arg, max_size=True)
 
     def load_step(self, kstep, base_tile):
-        """list[n_groups] of packed i32 (K=256 step for each 32-row pack-group)."""
-        base_group = base_tile // 32
+        """list[n_groups] of packed i32 (K=256 step for each 32-row pack-group).
+        All addends cast to Int32 so a runtime fx ``kstep`` (scf.for loop var)
+        doesn't trip arith.addi's same-type requirement (base_tile is Index)."""
+        base_group = fx.Int32(base_tile // 32)
+        kterm = fx.Int32(kstep) * fx.Int32(64)
+        lane = fx.Int32(self.lane_off)
         out = []
         for g in range_constexpr(self.n_groups):
-            i32_off = (base_group + g) * self.row_stride + kstep * 64 + self.lane_off
+            i32_off = (base_group + fx.Int32(g)) * fx.Int32(self.row_stride) + kterm + lane
             out.append(_buffer_ops.buffer_load(self.rsrc, i32_off, vec_width=1, dtype=fx.Int32))
         return out
 
@@ -409,13 +428,17 @@ def compile_fp4_gemm_4w(
             return b_scale_ld.load_step(k, base)
 
         def _load_scales(k):
-            """All four packed-i32 scales for K-step ``k`` (prefetchable)."""
+            """All four packed-i32 scales for K-step ``k`` (prefetchable). ``k`` may
+            be a compile-time int OR a runtime fx index (load_step's kstep*64 offset
+            arithmetic and buffer_load both accept a runtime value)."""
             return (
                 _a_sc(k, sa_R0),
                 _a_sc(k, sa_R1),
                 _b_sc(k, sb_C0),
                 _b_sc(k, sb_C1),
             )
+
+        _load_scales_rt = _load_scales  # runtime-k alias used inside the scf.for body
 
         # Accumulators: 2x2 64x64 quadrants per wave.
         c00_frag = [mfma.zero_value] * N_ACCUMS
@@ -454,57 +477,138 @@ def compile_fp4_gemm_4w(
         # Step-0 scale (consumed in iter 0); each iter prefetches step k+1.
         saR0, saR1, sbC0, sbC1 = _load_scales(0)
 
-        for k in range_constexpr(K_ITERS - 2):
-            # Depth-1 scale prefetch: consume this step's carried scale, prefetch
-            # k+1. Now that the accumulator is AGPR-pinned (spill gone, VGPR
-            # headroom ~44) the +4 scale VGPR fit, and prefetching one step ahead
-            # lets the scale buffer_load land before its MFMA so the compiler keeps
-            # vmcnt(16) instead of dropping to vmcnt(8-13) waiting on scale.
-            saR0_n, saR1_n, sbC0_n, sbC1_n = _load_scales(k + 1)
+        # ---- Main K-loop as scf.for, unrolled by 2 ------------------------------
+        # Why scf.for (not range_constexpr full unroll): fully unrolling all 30 main
+        # steps blew .text to ~59KB > 32KB I-cache -> periodic instruction-fetch
+        # stalls. Rolling into an scf.for (body = 2 unrolled steps) keeps .text small.
+        # Unroll-2 is chosen because the buffer ping-pong swaps the cur<->next LDS
+        # pointers exactly twice per body -> identity, so the LDS pointers need NOT
+        # be loop-carried. Carried state = the 4 accumulator groups + a0/b0 fragment
+        # + the 4 prefetched scales.
+        #
+        # ``buf`` arg names below are fixed (cur0/cur1/next0/next1); a single step
+        # mutates which physical buffer is "cur" via the pointer-pair swap, so the
+        # step body is parameterized by the current pointer set passed in.
+        def _one_step(kc, a0f, b0f, sc, accs, bufs):
+            # bufs = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
+            ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
+            saR0, saR1, sbC0, sbC1 = sc
+            c00f, c01f, c10f, c11f = accs
+            kc_i = fx.Int32(kc)  # Int32 for scale load_step (matches lane_off Int32)
+            saR0_n, saR1_n, sbC0_n, sbC1_n = _load_scales_rt(kc_i + 1)
 
-            # Interleave each quad's MFMA with the data movement feeding the NEXT
-            # quad: thunks (g2s buffer_load + s2r ds_read) issued one-after-each-MFMA
-            # so they co-issue in the MFMA execute shadow (fp4 MFMA ~16-cyc execute /
-            # 4-cyc issue). Results land in holders consumed by the next quad.
             _b1 = [None] * N_TILES_B
             _a1 = [None] * N_TILES_A
             _a0n = [None] * N_TILES_A
             _b0n = [None] * N_TILES_B
+            # This step prefetches K-step (kc+2). g2s offsets fully in Int32
+            # (A*_gl_offset is Index; kc_i is the Int32 loop var), so arith.addi
+            # operands match. a*_off = base + (kc+2)*A_K_STEP.
+            ak = (kc_i + fx.Int32(2)) * fx.Int32(A_K_STEP)
+            bk = (kc_i + fx.Int32(2)) * fx.Int32(B_K_STEP)
+            a0_off = fx.Int32(A0_gl_offset) + ak
+            a1_off = fx.Int32(A1_gl_offset) + ak
+            b0_off = fx.Int32(B0_gl_offset) + bk
+            b1_off = fx.Int32(B1_gl_offset) + bk
 
             wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
-            il = _g2s_thunks(a_g2s, a_cur0, A0_gl_offset + (k + 2) * A_K_STEP, N_TILES_A) + _s2r_thunks(
-                b_s2r, b_cur1, _b1, N_TILES_B, True
+            il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(
+                b_s2r, bc1, _b1, N_TILES_B, True
             )
-            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
-            b1_frag = _b1
+            c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il)
+            b1f = _b1
 
-            il = _g2s_thunks(b_g2s, b_cur0, B0_gl_offset + (k + 2) * B_K_STEP, N_TILES_A) + _s2r_thunks(
-                a_s2r, a_cur1, _a1, N_TILES_A, False
+            il = _g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A) + _s2r_thunks(
+                a_s2r, ac1, _a1, N_TILES_A, False
             )
-            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1, interleave=il)
-            a1_frag = _a1
+            c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il)
+            a1f = _a1
 
             wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
-            il = _g2s_thunks(b_g2s, b_cur1, B1_gl_offset + (k + 2) * B_K_STEP, N_TILES_A) + _s2r_thunks(
-                a_s2r, a_next0, _a0n, N_TILES_A, False
+            il = _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A) + _s2r_thunks(
+                a_s2r, an0, _a0n, N_TILES_A, False
             )
-            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0, interleave=il)
-            a0n_frag = _a0n
+            c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il)
+            a0nf = _a0n
 
-            il = _g2s_thunks(a_g2s, a_cur1, A1_gl_offset + (k + 2) * A_K_STEP, N_TILES_A) + _s2r_thunks(
-                b_s2r, b_next0, _b0n, N_TILES_B, True
+            il = _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A) + _s2r_thunks(
+                b_s2r, bn0, _b0n, N_TILES_B, True
             )
-            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1, interleave=il)
-            b0n_frag = _b0n
+            c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il)
+            b0nf = _b0n
 
-            a0_frag = a0n_frag
-            b0_frag = b0n_frag
-            saR0, saR1, sbC0, sbC1 = saR0_n, saR1_n, sbC0_n, sbC1_n
+            new_bufs = (an0, an1, ac0, ac1, bn0, bn1, bc0, bc1)  # swap cur<->next
+            return a0nf, b0nf, (saR0_n, saR1_n, sbC0_n, sbC1_n), (c00f, c01f, c10f, c11f), new_bufs
 
-            a_cur0, a_next0 = a_next0, a_cur0
-            a_cur1, a_next1 = a_next1, a_cur1
-            b_cur0, b_next0 = b_next0, b_cur0
-            b_cur1, b_next1 = b_next1, b_cur1
+        bufs0 = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
+        n_a = 2 * N_TILES_A
+        n_b = 2 * N_TILES_B
+        _R = arith._to_raw
+        n_ga = N_TILES_A // _FP4_PACK  # scale groups per A-scale (=len(saR0))
+        n_gb = N_TILES_B // _FP4_PACK
+
+        def _flat_sc(sc4):
+            # sc4 = (saR0, saR1, sbC0, sbC1); each is a list of n_g i32
+            out = []
+            for s in sc4:
+                for v in s:
+                    out.append(_R(v))
+            return out
+
+        def _unflat_sc(flat):
+            o = 0
+            saR0 = list(flat[o : o + n_ga]); o += n_ga
+            saR1 = list(flat[o : o + n_ga]); o += n_ga
+            sbC0 = list(flat[o : o + n_gb]); o += n_gb
+            sbC1 = list(flat[o : o + n_gb]); o += n_gb
+            return saR0, saR1, sbC0, sbC1
+
+        n_sc = 2 * n_ga + 2 * n_gb
+        init_state = (
+            _flat_frag(a0_frag)
+            + _flat_frag(b0_frag)
+            + _flat_sc((saR0, saR1, sbC0, sbC1))
+            + [_R(x) for x in c00_frag]
+            + [_R(x) for x in c01_frag]
+            + [_R(x) for x in c10_frag]
+            + [_R(x) for x in c11_frag]
+        )
+        for kk, state in range(0, K_ITERS - 2, 2, init=init_state):
+            off = 0
+            a0f = _unflat_frag(state[off : off + n_a], N_TILES_A); off += n_a
+            b0f = _unflat_frag(state[off : off + n_b], N_TILES_B); off += n_b
+            sc = _unflat_sc(state[off : off + n_sc]); off += n_sc
+            c00f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+            c01f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+            c10f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+            c11f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+            accs = (c00f, c01f, c10f, c11f)
+
+            # step kk
+            a0f, b0f, sc, accs, bufs = _one_step(kk, a0f, b0f, sc, accs, bufs0)
+            # step kk+1 (pointers swapped once; swap again -> back to bufs0 at exit)
+            a0f, b0f, sc, accs, bufs = _one_step(kk + 1, a0f, b0f, sc, accs, bufs)
+
+            new_state = (
+                _flat_frag(a0f)
+                + _flat_frag(b0f)
+                + _flat_sc(sc)
+                + [_R(x) for x in accs[0]]
+                + [_R(x) for x in accs[1]]
+                + [_R(x) for x in accs[2]]
+                + [_R(x) for x in accs[3]]
+            )
+            state = yield new_state
+
+        # unpack final state back into the named vars the tail uses
+        off = 0
+        a0_frag = _unflat_frag(state[off : off + n_a], N_TILES_A); off += n_a
+        b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B); off += n_b
+        saR0, saR1, sbC0, sbC1 = _unflat_sc(state[off : off + n_sc]); off += n_sc
+        c00_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+        c01_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+        c10_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+        c11_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
 
         # Tail step K_ITERS - 2 (scale carried from loop's last prefetch).
         wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
