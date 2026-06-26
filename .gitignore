@@ -93,3 +93,10 @@ resource_inspect/bm16_*/
 # Agent / tooling scratch
 .agents/
 codexhook.sh
+
+# Scratch / WIP experiments and handoff notes (not for tracking)
+experiments/
+handoff.md
+handoff_moe_gemm1.md
+resource_inspect/snapshots/
+scripts/run_bf16_gemm_att.sh
