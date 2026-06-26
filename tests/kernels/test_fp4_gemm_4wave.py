@@ -80,7 +80,9 @@ def _bench_fp4_gemm(M, N, K, tile_m=256, tile_n=256, num_warmups=10, num_iters=1
 
     c_out = torch.zeros((M, N), dtype=OUT_DTYPE, device=device)
 
-    launch_fn = compile_fp4_gemm_4w(K=K, BLOCK_M=tile_m, BLOCK_N=tile_n, mn_aligned=(M % tile_m == 0 and N % tile_n == 0))
+    launch_fn = compile_fp4_gemm_4w(
+        K=K, BLOCK_M=tile_m, BLOCK_N=tile_n, mn_aligned=(M % tile_m == 0 and N % tile_n == 0)
+    )
     print(f"\n[fp4_gemm_4wave] M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n}")
 
     def _args(c, a, b, sa, sb):

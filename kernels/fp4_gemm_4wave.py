@@ -30,8 +30,6 @@ import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import buffer_ops as _buffer_ops
-from flydsl.expr import rocdl as _rocdl
-from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 from kernels.fp8_gemm_utils import (
     G2SLoader,
@@ -219,9 +217,7 @@ class Mfma16x16x128Fp4:
                     b_op = b[j][ksub]
                     sb_v = sb[j // _FP4_PACK]
                     jb = j % _FP4_PACK
-                    c[self.idx(i, j)] = self._mfma_agpr(
-                        a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb
-                    )
+                    c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb)
                     if nth[0] < len(thunks):
                         thunks[nth[0]]()
                         nth[0] += 1
@@ -234,10 +230,7 @@ class Mfma16x16x128Fp4:
         # Build the op_sel / op_sel_hi suffix (compile-time). op_sel[2]/hi[2]=0.
         opsel = f"op_sel:[{ia},{jb},0]"
         opsel_hi = f"op_sel_hi:[{ksub},{ksub},0]"
-        asm = (
-            "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $3, $4 "
-            f"{opsel} {opsel_hi} cbsz:4 blgp:4"
-        )
+        asm = "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $3, $4 " f"{opsel} {opsel_hi} cbsz:4 blgp:4"
         return _llvm.inline_asm(
             self.res_ty,
             [
@@ -526,28 +519,20 @@ def compile_fp4_gemm_4w(
             b1_off = fx.Int32(B1_gl_offset) + bk
 
             wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
-            il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(
-                b_s2r, bc1, _b1, N_TILES_B, True
-            )
+            il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True)
             c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il)
             b1f = _b1
 
-            il = _g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A) + _s2r_thunks(
-                a_s2r, ac1, _a1, N_TILES_A, False
-            )
+            il = _g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A) + _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False)
             c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il)
             a1f = _a1
 
             wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
-            il = _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A) + _s2r_thunks(
-                a_s2r, an0, _a0n, N_TILES_A, False
-            )
+            il = _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A) + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False)
             c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il)
             a0nf = _a0n
 
-            il = _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A) + _s2r_thunks(
-                b_s2r, bn0, _b0n, N_TILES_B, True
-            )
+            il = _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A) + _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B, True)
             c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il)
             b0nf = _b0n
 
@@ -571,10 +556,14 @@ def compile_fp4_gemm_4w(
 
         def _unflat_sc(flat):
             o = 0
-            saR0 = list(flat[o : o + n_ga]); o += n_ga
-            saR1 = list(flat[o : o + n_ga]); o += n_ga
-            sbC0 = list(flat[o : o + n_gb]); o += n_gb
-            sbC1 = list(flat[o : o + n_gb]); o += n_gb
+            saR0 = list(flat[o : o + n_ga])
+            o += n_ga
+            saR1 = list(flat[o : o + n_ga])
+            o += n_ga
+            sbC0 = list(flat[o : o + n_gb])
+            o += n_gb
+            sbC1 = list(flat[o : o + n_gb])
+            o += n_gb
             return saR0, saR1, sbC0, sbC1
 
         n_sc = 2 * n_ga + 2 * n_gb
@@ -589,13 +578,20 @@ def compile_fp4_gemm_4w(
         )
         for kk, state in range(0, K_ITERS - 2, 2, init=init_state):
             off = 0
-            a0f = _unflat_frag(state[off : off + n_a], N_TILES_A); off += n_a
-            b0f = _unflat_frag(state[off : off + n_b], N_TILES_B); off += n_b
-            sc = _unflat_sc(state[off : off + n_sc]); off += n_sc
-            c00f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
-            c01f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
-            c10f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
-            c11f = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+            a0f = _unflat_frag(state[off : off + n_a], N_TILES_A)
+            off += n_a
+            b0f = _unflat_frag(state[off : off + n_b], N_TILES_B)
+            off += n_b
+            sc = _unflat_sc(state[off : off + n_sc])
+            off += n_sc
+            c00f = list(state[off : off + N_ACCUMS])
+            off += N_ACCUMS
+            c01f = list(state[off : off + N_ACCUMS])
+            off += N_ACCUMS
+            c10f = list(state[off : off + N_ACCUMS])
+            off += N_ACCUMS
+            c11f = list(state[off : off + N_ACCUMS])
+            off += N_ACCUMS
             accs = (c00f, c01f, c10f, c11f)
 
             # step kk
@@ -616,13 +612,20 @@ def compile_fp4_gemm_4w(
 
         # unpack final state back into the named vars the tail uses
         off = 0
-        a0_frag = _unflat_frag(state[off : off + n_a], N_TILES_A); off += n_a
-        b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B); off += n_b
-        saR0, saR1, sbC0, sbC1 = _unflat_sc(state[off : off + n_sc]); off += n_sc
-        c00_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
-        c01_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
-        c10_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
-        c11_frag = list(state[off : off + N_ACCUMS]); off += N_ACCUMS
+        a0_frag = _unflat_frag(state[off : off + n_a], N_TILES_A)
+        off += n_a
+        b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B)
+        off += n_b
+        saR0, saR1, sbC0, sbC1 = _unflat_sc(state[off : off + n_sc])
+        off += n_sc
+        c00_frag = list(state[off : off + N_ACCUMS])
+        off += N_ACCUMS
+        c01_frag = list(state[off : off + N_ACCUMS])
+        off += N_ACCUMS
+        c10_frag = list(state[off : off + N_ACCUMS])
+        off += N_ACCUMS
+        c11_frag = list(state[off : off + N_ACCUMS])
+        off += N_ACCUMS
 
         # Tail step K_ITERS - 2 (scale carried from loop's last prefetch).
         wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
