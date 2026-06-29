@@ -402,14 +402,31 @@ class ScaleLoader:
     def load_step(self, kstep, base_tile):
         """list[n_groups] of packed i32 (K=256 step for each 32-row pack-group).
         All addends cast to Int32 so a runtime fx ``kstep`` (scf.for loop var)
-        doesn't trip arith.addi's same-type requirement (base_tile is Index)."""
+        doesn't trip arith.addi's same-type requirement (base_tile is Index).
+
+        INLINE-ASM buffer_load (not the plain buffer_load op): the scale is a
+        depth-1 prefetch (loaded for kc+1, consumed next iteration, with a full
+        wait_barrier between), so making it opaque to the compiler is safe -- the
+        wait_barrier's s_waitcnt vmcnt still covers it (hardware counts inline-asm
+        VMEM). The plain op let the compiler fold the scale VMEM into the same
+        dependence graph as the g2s LDS DMA and emit coarse combined
+        `vmcnt(N) lgkmcnt(M)` waits (ATT: the dominant hot-loop stall); hiding the
+        scale load removes it from that analysis."""
         base_group = fx.Int32(base_tile // 32)
         kterm = fx.Int32(kstep) * fx.Int32(64)
         lane = fx.Int32(self.lane_off)
         out = []
         for g in range_constexpr(self.n_groups):
             i32_off = (base_group + fx.Int32(g)) * fx.Int32(self.row_stride) + kterm + lane
-            out.append(_buffer_ops.buffer_load(self.rsrc, i32_off, vec_width=1, dtype=fx.Int32))
+            byte_off = arith._to_raw(i32_off * fx.Int32(4))  # buffer voffset is in bytes
+            raw = _llvm.inline_asm(
+                _T.i32,
+                [byte_off, self.rsrc],
+                "buffer_load_dword $0, $1, $2, 0 offen",
+                "=v,v,s",
+                has_side_effects=True,
+            )
+            out.append(fx.Int32(raw))
         return out
 
 
@@ -620,6 +637,16 @@ def compile_fp4_gemm_4w(
         # Step-0 scale (consumed in iter 0); each iter prefetches step k+1.
         saR0, saR1, sbC0, sbC1 = _load_scales(0)
 
+        # Main-loop wait_barrier vmcnt. Both g2s AND scale are now inline-asm, so the
+        # compiler can't see any buffer_load and uses our literal vmcnt verbatim (it
+        # no longer recomputes/merges it). The count must therefore account for the
+        # in-flight scale VMEM too: scale is a depth-1 prefetch (8 loads = 2*n_ga +
+        # 2*n_gb issued at the top of each step, consumed next iter), which are
+        # allowed to stay in flight. Empirically the nan boundary is 11 (>=11 lets a
+        # not-yet-complete g2s LDS write be read -> nan at large K); 8 keeps a 2-slot
+        # safety margin. (A depth-2 scale prefetch would let this relax toward 16.)
+        _MAIN_VMCNT = 2 * (N_TILES_A // _FP4_PACK) + 2 * (N_TILES_B // _FP4_PACK)
+
         # ---- Main K-loop as scf.for, unrolled by 2 ------------------------------
         # Why scf.for (not range_constexpr full unroll): fully unrolling all 30 main
         # steps blew .text to ~59KB > 32KB I-cache -> periodic instruction-fetch
@@ -654,7 +681,7 @@ def compile_fp4_gemm_4w(
             b0_off = fx.Int32(B0_gl_offset) + bk
             b1_off = fx.Int32(B1_gl_offset) + bk
 
-            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+            wait_barrier(_MAIN_VMCNT)
             il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True)
             c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il)
             b1f = _b1
@@ -663,7 +690,7 @@ def compile_fp4_gemm_4w(
             c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il)
             a1f = _a1
 
-            wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+            wait_barrier(_MAIN_VMCNT)
             il = _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A) + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False)
             c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il)
             a0nf = _a0n
