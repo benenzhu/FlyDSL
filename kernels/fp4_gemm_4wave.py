@@ -814,16 +814,26 @@ def compile_fp4_gemm_4w(
         off += N_ACCUMS
 
         # Tail step K_ITERS - 2 (scale carried from loop's last prefetch).
+        # INTERLEAVED like the main loop: the b1/a1 ds_reads are issued as thunks in
+        # the shadow of the c00 MFMA cluster (c00 only needs a0/b0, already loaded),
+        # and the next-step a0'/b0' ds_reads in the c10 shadow -- so the LDS-read
+        # latency hides behind MFMA instead of being a serial stall.
+        _b1 = [None] * N_TILES_B
+        _a1 = [None] * N_TILES_A
         wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
-        b1_frag = b_s2r.load(b_cur1, preshuffled=True)
-        c00_frag = _do_quad(a0_frag, b0_frag, c00_frag, saR0, sbC0)
-        a1_frag = a_s2r.load(a_cur1)
-        c01_frag = _do_quad(a0_frag, b1_frag, c01_frag, saR0, sbC1)
+        il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
+        b1_frag = _b1
+        a1_frag = _a1
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
+        _a0n = [None] * N_TILES_A
+        _b0n = [None] * N_TILES_B
         wait_barrier((1 * N_TILES_A) + (1 * N_TILES_B))
-        a0_frag = a_s2r.load(a_next0)
-        c10_frag = _do_quad(a1_frag, b0_frag, c10_frag, saR1, sbC0)
-        b0_frag = b_s2r.load(b_next0, preshuffled=True)
-        c11_frag = _do_quad(a1_frag, b1_frag, c11_frag, saR1, sbC1)
+        il = _s2r_thunks(a_s2r, a_next0, _a0n, N_TILES_A, False) + _s2r_thunks(b_s2r, b_next0, _b0n, N_TILES_B, True)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0, interleave=il)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1)
+        a0_frag = _a0n
+        b0_frag = _b0n
 
         a_cur0, a_next0 = a_next0, a_cur0
         a_cur1, a_next1 = a_next1, a_cur1
@@ -831,14 +841,18 @@ def compile_fp4_gemm_4w(
         b_cur1, b_next1 = b_next1, b_cur1
 
         # Tail step K_ITERS - 1 (scale = sc_nxt, already prefetched in the loop).
+        # Last step, no g2s prefetch; interleave the b1/a1 ds_reads into c00's shadow.
         saR0, saR1, sbC0, sbC1 = sc_nxt
+        _b1 = [None] * N_TILES_B
+        _a1 = [None] * N_TILES_A
         wait_barrier(0)
-        b1_frag = b_s2r.load(b_cur1, preshuffled=True)
-        a1_frag = a_s2r.load(a_cur1)
-        c00_frag = _do_quad(a0_frag, b0_frag, c00_frag, saR0, sbC0)
-        c01_frag = _do_quad(a0_frag, b1_frag, c01_frag, saR0, sbC1)
-        c10_frag = _do_quad(a1_frag, b0_frag, c10_frag, saR1, sbC0)
-        c11_frag = _do_quad(a1_frag, b1_frag, c11_frag, saR1, sbC1)
+        il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
+        b1_frag = _b1
+        a1_frag = _a1
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1)
 
         store_c.store(c00_frag, sa_R0, sb_C0)
         store_c.store(c01_frag, sa_R0, sb_C1)
