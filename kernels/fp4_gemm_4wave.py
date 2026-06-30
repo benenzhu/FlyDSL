@@ -393,60 +393,116 @@ class Mfma16x16x128Fp4:
         )
 
 
-class ScaleLoader:
-    """Loads ``shuffle_scale_w4``-PRESHUFFLED per-1x32 E8M0 scales.
+# Scale-LDS geometry. Each wave needs 4 scale blocks (256 B each) per operand:
+# blocks {R0g0, R0g1, R1g0, R1g1} for A, {C0g0, C0g1, C1g0, C1g1} for B. One
+# ``buffer_load_dwordx4 ... lds`` (64 lanes x 16 B = 1024 B/wave) gathers all 4
+# blocks of one operand. A region (1024 B) + B region (1024 B) = 2048 B/wave;
+# x4 waves = 8192 B per pipeline slot; triple-buffered (depth-2 read[kc] /
+# write[kc+2] need 3 distinct slots) = 24 KB total.
+_SCALE_WAVE_BYTES = 2048
+_SCALE_SLOT_BYTES = _N_WAVES * _SCALE_WAVE_BYTES  # 8192
+_SCALE_SLOTS = 3
+_SCALE_LDS_BYTES = _SCALE_SLOTS * _SCALE_SLOT_BYTES  # 24 KB
+_SCALE_A_REGION = 0
+_SCALE_B_REGION = 1024
 
-    The shuffled layout (gate_up=False) packs the e8m0 as
-    ``[N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]`` (K_Lane=4, N_Lane=16,
-    K_Pack=N_Pack=2), so the 4 e8m0 selected by a lane's opsel values 0..3 are
-    exactly the 4 contiguous bytes of one i32. Per lane the element offset is::
 
-        group * (K1 * 64) + kstep * 64 + lane_div_16 * 16 + lane_mod_16   (i32)
+class ScaleLoaderLDS:
+    """Loads ``shuffle_scale_w4``-PRESHUFFLED per-1x32 E8M0 scales via a single
+    ``buffer_load_dwordx4 ... lds`` per operand per K-step, into a scale LDS
+    region, then per-lane ``ds_read_b32`` -- replacing the 8 per-step
+    ``buffer_load_dword`` (each with a dur-6 voffset v_add, the #1 exposed
+    hot-loop cost).
 
-    where ``group = base_tile // 32`` is the N1 index (one pack-group = the 2
-    tiles n_tiles=2), ``K1 = K // 256``, and the i32 holds [K_Pack, N_Pack].
-    The MFMA opsel ``ksub*2 + tile_in_pair`` selects the byte at runtime-free.
-    One buffer_load per K-step feeds all (tile, ksub) MFMAs of the group.
+    Layout (gate_up=False): per (N1 group, K-step) the e8m0 form a 64-i32
+    (256 B) block ``[K_Lane(4), N_Lane(16)]`` in which lane L's MFMA scale is
+    element L. A wave's 4 blocks are groups ``{G, G+1, G+4, G+5}`` (G+4 == the
+    second M/N half's group, since LDS_BLOCK/32 == 4). The dwordx4 gather has
+    lane g fetch 4 contiguous i32 ``(g%16)*4..+3`` of block ``g//16`` and write
+    them to ``m0 + g*16``; that lands i32 j of block blk at LDS byte
+    ``blk*256 + j*4`` (natural order), so the read is ``region + blk*256 + L*4``.
     """
 
-    def __init__(self, scale_arg, n_tiles, K, lane_id):
+    def __init__(self, scale_arg, n_tiles, K, lane_id, wave_id, lds_base_ptr, region_off):
         assert n_tiles % _FP4_PACK == 0
-        self.n_tiles = n_tiles
-        self.n_groups = n_tiles // _FP4_PACK  # pack-groups of 2 tiles (32 rows)
+        self.n_groups = n_tiles // _FP4_PACK  # pack-groups per M/N half (=2)
         self.K1 = K // 256
-        self.row_stride = self.K1 * 64  # i32 elems per N1 group
-        self.lane_off = (lane_id // 16) * 16 + (lane_id % 16)
-        self.rsrc = _buffer_ops.create_buffer_resource(scale_arg, max_size=True)
+        self.row_i32 = self.K1 * 64  # i32 per N1 group
+        self.lane_id = lane_id
+        self.wave_id = wave_id
+        self.region_off = region_off
+        self.rsrc = arith._to_raw(_buffer_ops.create_buffer_resource(scale_arg, max_size=True))
+        # Gather per-lane block / within-block index (loop-invariant).
+        self._blk = lane_id // 16  # 0..3 -> which of the 4 blocks
+        self._in16 = lane_id % 16  # 0..15 -> which 4-i32 chunk within the block
+        self._lds_base = fx.Int32(fx.ptrtoint(lds_base_ptr))
 
-    def load_step(self, kstep, base_tile):
-        """list[n_groups] of packed i32 (K=256 step for each 32-row pack-group).
-        All addends cast to Int32 so a runtime fx ``kstep`` (scf.for loop var)
-        doesn't trip arith.addi's same-type requirement (base_tile is Index).
+    def _slot_wave_byte(self, slot):
+        return self._lds_base + fx.Int32(slot) * fx.Int32(_SCALE_SLOT_BYTES) + fx.Int32(
+            self.wave_id * _SCALE_WAVE_BYTES + self.region_off
+        )
 
-        INLINE-ASM buffer_load (not the plain buffer_load op): the scale is a
-        depth-1 prefetch (loaded for kc+1, consumed next iteration, with a full
-        wait_barrier between), so making it opaque to the compiler is safe -- the
-        wait_barrier's s_waitcnt vmcnt still covers it (hardware counts inline-asm
-        VMEM). The plain op let the compiler fold the scale VMEM into the same
-        dependence graph as the g2s LDS DMA and emit coarse combined
-        `vmcnt(N) lgkmcnt(M)` waits (ATT: the dominant hot-loop stall); hiding the
-        scale load removes it from that analysis."""
+    def gather(self, kstep, slot, base_tile):
+        """Issue ONE buffer_load_dwordx4...lds gathering all 4 blocks of this
+        operand into scale-LDS ``slot``. ``base_tile`` = the M/N-half-0 base row
+        (half 1 is reached via group +4). Inline-asm so LLVM emits no LDS-write
+        drain; vmcnt accounting is owned by wait_barrier (hardware counts it)."""
+        # LDS write (layout A): lane L writes its 16 B to m0 + L*16. So lane L must
+        # READ from global the data destined for LDS slot L*16 = block (L//16),
+        # i32 chunk (L%16)*4..+3. block g//16 -> group G + (blk//2)*4 + (blk%2).
+        G = fx.Int32(base_tile // 32)
+        grp = G + (self._blk // 2) * fx.Int32(4) + (self._blk % 2)
+        _DBG_SAME_GROUP = True
+        if const_expr(_DBG_SAME_GROUP):
+            grp = G  # all lanes read group G; [0,1024) should be block-G replicated
+        i32_off = grp * fx.Int32(self.row_i32) + fx.Int32(kstep) * fx.Int32(64) + self._in16 * fx.Int32(4)
+        voff = arith._to_raw(i32_off * fx.Int32(4))  # bytes
+        soff = _uniform_i32(fx.Int32(0))
+        m0 = _uniform_i32(self._slot_wave_byte(slot))
+        asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
+        _asm_void([m0, voff, self.rsrc, soff], asm, "s,v,s,s")
+
+    def read_direct(self, kstep, base_tile):
+        """DEBUG: baseline direct per-group buffer_load_dword from global (no LDS).
+        Replicates HEAD's ScaleLoader.load_step to bisect pipeline vs roundtrip."""
         base_group = fx.Int32(base_tile // 32)
         kterm = fx.Int32(kstep) * fx.Int32(64)
-        lane = fx.Int32(self.lane_off)
-        out = []
-        for g in range_constexpr(self.n_groups):
-            i32_off = (base_group + fx.Int32(g)) * fx.Int32(self.row_stride) + kterm + lane
-            byte_off = arith._to_raw(i32_off * fx.Int32(4))  # buffer voffset is in bytes
-            raw = _llvm.inline_asm(
-                _T.i32,
-                [byte_off, self.rsrc],
-                "buffer_load_dword $0, $1, $2, 0 offen",
-                "=v,v,s",
-                has_side_effects=True,
-            )
-            out.append(fx.Int32(raw))
-        return out
+        lane = fx.Int32((self.lane_id // 16) * 16 + (self.lane_id % 16))
+        halves = []
+        for half in range_constexpr(2):
+            grp_list = []
+            for gi in range_constexpr(self.n_groups):
+                grp = base_group + fx.Int32(half * 4 + gi)
+                i32_off = grp * fx.Int32(self.row_i32) + kterm + lane
+                voff = arith._to_raw(i32_off * fx.Int32(4))
+                raw = _llvm.inline_asm(
+                    _T.i32, [voff, self.rsrc],
+                    "buffer_load_dword $0, $1, $2, 0 offen", "=v,v,s",
+                    has_side_effects=True,
+                )
+                grp_list.append(fx.Int32(raw))
+            halves.append(grp_list)
+        return halves[0], halves[1]
+
+    def read(self, slot):
+        """Per-lane ds_read of the 4 blocks -> (half0, half1), each list[n_groups]
+        of i32 (the same shape the MFMA consumes: sa[i//2] / sb[j//2])."""
+        # lane-contiguous write: lane g's 4 i32 at m0 + g*16. block-elem e of block
+        # blk was written by lane (blk*16 + e//4) as its (e%4)-th i32 -> LDS byte
+        # blk*256 + (e//4)*16 + (e%4)*4. MFMA lane L wants block-elem L.
+        L = self.lane_id
+        base = self._slot_wave_byte(slot) + fx.Int32((L // 4) * 16 + (L % 4) * 4)
+        halves = []
+        for half in range_constexpr(2):
+            grp_list = []
+            for gi in range_constexpr(self.n_groups):
+                blk = half * 2 + gi
+                vaddr = base + fx.Int32(blk * 256)
+                lds_ptr = _llvm.inttoptr(_lds_ptr_t(), arith._to_raw(vaddr))
+                raw = _llvm.LoadOp(fx.Int32.ir_type, lds_ptr, alignment=4).result
+                grp_list.append(fx.Int32(raw))
+            halves.append(grp_list)
+        return halves[0], halves[1]
 
 
 class StoreCFp4:
@@ -539,6 +595,7 @@ def compile_fp4_gemm_4w(
     @fx.struct
     class SharedStorage:
         all_lds: fx.Array[fx.Int8, 8 * _lds_buf, 16]
+        scale_lds: fx.Array[fx.Int8, _SCALE_LDS_BYTES, 16]
 
     @flyc.kernel
     def kernel_gemm(
@@ -585,9 +642,12 @@ def compile_fp4_gemm_4w(
 
         mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B)
 
-        # One i32 scale per K-step (256 fp4) per M/N-pair; K-step index = k.
-        a_scale_ld = ScaleLoader(A_scale, N_TILES_A, K, lane_id)
-        b_scale_ld = ScaleLoader(B_scale, N_TILES_B, K, lane_id)
+        # Scale via dwordx4...lds gather + ds_read (see ScaleLoaderLDS). One gather
+        # per operand per K-step into a triple-buffered scale-LDS slot; read[kc] /
+        # gather[kc+2] use slots kc%3 / (kc+2)%3 (3 distinct -> race-free).
+        _scale_base_ptr = lds.scale_lds.ptr
+        a_scale_ld = ScaleLoaderLDS(A_scale, N_TILES_A, K, lane_id, wave_id, _scale_base_ptr, _SCALE_A_REGION)
+        b_scale_ld = ScaleLoaderLDS(B_scale, N_TILES_B, K, lane_id, wave_id, _scale_base_ptr, _SCALE_B_REGION)
 
         base_row = tile_i * BLOCK_M + wave_i * (N_TILES_A * 16)
         base_col = tile_j * BLOCK_N + wave_j * (N_TILES_B * 16)
@@ -596,24 +656,25 @@ def compile_fp4_gemm_4w(
         sb_C0 = base_col
         sb_C1 = base_col + LDS_BLOCK_N
 
-        def _a_sc(k, base):
-            return a_scale_ld.load_step(k, base)
+        def _slot(k):
+            return fx.Int32(k) % fx.Int32(_SCALE_SLOTS)
 
-        def _b_sc(k, base):
-            return b_scale_ld.load_step(k, base)
+        def _gather_scales(k, slot):
+            """Issue the 2 dwordx4...lds gathers (A, B) for K-step ``k`` into LDS
+            ``slot``. base_row/base_col are the M/N half-0 bases; half-1 is reached
+            via group +4 inside gather()."""
+            a_scale_ld.gather(k, slot, base_row)
+            b_scale_ld.gather(k, slot, base_col)
 
-        def _load_scales(k):
-            """All four packed-i32 scales for K-step ``k`` (prefetchable). ``k`` may
-            be a compile-time int OR a runtime fx index (load_step's kstep*64 offset
-            arithmetic and buffer_load both accept a runtime value)."""
-            return (
-                _a_sc(k, sa_R0),
-                _a_sc(k, sa_R1),
-                _b_sc(k, sb_C0),
-                _b_sc(k, sb_C1),
-            )
+        _DBG_DIRECT_SCALE = False
 
-        _load_scales_rt = _load_scales  # runtime-k alias used inside the scf.for body
+        def _read_scales(kstep):
+            """Per-lane scale read for K-step ``kstep`` -> (saR0,saR1,sbC0,sbC1),
+            each list[n_groups] of i32 (same shape the MFMA consumes)."""
+            slot = _slot(kstep)
+            saR0, saR1 = a_scale_ld.read(slot)
+            sbC0, sbC1 = b_scale_ld.read(slot)
+            return (saR0, saR1, sbC0, sbC1)
 
         # Accumulators: 2x2 64x64 quadrants per wave.
         c00_frag = [mfma.zero_value] * N_ACCUMS
@@ -653,20 +714,19 @@ def compile_fp4_gemm_4w(
         wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B))
         b0_frag = b_s2r.load(b_cur0, preshuffled=True)
 
-        # DEPTH-2 scale prefetch: load step 0 (used iter 0) AND step 1 (the next),
-        # carried as (sc_cur, sc_nxt). Each iter prefetches step k+2 at the END of
-        # the step. This pulls the scale buffer_loads out of the FIFO window right
-        # before the binding wait_barrier (vs depth-1 which issued them at the step
-        # top, occupying ~8 vmcnt slots ahead of the binding g2s and forcing a tight
-        # count). With the scale moved late, the nan boundary rises and we run
-        # wait_barrier(16) to keep more g2s in flight.
-        sc_cur0 = _load_scales(0)
-        sc_nxt0 = _load_scales(1)
+        # DEPTH-2 scale prefetch into LDS slots: gather step 0 (used iter 0) into
+        # slot 0 and step 1 into slot 1. Each main-loop step gathers step kc+2 at the
+        # END (after all g2s) into slot (kc+2)%3, and reads step kc from slot kc%3 at
+        # the top. Triple-buffered: read[kc] / gather[kc+2] use distinct slots.
+        _gather_scales(0, _slot(0))
+        _gather_scales(1, _slot(1))
 
-        # Main-loop wait_barrier vmcnt. Both g2s and scale are inline-asm so the
+        # Main-loop wait_barrier vmcnt. g2s and scale gathers are inline-asm so the
         # compiler uses our literal vmcnt verbatim. With depth-2 end-of-step scale,
-        # 16 keeps the binding g2s safe while leaving more g2s in flight.
-        _MAIN_VMCNT = 16
+        # the scale[kc] gather (issued 2 steps ago) is the oldest outstanding VMEM at
+        # the step top; vmcnt(17) drains exactly it while keeping the g2s window (16)
+        # in flight, so the ds_read of scale[kc] sees landed LDS.
+        _MAIN_VMCNT = 17
 
         # ---- Main K-loop as scf.for, unrolled by 2 ------------------------------
         # Why scf.for (not range_constexpr full unroll): fully unrolling all 30 main
@@ -680,20 +740,16 @@ def compile_fp4_gemm_4w(
         # ``buf`` arg names below are fixed (cur0/cur1/next0/next1); a single step
         # mutates which physical buffer is "cur" via the pointer-pair swap, so the
         # step body is parameterized by the current pointer set passed in.
-        def _one_step(kc, a0f, b0f, sc, accs, bufs):
+        def _one_step(kc, a0f, b0f, accs, bufs):
             # bufs = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
             ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
-            # DEPTH-2 scale: sc = (sc_cur, sc_nxt). Consume sc_cur (scale[kc], loaded
-            # two steps ago), prefetch scale[kc+2] at the END of the step (after all
-            # g2s), and rotate -> next step gets (sc_nxt, new). Issuing the scale at
-            # the step END (not the top) keeps it OUT of the FIFO window right before
-            # the binding wait_barrier, so the nan-boundary vmcnt rises (scale no
-            # longer occupies ~8 slots ahead of the binding g2s) -> we can run
-            # wait_barrier(16) and keep more g2s in flight.
-            sc_cur, sc_nxt = sc
-            saR0, saR1, sbC0, sbC1 = sc_cur
+            # DEPTH-2 scale: scale[kc] was gathered into slot kc%3 two steps ago; its
+            # dwordx4...lds is the oldest outstanding VMEM, so the first wait_barrier
+            # (vmcnt) lets the ds_read below see landed LDS. scale[kc+2] is gathered at
+            # the END (after all g2s), into slot (kc+2)%3 -- distinct from kc%3 and
+            # (kc+1)%3, so the in-flight read[kc]/read[kc+1] don't alias the write.
             c00f, c01f, c10f, c11f = accs
-            kc_i = fx.Int32(kc)  # Int32 for scale load_step (matches lane_off Int32)
+            kc_i = fx.Int32(kc)
 
             _b1 = [None] * N_TILES_B
             _a1 = [None] * N_TILES_A
@@ -710,6 +766,8 @@ def compile_fp4_gemm_4w(
             b1_off = fx.Int32(B1_gl_offset) + bk
 
             wait_barrier(_MAIN_VMCNT)
+            # ds_read scale[kc] (slot kc%3) -- LDS landed by the wait_barrier above.
+            saR0, saR1, sbC0, sbC1 = _read_scales(kc_i)
             il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True)
             c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il)
             b1f = _b1
@@ -727,52 +785,22 @@ def compile_fp4_gemm_4w(
             c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il)
             b0nf = _b0n
 
-            # Prefetch scale[kc+2] at the END (after all g2s of this step).
-            sc_new = _load_scales_rt(kc_i + 2)
+            # Gather scale[kc+2] at the END (after all g2s of this step).
+            _gather_scales(kc_i + 2, _slot(kc_i + 2))
 
             new_bufs = (an0, an1, ac0, ac1, bn0, bn1, bc0, bc1)  # swap cur<->next
-            return a0nf, b0nf, (sc_nxt, sc_new), (c00f, c01f, c10f, c11f), new_bufs
+            return a0nf, b0nf, (c00f, c01f, c10f, c11f), new_bufs
 
         bufs0 = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
         n_a = 2 * N_TILES_A
         n_b = 2 * N_TILES_B
         _R = arith._to_raw
-        n_ga = N_TILES_A // _FP4_PACK  # scale groups per A-scale (=len(saR0))
-        n_gb = N_TILES_B // _FP4_PACK
 
-        def _flat_sc1(sc4):
-            # sc4 = (saR0, saR1, sbC0, sbC1); each is a list of n_g i32
-            out = []
-            for s in sc4:
-                for v in s:
-                    out.append(_R(v))
-            return out
-
-        def _unflat_sc1(flat):
-            o = 0
-            saR0 = list(flat[o : o + n_ga])
-            o += n_ga
-            saR1 = list(flat[o : o + n_ga])
-            o += n_ga
-            sbC0 = list(flat[o : o + n_gb])
-            o += n_gb
-            sbC1 = list(flat[o : o + n_gb])
-            o += n_gb
-            return saR0, saR1, sbC0, sbC1
-
-        n_sc1 = 2 * n_ga + 2 * n_gb  # one scale group (4 lists)
-        n_sc = 2 * n_sc1  # depth-2: carry (sc_cur, sc_nxt)
-
-        def _flat_sc(sc):  # sc = (sc_cur, sc_nxt)
-            return _flat_sc1(sc[0]) + _flat_sc1(sc[1])
-
-        def _unflat_sc(flat):
-            return (_unflat_sc1(flat[:n_sc1]), _unflat_sc1(flat[n_sc1:]))
-
+        # Scale is no longer loop-carried (it lives in triple-buffered LDS slots
+        # indexed by kc%3); carry = a0/b0 fragments + the 4 accumulator groups.
         init_state = (
             _flat_frag(a0_frag)
             + _flat_frag(b0_frag)
-            + _flat_sc((sc_cur0, sc_nxt0))
             + [_R(x) for x in c00_frag]
             + [_R(x) for x in c01_frag]
             + [_R(x) for x in c10_frag]
@@ -784,8 +812,6 @@ def compile_fp4_gemm_4w(
             off += n_a
             b0f = _unflat_frag(state[off : off + n_b], N_TILES_B)
             off += n_b
-            sc = _unflat_sc(state[off : off + n_sc])
-            off += n_sc
             c00f = list(state[off : off + N_ACCUMS])
             off += N_ACCUMS
             c01f = list(state[off : off + N_ACCUMS])
@@ -797,14 +823,13 @@ def compile_fp4_gemm_4w(
             accs = (c00f, c01f, c10f, c11f)
 
             # step kk
-            a0f, b0f, sc, accs, bufs = _one_step(kk, a0f, b0f, sc, accs, bufs0)
+            a0f, b0f, accs, bufs = _one_step(kk, a0f, b0f, accs, bufs0)
             # step kk+1 (pointers swapped once; swap again -> back to bufs0 at exit)
-            a0f, b0f, sc, accs, bufs = _one_step(kk + 1, a0f, b0f, sc, accs, bufs)
+            a0f, b0f, accs, bufs = _one_step(kk + 1, a0f, b0f, accs, bufs)
 
             new_state = (
                 _flat_frag(a0f)
                 + _flat_frag(b0f)
-                + _flat_sc(sc)
                 + [_R(x) for x in accs[0]]
                 + [_R(x) for x in accs[1]]
                 + [_R(x) for x in accs[2]]
@@ -818,11 +843,9 @@ def compile_fp4_gemm_4w(
         off += n_a
         b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B)
         off += n_b
-        # depth-2 carry: sc_cur = scale[K_ITERS-2] (tail step 1), sc_nxt =
-        # scale[K_ITERS-1] (tail step 2, already prefetched -- no extra load).
-        sc_cur, sc_nxt = _unflat_sc(state[off : off + n_sc])
-        saR0, saR1, sbC0, sbC1 = sc_cur
-        off += n_sc
+        # depth-2: scale[K_ITERS-2] / scale[K_ITERS-1] were gathered into LDS slots
+        # (K_ITERS-2)%3 / (K_ITERS-1)%3 during the loop's last iteration; read each
+        # from its slot after the wait_barrier that drains its gather (below).
         c00_frag = list(state[off : off + N_ACCUMS])
         off += N_ACCUMS
         c01_frag = list(state[off : off + N_ACCUMS])
@@ -840,6 +863,7 @@ def compile_fp4_gemm_4w(
         _b1 = [None] * N_TILES_B
         _a1 = [None] * N_TILES_A
         wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+        saR0, saR1, sbC0, sbC1 = _read_scales(fx.Int32(K_ITERS - 2))
         il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
         b1_frag = _b1
@@ -859,12 +883,12 @@ def compile_fp4_gemm_4w(
         b_cur0, b_next0 = b_next0, b_cur0
         b_cur1, b_next1 = b_next1, b_cur1
 
-        # Tail step K_ITERS - 1 (scale = sc_nxt, already prefetched in the loop).
+        # Tail step K_ITERS - 1 (scale gathered in the loop into slot (K_ITERS-1)%3).
         # Last step, no g2s prefetch; interleave the b1/a1 ds_reads into c00's shadow.
-        saR0, saR1, sbC0, sbC1 = sc_nxt
         _b1 = [None] * N_TILES_B
         _a1 = [None] * N_TILES_A
         wait_barrier(0)
+        saR0, saR1, sbC0, sbC1 = _read_scales(fx.Int32(K_ITERS - 1))
         il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
         b1_frag = _b1

@@ -98,5 +98,6 @@ codexhook.sh
 experiments/
 handoff.md
 handoff_moe_gemm1.md
+handoff_fp4_scale.md
 resource_inspect/snapshots/
 scripts/run_bf16_gemm_att.sh
