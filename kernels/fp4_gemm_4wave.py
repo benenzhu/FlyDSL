@@ -643,6 +643,15 @@ def compile_fp4_gemm_4w(
             a_scale_ld.gather(k, slot, base_row)
             b_scale_ld.gather(k, slot, base_col)
 
+        def _gather_scale_thunks(k, slot):
+            """gather (A,B) as thunks so they co-issue in the MFMA execute shadow
+            instead of two back-to-back buffer_load after all MFMAs (ATT showed the
+            end-of-step gather pair exposed, not hidden)."""
+            return [
+                lambda: a_scale_ld.gather(k, slot, base_row),
+                lambda: b_scale_ld.gather(k, slot, base_col),
+            ]
+
         def _read_scales(kstep):
             """Per-lane scale read for K-step ``kstep`` -> (saR0,saR1,sbC0,sbC1),
             each list[n_groups] of i32 (same shape the MFMA consumes)."""
@@ -751,17 +760,27 @@ def compile_fp4_gemm_4w(
             c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il)
             a1f = _a1
 
+            # Scale[kc+2] gather thunks: co-issue in the MFMA shadow (appended after
+            # this step's g2s so their order stays late, but now hidden vs the old
+            # end-of-step back-to-back pair). One gather per the last two MFMA calls.
+            _sc_gather = _gather_scale_thunks(kc_i + 2, _slot(kc_i + 2))
+
             wait_barrier(_MAIN_VMCNT)
-            il = _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A__4) + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A__4, False)
+            il = (
+                _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A__4)
+                + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A__4, False)
+                + _sc_gather[:1]
+            )
             c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il)
             a0nf = _a0n
 
-            il = _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A__4) + _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B__4, True)
+            il = (
+                _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A__4)
+                + _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B__4, True)
+                + _sc_gather[1:]
+            )
             c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il)
             b0nf = _b0n
-
-            # Gather scale[kc+2] at the END (after all g2s of this step).
-            _gather_scales(kc_i + 2, _slot(kc_i + 2))
 
             new_bufs = (an0, an1, ac0, ac1, bn0, bn1, bc0, bc1)  # swap cur<->next
             return a0nf, b0nf, (c00f, c01f, c10f, c11f), new_bufs
