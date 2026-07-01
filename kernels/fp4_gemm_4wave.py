@@ -42,7 +42,7 @@ from kernels.fp8_gemm_utils import (
     wait_barrier,
 )
 
-_N_WAVES = 4  # block is always 256 threads -> 4 waves (compile-time constant)
+_N_WAVES__4 = 4  # block is always 256 threads -> 4 waves (compile-time constant)
 
 
 class _Buf:
@@ -108,19 +108,19 @@ class G2SLoaderAsm:
     the K-step offset is the scalar soffset operand (hardware-free add).
     """
 
-    def __init__(self, rsrc, gl_offsets, n_load_steps, wave_id):
+    def __init__(self, rsrc, gl_offsets, n_load_steps__4, wave_id):
         self.rsrc = arith._to_raw(rsrc)
         self.gl_offsets = gl_offsets
-        self.n_load_steps = n_load_steps
+        self.n_load_steps__4 = n_load_steps__4
         self.wave_id = wave_id
-        self.n_waves = fx.block_dim.x // 64
+        self.n_waves__0_4 = fx.block_dim.x // 64
 
     @property
     def _step_stride(self):
         # m0 (LDS byte) advance between consecutive steps of one load. Must be a
         # Python int (baked into the asm string), so use the compile-time wave count
         # (block is always 256 -> 4 waves) rather than the runtime block_dim value.
-        return _N_WAVES * 1024
+        return _N_WAVES__4 * 1024
 
     def _lds_base_sgpr(self, lds_dst):
         # Step-0 LDS byte base (wave-uniform). Later steps add _step_stride to m0.
@@ -154,7 +154,7 @@ class G2SLoaderAsm:
             _asm_void([voff, self.rsrc, soff], asm, "v,s,s")
 
     def load(self, lds_dst, k_offset):
-        for step in range_constexpr(self.n_load_steps):
+        for step in range_constexpr(self.n_load_steps__4):
             self._emit(lds_dst, k_offset, step)
 
     def load_one(self, lds_dst, k_offset, step):
@@ -397,12 +397,14 @@ class Mfma16x16x128Fp4:
 # blocks {R0g0, R0g1, R1g0, R1g1} for A, {C0g0, C0g1, C1g0, C1g1} for B. One
 # ``buffer_load_dwordx4 ... lds`` (64 lanes x 16 B = 1024 B/wave) gathers all 4
 # blocks of one operand. A region (1024 B) + B region (1024 B) = 2048 B/wave;
-# x4 waves = 8192 B per pipeline slot; triple-buffered (depth-2 read[kc] /
-# write[kc+2] need 3 distinct slots) = 24 KB total.
-_SCALE_WAVE_BYTES = 2048
-_SCALE_SLOT_BYTES = _N_WAVES * _SCALE_WAVE_BYTES  # 8192
-_SCALE_SLOTS = 3
-_SCALE_LDS_BYTES = _SCALE_SLOTS * _SCALE_SLOT_BYTES  # 24 KB
+# x4 waves = 8192 B per pipeline slot. Slots are indexed kstep%_SCALE_SLOTS.
+# With depth-2 prefetch AND an unroll-by-2 main loop, up to 4 K-steps are live at
+# once (read[kk], read[kk+1], gather[kk+2], gather[kk+3]), so 4 slots are needed
+# to avoid one being overwritten before its read (3 slots -> nan). 4*8192 = 32 KB.
+_SCALE_WAVE_BYTES__2048 = 2048
+_SCALE_SLOT_BYTES__8192 = _N_WAVES__4 * _SCALE_WAVE_BYTES__2048  # 8192
+_SCALE_SLOTS__4 = 4
+_SCALE_LDS_BYTES__32768 = _SCALE_SLOTS__4 * _SCALE_SLOT_BYTES__8192  # 32 KB
 _SCALE_A_REGION = 0
 _SCALE_B_REGION = 1024
 
@@ -438,8 +440,8 @@ class ScaleLoaderLDS:
         self._lds_base = fx.Int32(fx.ptrtoint(lds_base_ptr))
 
     def _slot_wave_byte(self, slot):
-        return self._lds_base + fx.Int32(slot) * fx.Int32(_SCALE_SLOT_BYTES) + fx.Int32(
-            self.wave_id * _SCALE_WAVE_BYTES + self.region_off
+        return self._lds_base + fx.Int32(slot) * fx.Int32(_SCALE_SLOT_BYTES__8192) + fx.Int32(
+            self.wave_id * _SCALE_WAVE_BYTES__2048 + self.region_off
         )
 
     def gather(self, kstep, slot, base_tile):
@@ -452,37 +454,12 @@ class ScaleLoaderLDS:
         # i32 chunk (L%16)*4..+3. block g//16 -> group G + (blk//2)*4 + (blk%2).
         G = fx.Int32(base_tile // 32)
         grp = G + (self._blk // 2) * fx.Int32(4) + (self._blk % 2)
-        _DBG_SAME_GROUP = True
-        if const_expr(_DBG_SAME_GROUP):
-            grp = G  # all lanes read group G; [0,1024) should be block-G replicated
         i32_off = grp * fx.Int32(self.row_i32) + fx.Int32(kstep) * fx.Int32(64) + self._in16 * fx.Int32(4)
         voff = arith._to_raw(i32_off * fx.Int32(4))  # bytes
         soff = _uniform_i32(fx.Int32(0))
         m0 = _uniform_i32(self._slot_wave_byte(slot))
         asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
         _asm_void([m0, voff, self.rsrc, soff], asm, "s,v,s,s")
-
-    def read_direct(self, kstep, base_tile):
-        """DEBUG: baseline direct per-group buffer_load_dword from global (no LDS).
-        Replicates HEAD's ScaleLoader.load_step to bisect pipeline vs roundtrip."""
-        base_group = fx.Int32(base_tile // 32)
-        kterm = fx.Int32(kstep) * fx.Int32(64)
-        lane = fx.Int32((self.lane_id // 16) * 16 + (self.lane_id % 16))
-        halves = []
-        for half in range_constexpr(2):
-            grp_list = []
-            for gi in range_constexpr(self.n_groups):
-                grp = base_group + fx.Int32(half * 4 + gi)
-                i32_off = grp * fx.Int32(self.row_i32) + kterm + lane
-                voff = arith._to_raw(i32_off * fx.Int32(4))
-                raw = _llvm.inline_asm(
-                    _T.i32, [voff, self.rsrc],
-                    "buffer_load_dword $0, $1, $2, 0 offen", "=v,v,s",
-                    has_side_effects=True,
-                )
-                grp_list.append(fx.Int32(raw))
-            halves.append(grp_list)
-        return halves[0], halves[1]
 
     def read(self, slot):
         """Per-lane ds_read of the 4 blocks -> (half0, half1), each list[n_groups]
@@ -551,8 +528,8 @@ class StoreCFp4:
 def compile_fp4_gemm_4w(
     *,
     K: int,
-    BLOCK_M: int = 256,
-    BLOCK_N: int = 256,
+    BLOCK_M__256: int = 256,
+    BLOCK_N__256: int = 256,
     use_xcd_remap: bool = True,
     mn_aligned: bool = False,
 ):
@@ -561,24 +538,24 @@ def compile_fp4_gemm_4w(
     # 256 v_cmp+v_cndmask/wave). Leave False for arbitrary M/N (correctness via the
     # explicit bounds select). Common alignment-fast-path optimization.
     # 256 fp4 per LDS K-step row = 128 bytes; reuse fp8's 128-byte LDS layout.
-    BLOCK_K = 256  # fp4 elements
-    BLOCK_K_BYTES = BLOCK_K // 2  # 128 bytes / row
-    LDS_BLOCK_M = BLOCK_M // 2
-    LDS_BLOCK_N = BLOCK_N // 2
+    BLOCK_K__256 = 256  # fp4 elements
+    BLOCK_K_BYTES__128 = BLOCK_K__256 // 2  # 128 bytes / row
+    LDS_BLOCK_M__128 = BLOCK_M__256 // 2
+    LDS_BLOCK_N__128 = BLOCK_N__256 // 2
 
-    assert BLOCK_M % 64 == 0 and BLOCK_N % 64 == 0
-    assert K % BLOCK_K == 0
+    assert BLOCK_M__256 % 64 == 0 and BLOCK_N__256 % 64 == 0
+    assert K % BLOCK_K__256 == 0
 
-    K_ITERS = K // BLOCK_K
-    N_TILES_A = BLOCK_M // 4 // 16
-    N_TILES_B = BLOCK_N // 4 // 16
-    N_ACCUMS = N_TILES_A * N_TILES_B
-    assert N_ACCUMS > 0
+    K_ITERS = K // BLOCK_K__256
+    N_TILES_A__4 = BLOCK_M__256 // 4 // 16
+    N_TILES_B__4 = BLOCK_N__256 // 4 // 16
+    N_ACCUMS__16 = N_TILES_A__4 * N_TILES_B__4
+    assert N_ACCUMS__16 > 0
 
-    N_LDS_ROUNDS = max(N_TILES_A, N_TILES_B)
+    N_LDS_ROUNDS__4 = max(N_TILES_A__4, N_TILES_B__4)
 
-    a_lds_size = LDS_BLOCK_M * BLOCK_K_BYTES
-    b_lds_size = LDS_BLOCK_N * BLOCK_K_BYTES
+    a_lds_size__16384 = LDS_BLOCK_M__128 * BLOCK_K_BYTES__128
+    b_lds_size__16384 = LDS_BLOCK_N__128 * BLOCK_K_BYTES__128
 
     # One contiguous LDS array (single static `make_ptr` -> single `@__shared_alloc`
     # symbol), NOT 8 independent leaf fields. With one base symbol every cross-buffer
@@ -589,13 +566,13 @@ def compile_fp4_gemm_4w(
     # writes and the ds_reads, so it would insert a spurious `s_waitcnt vmcnt(0)`
     # before every ds_read -- which is why g2s uses inline-asm buffer_load (see
     # G2SLoaderAsm) so LLVM sees no LDS write and emits no drain.
-    assert a_lds_size == b_lds_size
-    _lds_buf = a_lds_size  # 16KB; 8 buffers laid out contiguously
+    assert a_lds_size__16384 == b_lds_size__16384
+    _lds_buf__16384 = a_lds_size__16384  # 16KB; 8 buffers laid out contiguously # 128KB
 
     @fx.struct
     class SharedStorage:
-        all_lds: fx.Array[fx.Int8, 8 * _lds_buf, 16]
-        scale_lds: fx.Array[fx.Int8, _SCALE_LDS_BYTES, 16]
+        all_lds: fx.Array[fx.Int8, 8 * _lds_buf__16384, 16]
+        scale_lds: fx.Array[fx.Int8, _SCALE_LDS_BYTES__32768, 16]
 
     @flyc.kernel
     def kernel_gemm(
@@ -606,7 +583,7 @@ def compile_fp4_gemm_4w(
         _base_ptr = lds.all_lds.ptr
 
         def _buf(idx):
-            return _Buf(_base_ptr, idx * _lds_buf)
+            return _Buf(_base_ptr, idx * _lds_buf__16384)
 
         a_cur0 = _buf(0)
         a_cur1 = _buf(1)
@@ -620,44 +597,44 @@ def compile_fp4_gemm_4w(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
-        n_blocks = ceildiv(c_n, BLOCK_N)
+        n_blocks = ceildiv(c_n, BLOCK_N__256)
         if const_expr(use_xcd_remap):
-            tile_i, tile_j = _xcd_swizzle(ceildiv(c_m, BLOCK_M), n_blocks)
+            tile_i, tile_j = _xcd_swizzle(ceildiv(c_m, BLOCK_M__256), n_blocks)
         else:
             tile_i, tile_j = divmod(fx.block_idx.x, n_blocks)
 
-        wave_i = wave_id // 2
-        wave_j = wave_id % 2
+        wave_i__0_1 = wave_id // 2
+        wave_j__0_1 = wave_id % 2
 
         # Global byte offsets (fp4 packed: K bytes = K // 2).
         K_BYTES = K // 2
-        A0_gl_offset = (tile_i * BLOCK_M) * K_BYTES
-        A1_gl_offset = (tile_i * BLOCK_M + LDS_BLOCK_M) * K_BYTES
-        A_K_STEP = BLOCK_K_BYTES
-        B0_gl_offset = (tile_j * BLOCK_N) * K_BYTES
-        B1_gl_offset = (tile_j * BLOCK_N + LDS_BLOCK_N) * K_BYTES
+        A0_gl_offset = (tile_i * BLOCK_M__256) * K_BYTES
+        A1_gl_offset = (tile_i * BLOCK_M__256 + LDS_BLOCK_M__128) * K_BYTES
+        A_K_STEP = BLOCK_K_BYTES__128
+        B0_gl_offset = (tile_j * BLOCK_N__256) * K_BYTES
+        B1_gl_offset = (tile_j * BLOCK_N__256 + LDS_BLOCK_N__128) * K_BYTES
         # B is preshuffled (16,16): one N-16 row-block spans 2*1024 bytes per
         # K-step (same constant fp8_gemm_4wave uses for b_preshuffled).
         B_K_STEP = 2 * 1024
 
-        mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B)
+        mfma = Mfma16x16x128Fp4(N_TILES_A__4, N_TILES_B__4)
 
         # Scale via dwordx4...lds gather + ds_read (see ScaleLoaderLDS). One gather
         # per operand per K-step into a triple-buffered scale-LDS slot; read[kc] /
         # gather[kc+2] use slots kc%3 / (kc+2)%3 (3 distinct -> race-free).
         _scale_base_ptr = lds.scale_lds.ptr
-        a_scale_ld = ScaleLoaderLDS(A_scale, N_TILES_A, K, lane_id, wave_id, _scale_base_ptr, _SCALE_A_REGION)
-        b_scale_ld = ScaleLoaderLDS(B_scale, N_TILES_B, K, lane_id, wave_id, _scale_base_ptr, _SCALE_B_REGION)
+        a_scale_ld = ScaleLoaderLDS(A_scale, N_TILES_A__4, K, lane_id, wave_id, _scale_base_ptr, _SCALE_A_REGION)
+        b_scale_ld = ScaleLoaderLDS(B_scale, N_TILES_B__4, K, lane_id, wave_id, _scale_base_ptr, _SCALE_B_REGION)
 
-        base_row = tile_i * BLOCK_M + wave_i * (N_TILES_A * 16)
-        base_col = tile_j * BLOCK_N + wave_j * (N_TILES_B * 16)
+        base_row = tile_i * BLOCK_M__256 + wave_i__0_1 * (N_TILES_A__4 * 16)
+        base_col = tile_j * BLOCK_N__256 + wave_j__0_1 * (N_TILES_B__4 * 16)
         sa_R0 = base_row
-        sa_R1 = base_row + LDS_BLOCK_M
+        sa_R1 = base_row + LDS_BLOCK_M__128
         sb_C0 = base_col
-        sb_C1 = base_col + LDS_BLOCK_N
+        sb_C1 = base_col + LDS_BLOCK_N__128
 
         def _slot(k):
-            return fx.Int32(k) % fx.Int32(_SCALE_SLOTS)
+            return fx.Int32(k) % fx.Int32(_SCALE_SLOTS__4)
 
         def _gather_scales(k, slot):
             """Issue the 2 dwordx4...lds gathers (A, B) for K-step ``k`` into LDS
@@ -665,8 +642,6 @@ def compile_fp4_gemm_4w(
             via group +4 inside gather()."""
             a_scale_ld.gather(k, slot, base_row)
             b_scale_ld.gather(k, slot, base_col)
-
-        _DBG_DIRECT_SCALE = False
 
         def _read_scales(kstep):
             """Per-lane scale read for K-step ``kstep`` -> (saR0,saR1,sbC0,sbC1),
@@ -677,27 +652,27 @@ def compile_fp4_gemm_4w(
             return (saR0, saR1, sbC0, sbC1)
 
         # Accumulators: 2x2 64x64 quadrants per wave.
-        c00_frag = [mfma.zero_value] * N_ACCUMS
-        c01_frag = [mfma.zero_value] * N_ACCUMS
-        c10_frag = [mfma.zero_value] * N_ACCUMS
-        c11_frag = [mfma.zero_value] * N_ACCUMS
+        c00_frag = [mfma.zero_value] * N_ACCUMS__16
+        c01_frag = [mfma.zero_value] * N_ACCUMS__16
+        c10_frag = [mfma.zero_value] * N_ACCUMS__16
+        c11_frag = [mfma.zero_value] * N_ACCUMS__16
 
-        gl_off_a = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=False)
-        gl_off_b = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=True)
+        gl_off_a = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS__4, preshuffled=False)
+        gl_off_b = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS__4, preshuffled=True)
 
         # Inline-asm g2s (see G2SLoaderAsm): needs the raw buffer resource. Build it
         # once from the i8 buffer tensor (max_size OOB check; all addresses in-bounds).
-        a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=True)
-        b_rsrc = _buffer_ops.create_buffer_resource(B_T, max_size=True)
-        a_g2s = G2SLoaderAsm(a_rsrc, gl_off_a, N_TILES_A, wave_id)
-        b_g2s = G2SLoaderAsm(b_rsrc, gl_off_b, N_TILES_B, wave_id)
-        a_s2r = S2RLoaderFp4(wave_i, N_TILES_A)
-        b_s2r = S2RLoaderFp4(wave_j, N_TILES_B)
-        store_c = StoreCFp4(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B, mn_aligned=mn_aligned)
+        a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=True) # why max size here...
+        b_rsrc = _buffer_ops.create_buffer_resource(B_T, max_size=True) # why???
+        a_g2s = G2SLoaderAsm(a_rsrc, gl_off_a, N_TILES_A__4, wave_id)
+        b_g2s = G2SLoaderAsm(b_rsrc, gl_off_b, N_TILES_B__4, wave_id)
+        a_s2r = S2RLoaderFp4(wave_i__0_1, N_TILES_A__4)
+        b_s2r = S2RLoaderFp4(wave_j__0_1, N_TILES_B__4)
+        store_c = StoreCFp4(C, c_m, c_n, mfma.idx, N_TILES_A__4, N_TILES_B__4, mn_aligned=mn_aligned)
 
         # Prologue.
-        a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
-        b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)
+        a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP) # 4个load.
+        b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP) # 4个...
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * A_K_STEP)
 
@@ -709,9 +684,9 @@ def compile_fp4_gemm_4w(
         def _do_quad(a_frag, b_frag, c_frag, sa_ksub, sb_ksub):
             return mfma.call(a_frag, b_frag, c_frag, sa_ksub, sb_ksub)
 
-        wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B))
+        wait_barrier((3 * N_TILES_A__4) + (4 * N_TILES_B__4))
         a0_frag = a_s2r.load(a_cur0)
-        wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B))
+        wait_barrier((3 * N_TILES_A__4) + (3 * N_TILES_B__4))
         b0_frag = b_s2r.load(b_cur0, preshuffled=True)
 
         # DEPTH-2 scale prefetch into LDS slots: gather step 0 (used iter 0) into
@@ -751,10 +726,10 @@ def compile_fp4_gemm_4w(
             c00f, c01f, c10f, c11f = accs
             kc_i = fx.Int32(kc)
 
-            _b1 = [None] * N_TILES_B
-            _a1 = [None] * N_TILES_A
-            _a0n = [None] * N_TILES_A
-            _b0n = [None] * N_TILES_B
+            _b1 = [None] * N_TILES_B__4
+            _a1 = [None] * N_TILES_A__4
+            _a0n = [None] * N_TILES_A__4
+            _b0n = [None] * N_TILES_B__4
             # This step prefetches K-step (kc+2). g2s offsets fully in Int32
             # (A*_gl_offset is Index; kc_i is the Int32 loop var), so arith.addi
             # operands match. a*_off = base + (kc+2)*A_K_STEP.
@@ -768,20 +743,20 @@ def compile_fp4_gemm_4w(
             wait_barrier(_MAIN_VMCNT)
             # ds_read scale[kc] (slot kc%3) -- LDS landed by the wait_barrier above.
             saR0, saR1, sbC0, sbC1 = _read_scales(kc_i)
-            il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True)
+            il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A__4) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B__4, True)
             c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il)
             b1f = _b1
 
-            il = _g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A) + _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False)
+            il = _g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A__4) + _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A__4, False)
             c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il)
             a1f = _a1
 
             wait_barrier(_MAIN_VMCNT)
-            il = _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A) + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False)
+            il = _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A__4) + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A__4, False)
             c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il)
             a0nf = _a0n
 
-            il = _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A) + _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B, True)
+            il = _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A__4) + _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B__4, True)
             c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il)
             b0nf = _b0n
 
@@ -792,8 +767,8 @@ def compile_fp4_gemm_4w(
             return a0nf, b0nf, (c00f, c01f, c10f, c11f), new_bufs
 
         bufs0 = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
-        n_a = 2 * N_TILES_A
-        n_b = 2 * N_TILES_B
+        n_a = 2 * N_TILES_A__4
+        n_b = 2 * N_TILES_B__4
         _R = arith._to_raw
 
         # Scale is no longer loop-carried (it lives in triple-buffered LDS slots
@@ -808,18 +783,18 @@ def compile_fp4_gemm_4w(
         )
         for kk, state in range(0, K_ITERS - 2, 2, init=init_state):
             off = 0
-            a0f = _unflat_frag(state[off : off + n_a], N_TILES_A)
+            a0f = _unflat_frag(state[off : off + n_a], N_TILES_A__4)
             off += n_a
-            b0f = _unflat_frag(state[off : off + n_b], N_TILES_B)
+            b0f = _unflat_frag(state[off : off + n_b], N_TILES_B__4)
             off += n_b
-            c00f = list(state[off : off + N_ACCUMS])
-            off += N_ACCUMS
-            c01f = list(state[off : off + N_ACCUMS])
-            off += N_ACCUMS
-            c10f = list(state[off : off + N_ACCUMS])
-            off += N_ACCUMS
-            c11f = list(state[off : off + N_ACCUMS])
-            off += N_ACCUMS
+            c00f = list(state[off : off + N_ACCUMS__16])
+            off += N_ACCUMS__16
+            c01f = list(state[off : off + N_ACCUMS__16])
+            off += N_ACCUMS__16
+            c10f = list(state[off : off + N_ACCUMS__16])
+            off += N_ACCUMS__16
+            c11f = list(state[off : off + N_ACCUMS__16])
+            off += N_ACCUMS__16
             accs = (c00f, c01f, c10f, c11f)
 
             # step kk
@@ -839,40 +814,40 @@ def compile_fp4_gemm_4w(
 
         # unpack final state back into the named vars the tail uses
         off = 0
-        a0_frag = _unflat_frag(state[off : off + n_a], N_TILES_A)
+        a0_frag = _unflat_frag(state[off : off + n_a], N_TILES_A__4)
         off += n_a
-        b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B)
+        b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B__4)
         off += n_b
         # depth-2: scale[K_ITERS-2] / scale[K_ITERS-1] were gathered into LDS slots
         # (K_ITERS-2)%3 / (K_ITERS-1)%3 during the loop's last iteration; read each
         # from its slot after the wait_barrier that drains its gather (below).
-        c00_frag = list(state[off : off + N_ACCUMS])
-        off += N_ACCUMS
-        c01_frag = list(state[off : off + N_ACCUMS])
-        off += N_ACCUMS
-        c10_frag = list(state[off : off + N_ACCUMS])
-        off += N_ACCUMS
-        c11_frag = list(state[off : off + N_ACCUMS])
-        off += N_ACCUMS
+        c00_frag = list(state[off : off + N_ACCUMS__16])
+        off += N_ACCUMS__16
+        c01_frag = list(state[off : off + N_ACCUMS__16])
+        off += N_ACCUMS__16
+        c10_frag = list(state[off : off + N_ACCUMS__16])
+        off += N_ACCUMS__16
+        c11_frag = list(state[off : off + N_ACCUMS__16])
+        off += N_ACCUMS__16
 
         # Tail step K_ITERS - 2 (scale carried from loop's last prefetch).
         # INTERLEAVED like the main loop: the b1/a1 ds_reads are issued as thunks in
         # the shadow of the c00 MFMA cluster (c00 only needs a0/b0, already loaded),
         # and the next-step a0'/b0' ds_reads in the c10 shadow -- so the LDS-read
         # latency hides behind MFMA instead of being a serial stall.
-        _b1 = [None] * N_TILES_B
-        _a1 = [None] * N_TILES_A
-        wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
+        _b1 = [None] * N_TILES_B__4
+        _a1 = [None] * N_TILES_A__4
+        wait_barrier((2 * N_TILES_A__4) + (2 * N_TILES_B__4))
         saR0, saR1, sbC0, sbC1 = _read_scales(fx.Int32(K_ITERS - 2))
-        il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
+        il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B__4, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A__4, False)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
         b1_frag = _b1
         a1_frag = _a1
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
-        _a0n = [None] * N_TILES_A
-        _b0n = [None] * N_TILES_B
-        wait_barrier((1 * N_TILES_A) + (1 * N_TILES_B))
-        il = _s2r_thunks(a_s2r, a_next0, _a0n, N_TILES_A, False) + _s2r_thunks(b_s2r, b_next0, _b0n, N_TILES_B, True)
+        _a0n = [None] * N_TILES_A__4
+        _b0n = [None] * N_TILES_B__4
+        wait_barrier((1 * N_TILES_A__4) + (1 * N_TILES_B__4))
+        il = _s2r_thunks(a_s2r, a_next0, _a0n, N_TILES_A__4, False) + _s2r_thunks(b_s2r, b_next0, _b0n, N_TILES_B__4, True)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0, interleave=il)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1)
         a0_frag = _a0n
@@ -885,11 +860,11 @@ def compile_fp4_gemm_4w(
 
         # Tail step K_ITERS - 1 (scale gathered in the loop into slot (K_ITERS-1)%3).
         # Last step, no g2s prefetch; interleave the b1/a1 ds_reads into c00's shadow.
-        _b1 = [None] * N_TILES_B
-        _a1 = [None] * N_TILES_A
+        _b1 = [None] * N_TILES_B__4
+        _a1 = [None] * N_TILES_A__4
         wait_barrier(0)
         saR0, saR1, sbC0, sbC1 = _read_scales(fx.Int32(K_ITERS - 1))
-        il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
+        il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B__4, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A__4, False)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
         b1_frag = _b1
         a1_frag = _a1
@@ -913,7 +888,7 @@ def compile_fp4_gemm_4w(
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        grid_x = ceildiv(c_m, BLOCK_M__256) * ceildiv(c_n, BLOCK_N__256)
         kernel_gemm(
             A,
             B_T,
