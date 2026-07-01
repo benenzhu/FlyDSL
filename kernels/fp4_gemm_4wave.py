@@ -670,7 +670,13 @@ def compile_fp4_gemm_4w(
         b_s2r = S2RLoaderFp4(wave_j__0_1, N_TILES_B__4)
         store_c = StoreCFp4(C, c_m, c_n, mfma.idx, N_TILES_A__4, N_TILES_B__4, mn_aligned=mn_aligned)
 
-        # Prologue.
+        # Prologue. Scale gathers for step 0/1 go FIRST (before the 32 g2s) so they
+        # are the OLDEST outstanding VMEM -- the main loop's wait_barrier(17) then
+        # drains them naturally (vs issuing them last, where vmcnt(17) can't reach
+        # them past the 32 newer g2s -> step-0 read got un-landed LDS -> big-K nan).
+        _gather_scales(0, _slot(0))
+        _gather_scales(1, _slot(1))
+
         a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP) # 4个load.
         b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP) # 4个...
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
@@ -689,12 +695,6 @@ def compile_fp4_gemm_4w(
         wait_barrier((3 * N_TILES_A__4) + (3 * N_TILES_B__4))
         b0_frag = b_s2r.load(b_cur0, preshuffled=True)
 
-        # DEPTH-2 scale prefetch into LDS slots: gather step 0 (used iter 0) into
-        # slot 0 and step 1 into slot 1. Each main-loop step gathers step kc+2 at the
-        # END (after all g2s) into slot (kc+2)%3, and reads step kc from slot kc%3 at
-        # the top. Triple-buffered: read[kc] / gather[kc+2] use distinct slots.
-        _gather_scales(0, _slot(0))
-        _gather_scales(1, _slot(1))
 
         # Main-loop wait_barrier vmcnt. g2s and scale gathers are inline-asm so the
         # compiler uses our literal vmcnt verbatim. With depth-2 end-of-step scale,
