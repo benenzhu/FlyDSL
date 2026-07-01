@@ -461,25 +461,28 @@ class ScaleLoaderLDS:
         asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
         _asm_void([m0, voff, self.rsrc, soff], asm, "s,v,s,s")
 
-    def read(self, slot):
-        """Per-lane ds_read of the 4 blocks -> (half0, half1), each list[n_groups]
-        of i32 (the same shape the MFMA consumes: sa[i//2] / sb[j//2])."""
+    def read_half(self, slot, half):
+        """Per-lane ds_read of ONE half (2 blocks) -> list[n_groups] of i32.
+        Split from read() so half-1 can be issued as a thunk in an MFMA shadow
+        (half-0 feeds c00/c01, half-1 feeds c10/c11 -- two MFMA clusters later)."""
         # lane-contiguous write: lane g's 4 i32 at m0 + g*16. block-elem e of block
         # blk was written by lane (blk*16 + e//4) as its (e%4)-th i32 -> LDS byte
         # blk*256 + (e//4)*16 + (e%4)*4. MFMA lane L wants block-elem L.
         L = self.lane_id
         base = self._slot_wave_byte(slot) + fx.Int32((L // 4) * 16 + (L % 4) * 4)
-        halves = []
-        for half in range_constexpr(2):
-            grp_list = []
-            for gi in range_constexpr(self.n_groups):
-                blk = half * 2 + gi
-                vaddr = base + fx.Int32(blk * 256)
-                lds_ptr = _llvm.inttoptr(_lds_ptr_t(), arith._to_raw(vaddr))
-                raw = _llvm.LoadOp(fx.Int32.ir_type, lds_ptr, alignment=4).result
-                grp_list.append(fx.Int32(raw))
-            halves.append(grp_list)
-        return halves[0], halves[1]
+        grp_list = []
+        for gi in range_constexpr(self.n_groups):
+            blk = half * 2 + gi
+            vaddr = base + fx.Int32(blk * 256)
+            lds_ptr = _llvm.inttoptr(_lds_ptr_t(), arith._to_raw(vaddr))
+            raw = _llvm.LoadOp(fx.Int32.ir_type, lds_ptr, alignment=4).result
+            grp_list.append(fx.Int32(raw))
+        return grp_list
+
+    def read(self, slot):
+        """Per-lane ds_read of the 4 blocks -> (half0, half1), each list[n_groups]
+        of i32 (the same shape the MFMA consumes: sa[i//2] / sb[j//2])."""
+        return self.read_half(slot, 0), self.read_half(slot, 1)
 
 
 class StoreCFp4:
@@ -750,15 +753,37 @@ def compile_fp4_gemm_4w(
             b1_off = fx.Int32(B1_gl_offset) + bk
 
             wait_barrier(_MAIN_VMCNT)
-            # ds_read scale[kc] (slot kc%3) -- LDS landed by the wait_barrier above.
-            saR0, saR1, sbC0, sbC1 = _read_scales(kc_i)
-            il = _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A__4) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B__4, True)
+            # Scale ds_read, split by half so half-1 hides in the c00/c01 MFMA shadow:
+            # half-0 (saR0/sbC0) feeds c00/c01 now; half-1 (saR1/sbC1) is only needed
+            # by c10/c11 (two MFMA clusters later), so issue it as thunks in c00/c01.
+            sc_slot = _slot(kc_i)
+            saR0 = a_scale_ld.read_half(sc_slot, 0)
+            sbC0 = b_scale_ld.read_half(sc_slot, 0)
+            _saR1 = [None]
+            _sbC1 = [None]
+
+            def _rd_saR1(_s=sc_slot):
+                _saR1[0] = a_scale_ld.read_half(_s, 1)
+
+            def _rd_sbC1(_s=sc_slot):
+                _sbC1[0] = b_scale_ld.read_half(_s, 1)
+
+            # Both half-1 reads go in c00's shadow: c00 needs only half-0; sbC1 is
+            # needed by c01 (next MFMA) and saR1 by c10, so both must be ready after
+            # c00's execute window. c00 has 16 MFMAs -> plenty of shadow for 4 ds_read.
+            il = (
+                _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A__4)
+                + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B__4, True)
+                + [_rd_saR1, _rd_sbC1]
+            )
             c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il)
             b1f = _b1
+            sbC1 = _sbC1[0]
 
             il = _g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A__4) + _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A__4, False)
             c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il)
             a1f = _a1
+            saR1 = _saR1[0]
 
             # Scale[kc+2] gather thunks: co-issue in the MFMA shadow (appended after
             # this step's g2s so their order stays late, but now hidden vs the old
