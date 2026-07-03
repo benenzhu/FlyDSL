@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""Find which instructions are NOT hidden behind MFMA in a GEMM hot loop.
+
+Model: each MFMA occupies a fixed execute window of EXEC cycles from its issue
+cycle. Back-to-back MFMAs tile [c, c+EXEC) windows; while the matrix unit is busy
+any co-issued scalar/VMEM/LDS op is "free". Cycles OUTSIDE the union of those
+windows are EXPOSED -- the matrix unit idles there, so cyc/mfma > EXEC. We attribute
+each exposed gap to the (non-MFMA) instruction at its start = what blocked the next
+MFMA from issuing on time.
+
+Input: an ATT rocprofv3 UI dispatch dir (has code.json + se*_wv*.json). Pick the
+steady-state cycle window with --range (avoid prologue/tail).
+
+Usage:
+  python3 mfma_coverage.py <dispatch_dir> [--wave se0_sm0_sl0_wv0.json]
+                                          [--range LO,HI] [--exec 16]
+
+  # find a steady window first (cycles): the script prints the wave cycle span;
+  # pick a mid slice spanning ~10 outer loop iterations.
+
+Notes:
+- EXEC is the MFMA execute latency, NOT the issue latency. fp4
+  mfma_scale_f32_16x16x128 ~ 16; fp8 16x16x128 ~ 32. Pass --exec accordingly.
+- "idle" gaps = pure latency stalls (waitcnt drain / dependency) with no issuing
+  instruction; real wins come from cutting the named-instruction gaps.
+"""
+import argparse
+import collections
+import glob
+import json
+import os
+import sys
+
+
+def load(dispatch_dir, wave):
+    code = json.load(open(os.path.join(dispatch_dir, "code.json")))["code"]
+    if wave:
+        wpath = os.path.join(dispatch_dir, wave)
+    else:
+        cands = sorted(glob.glob(os.path.join(dispatch_dir, "se*_wv0.json")))
+        wpath = cands[0]
+    wj = json.load(open(wpath))
+    return code, wj["wave"]["instructions"], os.path.basename(wpath)
+
+
+def op_of(code, cid):
+    a = code[cid][0].strip().split() if cid < len(code) else ["?"]
+    return a[0] if a else "?"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("dispatch_dir")
+    ap.add_argument("--wave", default=None)
+    ap.add_argument("--range", default=None, help="LO,HI cycle window (steady state)")
+    ap.add_argument("--exec", type=int, default=16, dest="exec_cyc", help="MFMA execute latency")
+    args = ap.parse_args()
+
+    code, insts, wname = load(args.dispatch_dir, args.wave)
+    cyc = [r[0] for r in insts]
+    print(f"wave={wname}  inst cycle span {min(cyc)}..{max(cyc)}  n={len(insts)}")
+    if not args.range:
+        print("pass --range LO,HI (a mid steady slice, ~10 outer iters). e.g. "
+              f"--range {min(cyc) + (max(cyc)-min(cyc))//4},{min(cyc) + (max(cyc)-min(cyc))//2}")
+        return
+    lo, hi = (int(x) for x in args.range.split(","))
+    seg = sorted((r for r in insts if lo <= r[0] < hi), key=lambda r: r[0])
+    span = hi - lo
+
+    E = args.exec_cyc
+    mfma = sorted(r[0] for r in seg if op_of(code, r[4]).startswith("v_mfma"))
+    if not mfma:
+        print("no MFMA in window")
+        return
+
+    # next_free model (matrix-unit pipeline): each MFMA occupies ONE E-cycle execute
+    # slot, but slots pipeline -- consecutive MFMAs can ISSUE < E apart and still both
+    # be hidden (the unit stays busy). Track next_free = when the matrix unit frees.
+    #   - issue t <= next_free : hidden (co-issued in the shadow); slot advances +E
+    #   - issue t >  next_free : the unit was IDLE for (t - next_free) -> EXPOSED
+    # This fixes the older union-of-[issue,issue+E) model, which capped overlapping
+    # windows and so mislabeled shadow-hidden loads (dense 8-cyc-apart MFMAs) as
+    # exposed. Blame each exposed gap on the first non-MFMA op issuing inside it.
+    next_free = mfma[0]
+    gaps = []
+    for t in mfma:
+        if t > next_free:
+            gaps.append((next_free, t))
+            next_free = t + E
+        else:
+            next_free = next_free + E
+    exp = sum(b - a for a, b in gaps)
+    cov = span - exp
+    print(f"\nsegment [{lo},{hi})  span={span}  mfma={len(mfma)}  exec={E}")
+    print(f"MFMA-covered: {cov} ({cov*100//span}%)   EXPOSED: {exp} ({exp*100//span}%)")
+    print(f"cyc/mfma = {span/len(mfma):.2f}  (floor = {E})")
+
+    # OCCUPANCY attribution: for every EXPOSED cycle (matrix unit idle), credit it to
+    # whatever instruction was occupying the issue port then. Each non-MFMA instruction
+    # occupies [its issue, next instruction's issue) -- i.e. its issue_dur PLUS any
+    # stall (r[2]); we do NOT separate issue vs stall, we just ask "while the matrix
+    # unit sat idle, which op was on the port?". Intersect each op's occupancy span
+    # with the next_free idle gaps and sum. This tiles the whole EXPOSED window with no
+    # gaps (every idle cycle has an owner), so the ranking directly says: to push
+    # cyc/mfma toward the floor, which non-MFMA ops must be REMOVED / SHRUNK from
+    # between the MFMAs. (Stall-vs-issue and who-"blocks" views were dropped -- what
+    # matters for MFMA-bound speedup is total occupancy stealing issue bandwidth.)
+    # Row = [cycle, issue_dur, stall, total_dur, code_id].
+    def label(cid):
+        t = code[cid][0].strip() if cid < len(code) else "?"
+        o = op_of(code, cid)
+        if o == "s_waitcnt":
+            v, l = "vmcnt" in t, "lgkmcnt" in t
+            return "s_waitcnt(vm+lgkm)" if v and l else "s_waitcnt(vmcnt)" if v else \
+                   "s_waitcnt(lgkmcnt)" if l else "s_waitcnt"
+        return o
+
+    def gap_overlap(a, b):
+        tot = 0
+        for g0, g1 in gaps:
+            if g1 <= a or g0 >= b:
+                continue
+            tot += min(g1, b) - max(g0, a)
+        return tot
+
+    ni = [r for r in seg if not op_of(code, r[4]).startswith("v_mfma")]
+    ni.sort(key=lambda r: r[0])
+    occ = collections.Counter()
+    for i, r in enumerate(ni):
+        nxt = ni[i + 1][0] if i + 1 < len(ni) else hi
+        c = gap_overlap(r[0], nxt)
+        if c:
+            occ[label(r[4])] += c
+    total = exp or 1
+    print(f"\n== EXPOSED {exp} cyc ({exp*100/span:.1f}% of全局) by occupying instruction ==")
+    print(f"  {'cyc':>6} {'%exp':>5} {'%all':>5}  op")
+    for o, c in occ.most_common(18):
+        print(f"  {c:>6} {c*100//total:>4d}% {c*100/span:>4.1f}%  {o}")
+
+
+if __name__ == "__main__":
+    main()
