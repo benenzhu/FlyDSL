@@ -264,3 +264,103 @@ def sort_scales_kernel(M, max_sorted,
                     k_idx = ku*K_PACK*4 + ikxdl*4 + k_lane
                     bytes[ikxdl*MN_PACK + im_a] = a_scale[tok_ids[im_a]*A_SCALE_COLS + k_idx]  # gather
         a_scale_sorted_shuffled[work_id*4 : work_id*4 + 4] = bytes   # 写成交织布局
+
+
+# ===========================================================================
+# GEMM1 / stage1  (gate+up projection)   FlyDSL: mxfp4_gemm1.py:748
+#   数学: 每个 expert  out[m, 2*inter] = A[m, H] @ w1[e]^T ,  A=gemm1 输入激活
+#         w1 拼了 gate 和 up 两半 -> N_OUT = 2*inter。算完做 SiLU(gate)*up
+#         再重新量化成 fp4 -> 喂给 gemm2 的 A。
+#   ★ A 的数据本体 a_quant 是【未排序】的(quant_kernel 按原 token 序产出)。
+#     gemm1 在这里用 m_indices(=sorted 行->原 token)【动态 gather】读 A。
+#     而 a_scale 已被 sort_scales 预排+交织,gemm1 直接顺序读。
+#   下面只写我们 TP 实际走的主干: BM=128, cached(非 inline_quant), 非 interleave。
+#
+#   维度(TP32768): H=7168(K), inter=512, N_OUT=2*512=1024, NE=385
+#   BM=128, BN=256, BK=256 -> K_TILES = H/BK = 28, NUM_N_BLOCKS = N_OUT/BN = 4
+#   kStages=2 (A 的 LDS 双缓冲深度)
+# ===========================================================================
+@launch(grid="total_m_blocks * NUM_N_BLOCKS", block=1024)   # 每 WG 一个 (m_block,n_block) 瓦片
+def gemm1_kernel(arg_aq,        # [ntok, H//2]   u8 fp4  A 数据本体(未排序!)
+                 arg_ascale,    # sort_scales 输出: 已排序+交织的 A scale
+                 arg_bq,        # [NE, N_OUT, H//2] u8 fp4  w1 权重(gate|up 拼一起)
+                 arg_bscale,    # w1 scale
+                 arg_eids,      # [m_blocks]  每个 m_block 的 expert
+                 arg_cumsum,    # [2] cumsum[0]=有效总行数
+                 arg_mind,      # m_indices: sorted 行 -> 原 token(gather A 用)
+                 i32_ntok,
+                 arg_aqout,     # 输出: [ntok, inter//2] u8 fp4  (SiLU 后 requant, 喂 gemm2)
+                 arg_ascaleout, # 输出: gemm2 要的 A scale
+                 arg_hidden):   # inline_quant 变体才用,主干忽略
+    H, INTER, NE = 7168, 512, 385
+    N_OUT = 2 * INTER              # 1024 = gate(512) | up(512)
+    NUM_N_BLOCKS = N_OUT // 256    # 4
+    K_TILES = H // 256             # 28
+    kStages = 2
+
+    # ---- ① block -> 负责哪个 (m_block, n_block) 瓦片 + 查 expert ----
+    #   (xcd_swizzle>0 时先过 _xcd() 重映射做 XCD 负载均衡; 主干 SW=0 直接用 bx)
+    n_block_idx = bx % NUM_N_BLOCKS
+    m_block_idx = bx // NUM_N_BLOCKS
+    e     = readfirstlane(arg_eids[m_block_idx])   # 本瓦片所有行的 expert
+    m_row = m_block_idx * BM
+
+    # ---- ② 预取 gather 索引: 本 wave 负责的 sorted 行 -> 原 token 行 ----
+    #   A 未排序,所以要用 m_indices 把 "sorted 行" 翻译成 a_quant 里的原 token 行。
+    cached_actual_row = [ arg_mind[m_row + wave*(BM//4) + sub*8 + lane//8]
+                          for sub in range(kSubBlocks) ]   # 每 sub 一个原 token 行号
+
+    # ---- ③ B(权重)/scale 的 per-wave 基址(readfirstlane 成标量)----
+    b_load_s_base = [ (e*N_OUT + col_of(j)) * K_HALF   for j in range(4) ]
+    b_scale_s_base = ...   # e*kBS_per_expert + ...
+
+    # A -> LDS: 用 gather 行号 cached_actual_row 去 a_quant 里 buffer_load_lds
+    def issue_a_load_lds(slot, kt):
+        for sub in range(kSubBlocks):
+            voffset = swizzle(...) + cached_actual_row[sub] * K_HALF   # ← gather 原 token 行
+            buffer_load_lds(aq_rsrc, s_aq[slot], voffset, soffset=kt*KH_TILE)
+
+    def issue_a_ds_read(slot):        # 从 LDS 读 A 片给 MFMA(带 xor swizzle 解 bank 冲突)
+        return [[ lds_load_vec4(s_aq[slot], row=i, k) for k in range(2)] for i in range(kMChunks)]
+
+    def mfma_cluster(b, a, a_sc, b_sc, J, init):   # 4 个 J,每个多条 16x16x128 fp4 MFMA 累加
+        accm[.][J] = mfma_scale_f32_16x16x128_f8f6f4(a, b, accm, a_sc, b_sc)
+
+    # ---- ④ 软流水主循环 (kStages=2 双缓冲): 边算当前 tile 边预取下一 tile 的 A ----
+    issue_a_scale_load()                       # A scale 一次性载进 LDS
+    for K_C in range(kStages):                  # prologue: 预热前 2 个 K-tile
+        issue_a_load_lds(K_C, K_C)
+    for K_C in range(kStages):                  # B 权重/scale 预取
+        for j in range(4): issue_b_load_j(b[K_C], K_C, j)
+        issue_b_scale_load(b_scale_v[K_C], K_C)
+
+    for OFFSET in range(kUnroll):               # 主体: K_TILES-kStages 轮
+        K_C = kStages + OFFSET
+        gpu.barrier()
+        asc = issue_a_scale_ds_read(K_C - kStages)
+        a   = issue_a_ds_read(OFFSET % kAStages)     # 读当前 tile 的 A
+        issue_a_load_lds(K_C % kAStages, K_C)         # 预取下一 tile 的 A(重叠)
+        for J in range(4):
+            mfma_cluster(b[OFFSET%kStages], a, asc, b_scale_v[OFFSET%kStages], J, init=(OFFSET==0))
+            issue_b_load_j(b[OFFSET%kStages], K_C, J)  # 顺带预取下一 tile 的 B
+        issue_b_scale_load(b_scale_v[OFFSET%kStages], K_C)
+
+    for S in range(kStages):                    # epilogue drain 最后 2 个 tile
+        kt = K_TILES - kStages + S
+        gpu.barrier()
+        asc = issue_a_scale_ds_read(kt); a = issue_a_ds_read(kt % kAStages)
+        for J in range(4): mfma_cluster(b[kt%kStages], a, asc, b_scale_v[kt%kStages], J, init=False)
+
+    # ---- ⑤ epilogue: accm -> LDS 重排 -> SiLU(gate)*up -> requant fp4 -> 写出 ----
+    store accm to lds_acc                         # [BM, BN] f32 经 LDS 重排
+    gpu.barrier()
+    for mr in range(M_REPS):                       # 每线程负责的输出行
+        gate[0:8] = lds_acc[row, gate_cols]        # 从 LDS 取 gate 半
+        up[0:8]   = lds_acc[row, up_cols]          #          up 半
+        result = silu(gate) * up                   # _silu_mul_batch
+        amax   = dpp_quad_amax(|result|)           # 8 元素 blockwise absmax
+        e8m0, qs = e8m0_from_amax(amax)
+        packed = cvt_scalef32_pk_fp4_f32(result, qs)  # 8 f32 -> 8 fp4 (4B)
+        arg_aqout[out_row, byte_pos]   = packed    # 写 gemm2 的 A 数据本体
+        arg_ascaleout[...]             = e8m0       # 写 gemm2 的 A scale
+    # → gemm2 的输入 (a_quant/a_scale) 就是这里产出的,已是 sorted 布局(按 m_row 写)
