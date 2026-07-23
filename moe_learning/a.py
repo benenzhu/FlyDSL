@@ -165,14 +165,38 @@ def sort_place_pad_kernel(M,
 #   量化粒度: 32 个 hidden 元素共享一个 e8m0 scale (= 一个 quant-block)。
 #   D_HIDDEN=7168 -> 每 token 224 个 quant-block。
 # ---------------------------------------------------------------------------
-@launch(N_QCTAS, 1024)   # grid=N_QCTAS(codegen 常量), block=1024=16 waves
-def quant_kernel(M, hidden_states,   # [M, 7168] bf16 (未排序)
+# constexpr int DPP_QUAD_PERM(int a,int b,int c,int d){ return (a&3) | ((b&3)<<2) | ((c&3)<<4) | ((d&3)<<6); } 怎么交换.
+@launch(512, 1024)   # grid=kNCtasSort=512, block=kThreadsSort=1024 (dispatch.h:12-13)
+def quant_kernel(M, 
+                 hidden_states,      # [M, 7168] bf16 (未排序)
                  a_quant,            # [M, 7168//2] u8  (fp4, 未排序)
                  a_scale):           # [M, 7168//32] u8 (e8m0, 未排序)
-    BLOCKS_PER_HIDDEN = 7168 // 32    # 224 quant-block / token
-    # 4 个 lane 协作处理一个 32-元素 block,每 lane 8 个元素
-    TOTAL_BLOCKS = M * BLOCKS_PER_HIDDEN
-    for my_block in assigned_blocks(bid, tid):   # grid-stride, 见源码 wi/wave/block 映射
+    WARP__64 = 64
+    BLOCKS_PER_HIDDEN__224 = 7168 // 32     # 224 quant-block / token
+    LANES_PER_BLOCK__4   = 4              # 4 lane 协作一个 32-元素 block,每 lane 8 元素
+    BLOCKS_PER_WAVE__16   = WARP__64 // LANES_PER_BLOCK__4      # 16 (一个 wave 管 16 个 block)
+    WAVES_PER_CTA     = 1024 // WARP__64                 # 16
+    BLOCKS_PER_CTA__256    = BLOCKS_PER_WAVE__16 * WAVES_PER_CTA   # 256 (一个 CTA 一批做 256 个)
+
+    # 线程 -> (wave, block_in_wave, lane_in_block) 的拆分
+    wave_id       = tid // WARP__64           # 0..15
+    lane          = tid %  WARP__64           # 0..63
+    block_in_wave = lane // LANES_PER_BLOCK__4   # 0..15
+    lane_in_block = lane %  LANES_PER_BLOCK__4   # 0..3
+
+    # 把 TOTAL_BLOCKS 个 quant-block 按 "批(BLOCKS_PER_CTA=256)" 分给 512 个 CTA
+    TOTAL_BLOCKS  = M * BLOCKS_PER_HIDDEN__224
+    N_BATCHES     = ceil_div(TOTAL_BLOCKS, BLOCKS_PER_CTA__256)
+    BATCH_PER_CTA = ceil_div(N_BATCHES, 512)          # 每个 CTA 分几批
+    wi_start = bid * BATCH_PER_CTA
+    wi_end   = min(wi_start + BATCH_PER_CTA, N_BATCHES)
+
+    for wi in range(wi_start, wi_end):
+        # 本线程这一批负责哪个 quant-block(← 这就是原来偷懒的 assigned_blocks)
+        my_block = wi * BLOCKS_PER_CTA__256 + wave_id * BLOCKS_PER_WAVE__16 + block_in_wave
+        if my_block >= TOTAL_BLOCKS:
+            continue
+
         kb = my_block * 32 + lane_in_block * 8
         h[0:4] = load_int4(hidden_states[kb : kb+8])    # 一次载 8 个 bf16
 
@@ -184,7 +208,7 @@ def quant_kernel(M, hidden_states,   # [M, 7168] bf16 (未排序)
         pk = cvt_scalef32_pk_fp4_bf16(h[0:4], qs)        # gfx950 硬件: 8 bf16 -> 8 fp4(4B)
         a_quant[my_block*16 + lane_in_block*4 : +4] = pk
         if lane_in_block == 0:
-            a_scale[my_block] = scale                    # 每 block 一个 scale
+            a_scale[my_block] = scale                    # 每 block 一个 scale (4 lane 只写一次)
 
 
 # ---------------------------------------------------------------------------
@@ -194,23 +218,49 @@ def quant_kernel(M, hidden_states,   # [M, 7168] bf16 (未排序)
 #   的交织布局 (MN_PACK/K_PACK/K_LANE=4/N_LANE=16)。
 #   数据本体 a_quant 不在此排,gemm1 读时用 sorted_token_ids 动态 gather。
 # ---------------------------------------------------------------------------
-@launch(N_CTAS, 1024)    # kNCtasScales=512, kThreadsScales=1024
+@launch(512, 1024)    # grid=kNCtasScales=512, block=kThreadsScales=1024
 def sort_scales_kernel(M, max_sorted,
                        a_scale,                    # [M, 7168//32] u8 (未排序)
                        sorted_token_ids,           # [max_sorted]
                        cumsum,                     # [2], cumsum[0]=有效总行数
                        a_scale_sorted_shuffled):   # 输出: 交织布局 sorted scale
-    A_SCALE_COLS = 7168 // 32     # 224
-    actual_sorted = cumsum[0]
-    for work_id in grid_stride(bid, tid):          # 每 work_id = 输出一个 4B chunk
-        chunk, mi, ku, k_lane, n_lane = decode(work_id)  # -> MFMA 布局坐标
+    # MFMA 读 scale 的布局常量 (BM=128, BK=256, D_HIDDEN=7168)
+    A_SCALE_COLS = 7168 // 32        # 224 = 每 token 的 scale 列数
+    MN_PACK = 2                       # 每输出 dword 打包 2 行(M 方向)
+    K_PACK  = 256 // 128              # BK/128 = 2
+    C_M1    = BM // (16 * MN_PACK)    # 128/32 = 4
+    C_K1    = (7168 // 32) // (4 * K_PACK)   # 224/8 = 28
+    K_LANE  = 4
+    N_LANE  = 16
+    DWORDS_PER_CHUNK = C_M1 * C_K1 * K_LANE * N_LANE   # 4*28*4*16 = 7168
+
+    n_chunks        = max_sorted // BM                 # 全部(含 padding)chunk 数
+    actual_sorted   = cumsum[0]
+    actual_n_chunks = ceil_div(actual_sorted, BM)      # 有效 chunk 数
+
+    # 显式 grid-stride:512*1024 个线程扫 total_work 个 4B 输出 dword
+    total_work    = n_chunks * DWORDS_PER_CHUNK
+    total_threads = 512 * 1024
+    global_tid    = bid * 1024 + tid
+    for work_id in range(global_tid, total_work, total_threads):
+        # 把线性 work_id 拆成 MFMA 布局坐标(低维在前)
+        r = work_id
+        n_lane = r % N_LANE; r //= N_LANE     # 0..15
+        k_lane = r % K_LANE; r //= K_LANE     # 0..3
+        ku     = r % C_K1;   r //= C_K1       # 0..27  (K 方向 chunk)
+        mi     = r % C_M1;   r //= C_M1       # 0..3   (M 方向 pack)
+        chunk  = r                             # 第几个 BM 行块
+
         bytes = [0, 0, 0, 0]
         if chunk < actual_n_chunks:
-            for im_a in range(2):                  # MN_PACK=2
-                sorted_row = chunk*BM + (mi*2 + im_a)*16 + n_lane
-                tok = sorted_token_ids[sorted_row] & 0x00FFFFFF   # 反查原 token
-                tok = tok if tok < M else 0                        # 哨兵 -> 0
-                for ikxdl in range(K_PACK):
+            tok_ids = [0, 0]
+            for im_a in range(MN_PACK):                     # 2 行
+                sorted_row = chunk*BM + (mi*MN_PACK + im_a)*16 + n_lane
+                if sorted_row < actual_sorted:
+                    v = sorted_token_ids[sorted_row] & 0x00FFFFFF   # 反查原 token
+                    tok_ids[im_a] = v if v < M else 0                # 哨兵 -> 0
+            for ikxdl in range(K_PACK):                     # 2
+                for im_a in range(MN_PACK):                  # 2
                     k_idx = ku*K_PACK*4 + ikxdl*4 + k_lane
-                    bytes[...] = a_scale[tok * A_SCALE_COLS + k_idx]  # gather 重排
-        a_scale_sorted_shuffled[work_id*4 : +4] = bytes
+                    bytes[ikxdl*MN_PACK + im_a] = a_scale[tok_ids[im_a]*A_SCALE_COLS + k_idx]  # gather
+        a_scale_sorted_shuffled[work_id*4 : work_id*4 + 4] = bytes   # 写成交织布局
