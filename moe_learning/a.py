@@ -9,6 +9,7 @@ def round_up():
 from typing import List
 
 bid = 0
+bx = 0
 tid = 0
 M = 32768
 topk = 8
@@ -280,6 +281,7 @@ def sort_scales_kernel(M, max_sorted,
 #   BM=128, BN=256, BK=256 -> K_TILES = H/BK = 28, NUM_N_BLOCKS = N_OUT/BN = 4
 #   kStages=2 (A 的 LDS 双缓冲深度)
 # ===========================================================================
+#  max_m_blocks = (n_tokens*TOPK + NE*(BM-1) + BM-1)//BM;  grid = max_m_blocks*NUM_N_BLOCKS
 # launch: grid=(total_m_blocks*NUM_N_BLOCKS, 1, 1) 一维, block=(256,1,1) (mxfp4_gemm1.py:941)
 #   bx 一维线性, kernel 内拆: m_block_idx = bx//NUM_N_BLOCKS, n_block_idx = bx%NUM_N_BLOCKS
 @launch(grid="total_m_blocks * NUM_N_BLOCKS", block=256)   # 一维 grid, block=256=4 waves; 每 WG 一个 (m_block,n_block) 瓦片
@@ -287,9 +289,9 @@ def gemm1_kernel(arg_aq,        # [ntok, H//2]   u8 fp4  A 数据本体(未排�
                  arg_ascale,    # sort_scales 输出: 已排序+交织的 A scale
                  arg_bq,        # [NE, N_OUT, H//2] u8 fp4  w1 权重(gate|up 拼一起)
                  arg_bscale,    # w1 scale
-                 arg_eids,      # [m_blocks]  每个 m_block 的 expert
-                 arg_cumsum,    # [2] cumsum[0]=有效总行数
-                 arg_mind,      # m_indices: sorted 行 -> 原 token(gather A 用)
+                 eids_in,      # [m_blocks]  每个 m_block 的 expert
+                 cumsum_in,    # [2] cumsum[0]=有效总行数
+                 mindices_in,      # m_indices: sorted 行 -> 原 token(gather A 用)
                  i32_ntok,
                  arg_aqout,     # 输出: [ntok, inter//2] u8 fp4  (SiLU 后 requant, 喂 gemm2)
                  arg_ascaleout, # 输出: gemm2 要的 A scale
@@ -301,12 +303,9 @@ def gemm1_kernel(arg_aq,        # [ntok, H//2]   u8 fp4  A 数据本体(未排�
     NUM_N_BLOCKS = N_OUT // 256    # 4  (gemm1; gemm2 是 7168//256=28)
     K_TILES = H // 256             # 28  (K = H = 7168 是 gemm1 的规约维)
     kStages = 2
-    # ★ grid 用的是 HOST 端算的【上界】(gemm1_grid, 纯用 n_tokens, 零 d2h):
-    #     max_m_blocks = (n_tokens*TOPK + NE*(BM-1) + BM-1)//BM;  grid = max_m_blocks*NUM_N_BLOCKS
-    #   kernel 里再用【实际值】做提前退出(device 读自己的 global cumsum, 也不是 d2h):
-    total_m_blocks = arg_cumsum[0] // BM   # device 读 cumsum[0](GPU 内部, 非 d2h)
+    total_m_blocks = cumsum_in[0] // BM   # total blocks
     bound = total_m_blocks * NUM_N_BLOCKS
-    if bx >= bound:                        # 上界多起的空 block 直接退出(≈零成本)
+    if bx >= bound:                        # early return
         return
     # 即: grid=host上界(偏多) + kernel内 if bx<bound 剪掉多余; 用空转换掉 d2h 同步
 
@@ -314,12 +313,12 @@ def gemm1_kernel(arg_aq,        # [ntok, H//2]   u8 fp4  A 数据本体(未排�
     #   (xcd_swizzle>0 时先过 _xcd() 重映射做 XCD 负载均衡; 主干 SW=0 直接用 bx)
     n_block_idx = bx % NUM_N_BLOCKS
     m_block_idx = bx // NUM_N_BLOCKS
-    e     = readfirstlane(arg_eids[m_block_idx])   # 本瓦片所有行的 expert
+    e     = readfirstlane(eids_in[m_block_idx])   # 本瓦片所有行的 expert
     m_row = m_block_idx * BM
 
     # ---- ② 预取 gather 索引: 本 wave 负责的 sorted 行 -> 原 token 行 ----
     #   A 未排序,所以要用 m_indices 把 "sorted 行" 翻译成 a_quant 里的原 token 行。
-    cached_actual_row = [ arg_mind[m_row + wave*(BM//4) + sub*8 + lane//8]
+    cached_actual_row = [ mindices_in[m_row + wave*(BM//4) + sub*8 + lane//8]
                           for sub in range(kSubBlocks) ]   # 每 sub 一个原 token 行号
 
     # ---- ③ B(权重)/scale 的 per-wave 基址(readfirstlane 成标量)----
