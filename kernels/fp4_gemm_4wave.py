@@ -336,7 +336,6 @@ class Mfma16x16x128Fp4:
     def __init__(self, n_tiles_a, n_tiles_b, swap_operands=False, tile_2x2=True):
         assert n_tiles_a % _FP4_PACK == 0 and n_tiles_b % _FP4_PACK == 0
         self.accum_type = Vec.make_type(4, fx.Float32)
-        self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.res_ty = Vec.make_type(4, fx.Float32)
@@ -385,7 +384,7 @@ class Mfma16x16x128Fp4:
                 order += [(i0 + di, j0 + dj) for di in range(2) for dj in range(2)]
         return order
 
-    def call(self, a, b, c, sa, sb, interleave=None, interleave_stride=1):
+    def call(self, a, b, c, sa, sb, interleave=None, interleave_stride=1, zero_acc=False):
         """``sa`` / ``sb`` are lists (len n_groups) of packed-E8M0 i32 scales
         (4 sub-fields each, one full K=256 step for a 32-row pack-group).
 
@@ -416,7 +415,12 @@ class Mfma16x16x128Fp4:
                 b_op = b[j][ksub]
                 sb_v = sb[j // _FP4_PACK]
                 jb = j % _FP4_PACK
-                c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb)
+                if zero_acc and ksub == 0:
+                    # First K-sub of the first K-step: src2 is the inline constant 0,
+                    # so the accumulator needs no v_accvgpr_write pre-initialization.
+                    c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, None, sa_v, sb_v, ksub, ia, jb)
+                else:
+                    c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb)
                 # Issue a thunk only every `interleave_stride` MFMAs so a load gets
                 # >1 MFMA execute-shadow to hide behind (vs bunched after the first
                 # few MFMAs). Spreads buffer_load/ds_read across the quad.
@@ -447,20 +451,22 @@ class Mfma16x16x128Fp4:
             ia, jb = jb, ia
         opsel = f"op_sel:[{ia},{jb},0]"
         opsel_hi = f"op_sel_hi:[{ksub},{ksub},0]"
-        asm = "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, $0, $3, $4 " f"{opsel} {opsel_hi} cbsz:4 blgp:4"
-        return _llvm.inline_asm(
-            self.res_ty,
-            [
-                arith._to_raw(a_op),
-                arith._to_raw(b_op),
-                arith._to_raw(sa_v),
-                arith._to_raw(sb_v),
-                arith._to_raw(acc),
-            ],
-            asm,
-            "=a,v,v,v,v,0",
-            has_side_effects=True,
-        )
+        # acc=None -> src2 is the literal 0 (C = A*B, not A*B + C). Used for the
+        # first K-sub of the first K-step so the 256 v_accvgpr_write_b32 that
+        # would zero the accumulators disappear entirely.
+        src2 = "$0" if acc is not None else "0"
+        asm = f"v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, {src2}, $3, $4 " f"{opsel} {opsel_hi} cbsz:4 blgp:4"
+        ops = [
+            arith._to_raw(a_op),
+            arith._to_raw(b_op),
+            arith._to_raw(sa_v),
+            arith._to_raw(sb_v),
+        ]
+        cons = "=a,v,v,v,v"
+        if acc is not None:
+            ops.append(arith._to_raw(acc))
+            cons += ",0"
+        return _llvm.inline_asm(self.res_ty, ops, asm, cons, has_side_effects=True)
 
 
 # Scale-LDS geometry. Each wave needs 4 scale blocks (256 B each) per operand:
@@ -745,6 +751,12 @@ def compile_fp4_gemm_4w(
     assert K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K
+    # scf.for body length in K-steps. Steps 0/1 are peeled (see zero_acc) and the
+    # last 2 are the tail, so the loop covers K_ITERS-4 steps. 4 measured fastest:
+    # 2 -> 16KB .text, 4 -> 20KB (+0.7..1.6%), full unroll -> 111KB and -3% (blows
+    # the 32KB I-cache). Must be even -- see the ping-pong note at the loop.
+    UNROLL = 4 if (K_ITERS - 4) % 4 == 0 else 2
+    assert (K_ITERS - 4) % UNROLL == 0, K_ITERS
     N_TILES_A = BLOCK_M // 4 // 16
     N_TILES_B = BLOCK_N // 4 // 16
     N_ACCUMS = N_TILES_A * N_TILES_B
@@ -854,11 +866,8 @@ def compile_fp4_gemm_4w(
                 lambda: b_scale_ld.gather(k, slot, base_col),
             ]
 
-        # Accumulators: 2x2 64x64 quadrants per wave.
-        c00_frag = [mfma.zero_value] * N_ACCUMS
-        c01_frag = [mfma.zero_value] * N_ACCUMS
-        c10_frag = [mfma.zero_value] * N_ACCUMS
-        c11_frag = [mfma.zero_value] * N_ACCUMS
+        # Accumulators: 2x2 64x64 quadrants per wave. They are NOT zero-initialized --
+        # K-step 0 runs with ``zero_acc`` so its ksub-0 MFMAs write C = A*B directly.
 
         gl_off_a = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=False)
         gl_off_b = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=True)
@@ -929,14 +938,14 @@ def compile_fp4_gemm_4w(
         # in flight, so the ds_read of scale[kc] sees landed LDS.
         _MAIN_VMCNT = 17
 
-        # ---- Main K-loop as scf.for, unrolled by 2 ------------------------------
-        # Why scf.for (not range_constexpr full unroll): fully unrolling all 30 main
-        # steps blew .text to ~59KB > 32KB I-cache -> periodic instruction-fetch
-        # stalls. Rolling into an scf.for (body = 2 unrolled steps) keeps .text small.
-        # Unroll-2 is chosen because the buffer ping-pong swaps the cur<->next LDS
-        # pointers exactly twice per body -> identity, so the LDS pointers need NOT
-        # be loop-carried. Carried state = the 4 accumulator groups + a0/b0 fragment
-        # + the 4 prefetched scales.
+        # ---- Main K-loop as scf.for, body = UNROLL K-steps ----------------------
+        # Why scf.for (not range_constexpr full unroll): fully unrolling every main
+        # step blows .text past the 32KB I-cache -> periodic instruction-fetch
+        # stalls. Measured at 16384^3: unroll-2 16KB / 5393 TFLOPS, unroll-4 20KB /
+        # 5432, full unroll 111KB / 5233. UNROLL must be EVEN so the buffer
+        # ping-pong (one cur<->next swap per step) is an identity over the body and
+        # the LDS pointers need NOT be loop-carried. Carried state = the 4
+        # accumulator groups + a0/b0 fragment + the 4 prefetched scales.
         #
         # ``buf`` arg names below are fixed (cur0/cur1/next0/next1); a single step
         # mutates which physical buffer is "cur" via the pointer-pair swap, so the
@@ -958,7 +967,7 @@ def compile_fp4_gemm_4w(
                 lambda: _r(3, b_scale_ld, 1),
             ]
 
-        def _one_step(kc, a0f, b0f, sc, accs, bufs):
+        def _one_step(kc, a0f, b0f, sc, accs, bufs, zero_acc=False):
             # bufs = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
             ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
             # DEPTH-3 scale + VGPR carry: ``sc`` = scale[kc] ALREADY in VGPR (read in
@@ -996,7 +1005,7 @@ def compile_fp4_gemm_4w(
             il = (
                 _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True) + _rd_scn[:2]
             )
-            c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il, interleave_stride=2)
+            c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il, interleave_stride=2, zero_acc=zero_acc)
             b1f = _b1
 
             il = (
@@ -1004,7 +1013,7 @@ def compile_fp4_gemm_4w(
                 + _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False)
                 + _rd_scn[2:]
             )
-            c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il, interleave_stride=2)
+            c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il, interleave_stride=2, zero_acc=zero_acc)
             a1f = _a1
 
             wait_barrier(_MAIN_VMCNT)
@@ -1013,7 +1022,7 @@ def compile_fp4_gemm_4w(
                 + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False)
                 + _sc_gather[:1]
             )
-            c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il, interleave_stride=2)
+            c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il, interleave_stride=2, zero_acc=zero_acc)
             a0nf = _a0n
 
             il = (
@@ -1021,7 +1030,7 @@ def compile_fp4_gemm_4w(
                 + _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B, True)
                 + _sc_gather[1:]
             )
-            c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il, interleave_stride=2)
+            c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il, interleave_stride=2, zero_acc=zero_acc)
             b0nf = _b0n
 
             sc_next = (_scn[0], _scn[1], _scn[2], _scn[3])
@@ -1029,6 +1038,12 @@ def compile_fp4_gemm_4w(
             return a0nf, b0nf, sc_next, (c00f, c01f, c10f, c11f), new_bufs
 
         bufs0 = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
+
+        def _swap_bufs(bufs):
+            """Same cur<->next swap ``_one_step`` returns; used by the peeled steps."""
+            ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
+            return (an0, an1, ac0, ac1, bn0, bn1, bc0, bc1)
+
         n_a = 2 * N_TILES_A
         n_b = 2 * N_TILES_B
         n_ga = N_TILES_A // _FP4_PACK  # scale groups per A half (=len(saR0))
@@ -1052,17 +1067,27 @@ def compile_fp4_gemm_4w(
             o += n_gb
             return (saR0, saR1, sbC0, sbC1)
 
+        # Steps 0 and 1 are peeled out of the scf.for so step 0 can run with
+        # ``zero_acc``: its ksub-0 MFMAs take the literal 0 as src2 (C = A*B), which
+        # removes the 256 v_accvgpr_write_b32 that would otherwise zero the
+        # accumulators before the loop. Two steps are peeled (not one) to keep the
+        # LDS ping-pong identity -- the pointer pairs swap twice, so the loop body
+        # still sees ``bufs0``.
+        _accs0 = ([None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS)
+        a0f, b0f, sc, accs, _ = _one_step(0, a0_frag, b0_frag, sc0, _accs0, bufs0, zero_acc=True)
+        a0f, b0f, sc, accs, _ = _one_step(1, a0f, b0f, sc, accs, _swap_bufs(bufs0))
+
         # Carry = a0/b0 fragments + VGPR scale carry (scale[kc]) + 4 accumulator groups.
         init_state = (
-            _flat_frag(a0_frag)
-            + _flat_frag(b0_frag)
-            + _flat_sc(sc0)
-            + [_R(x) for x in c00_frag]
-            + [_R(x) for x in c01_frag]
-            + [_R(x) for x in c10_frag]
-            + [_R(x) for x in c11_frag]
+            _flat_frag(a0f)
+            + _flat_frag(b0f)
+            + _flat_sc(sc)
+            + [_R(x) for x in accs[0]]
+            + [_R(x) for x in accs[1]]
+            + [_R(x) for x in accs[2]]
+            + [_R(x) for x in accs[3]]
         )
-        for kk, state in range(0, K_ITERS - 2, 2, init=init_state):
+        for kk, state in range(2, K_ITERS - 2, UNROLL, init=init_state):
             off = 0
             a0f = _unflat_frag(state[off : off + n_a], N_TILES_A)
             off += n_a
@@ -1080,10 +1105,12 @@ def compile_fp4_gemm_4w(
             off += N_ACCUMS
             accs = (c00f, c01f, c10f, c11f)
 
-            # step kk
-            a0f, b0f, sc, accs, bufs = _one_step(kk, a0f, b0f, sc, accs, bufs0)
-            # step kk+1 (pointers swapped once; swap again -> back to bufs0 at exit)
-            a0f, b0f, sc, accs, bufs = _one_step(kk + 1, a0f, b0f, sc, accs, bufs)
+            # UNROLL steps. The pointer pair swaps once per step and UNROLL is even
+            # -> back to bufs0 at body exit, so the LDS pointers stay loop-invariant
+            # and need not be carried.
+            bufs = bufs0
+            for u in range_constexpr(UNROLL):
+                a0f, b0f, sc, accs, bufs = _one_step(kk + u, a0f, b0f, sc, accs, bufs)
 
             new_state = (
                 _flat_frag(a0f)
@@ -1102,7 +1129,7 @@ def compile_fp4_gemm_4w(
         off += n_a
         b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B)
         off += n_b
-        # VGPR carry at loop exit = scale[K_ITERS-2] (each iter advances sc by 2).
+        # VGPR carry at loop exit = scale[K_ITERS-2] (each iter advances sc by UNROLL).
         sc = _unflat_sc(state[off : off + n_sc])
         off += n_sc
         c00_frag = list(state[off : off + N_ACCUMS])
