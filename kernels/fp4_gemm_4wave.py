@@ -333,7 +333,7 @@ class Mfma16x16x128Fp4:
     ``k_sub * pack + tile_in_pair`` where tile_in_pair = i % pack / j % pack.
     """
 
-    def __init__(self, n_tiles_a, n_tiles_b, swap_operands=False):
+    def __init__(self, n_tiles_a, n_tiles_b, swap_operands=False, tile_2x2=True):
         assert n_tiles_a % _FP4_PACK == 0 and n_tiles_b % _FP4_PACK == 0
         self.accum_type = Vec.make_type(4, fx.Float32)
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
@@ -343,9 +343,47 @@ class Mfma16x16x128Fp4:
         # See _mfma_agpr: feeds (B, A) so the accumulator comes out transposed
         # (row-contiguous), which the epilogue needs to store wide.
         self.swap_operands = swap_operands
+        # Emit MFMAs in 2x2 (i,j) tiles so both source operands stay resident in
+        # the XDL operand buffer. See _order.
+        self.tile_2x2 = tile_2x2 and n_tiles_a % 2 == 0 and n_tiles_b % 2 == 0
 
     def idx(self, i, j):
         return i * self.n_tiles_b + j
+
+    def _order(self):
+        """(i, j) emission order for one ksub.
+
+        The plain ``for i: for j:`` sweep holds one operand fixed across a whole
+        row and cycles the other, so the cycled side never hits: the XDL operand
+        buffer is 8 registers per side = 2 slots of v[n:n+3], and a row of
+        n_tiles_b=4 distinct operands evicts each entry before it is reused.
+
+        A 2x2 tile touches exactly 2 distinct i and 2 distinct j, which is what
+        those 2 slots hold, so of the 4 MFMAs only the first fetches on either
+        side::
+
+            (i,j) (i,j+1) (i+1,j) (i+1,j+1)   ->  2 A fetches + 2 B fetches
+            row sweep, 4 wide                 ->  4 A fetches + 1 B fetch
+
+        The j0 sweep is serpentine (0,2 then 2,0) rather than restarting at 0 for
+        every i0 row: at the row turn the previous row's last 2x2 tile holds the
+        same B pair the new row starts with, so that tile's two B fetches become
+        hits, and the same carry then survives across the call boundary into the
+        next quadrant. Plain 2x2 restarts at j0=0 and evicts it.
+
+        Modelled over the full 512-MFMA body: 640 (row sweep) -> 384 (plain 2x2)
+        -> 320 (serpentine), which is the floor for pure reordering under the
+        four-quadrant call structure. Order only; the (i,j) set and each
+        accumulator's operands are unchanged.
+        """
+        if not self.tile_2x2:
+            return [(i, j) for i in range(self.n_tiles_a) for j in range(self.n_tiles_b)]
+        order = []
+        j0s = list(range(0, self.n_tiles_b, 2))
+        for n, i0 in enumerate(range(0, self.n_tiles_a, 2)):
+            for j0 in (reversed(j0s) if n % 2 else j0s):
+                order += [(i0 + di, j0 + dj) for di in range(2) for dj in range(2)]
+        return order
 
     def call(self, a, b, c, sa, sb, interleave=None, interleave_stride=1):
         """``sa`` / ``sb`` are lists (len n_groups) of packed-E8M0 i32 scales
@@ -369,23 +407,23 @@ class Mfma16x16x128Fp4:
         thunks = list(interleave) if interleave else []
         nth = [0]  # python-level counter (compile-time), not loop-carried
         mth = [0]  # MFMA counter, for spacing thunks every `interleave_stride` MFMAs
+        order = self._order()
         for ksub in range_constexpr(_FP4_PACK):
-            for i in range_constexpr(self.n_tiles_a):
+            for i, j in order:
                 a_op = a[i][ksub]
                 sa_v = sa[i // _FP4_PACK]
                 ia = i % _FP4_PACK
-                for j in range_constexpr(self.n_tiles_b):
-                    b_op = b[j][ksub]
-                    sb_v = sb[j // _FP4_PACK]
-                    jb = j % _FP4_PACK
-                    c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb)
-                    # Issue a thunk only every `interleave_stride` MFMAs so a load gets
-                    # >1 MFMA execute-shadow to hide behind (vs bunched after the first
-                    # few MFMAs). Spreads buffer_load/ds_read across the quad.
-                    if nth[0] < len(thunks) and (mth[0] % interleave_stride) == 0:
-                        thunks[nth[0]]()
-                        nth[0] += 1
-                    mth[0] += 1
+                b_op = b[j][ksub]
+                sb_v = sb[j // _FP4_PACK]
+                jb = j % _FP4_PACK
+                c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb)
+                # Issue a thunk only every `interleave_stride` MFMAs so a load gets
+                # >1 MFMA execute-shadow to hide behind (vs bunched after the first
+                # few MFMAs). Spreads buffer_load/ds_read across the quad.
+                if nth[0] < len(thunks) and (mth[0] % interleave_stride) == 0:
+                    thunks[nth[0]]()
+                    nth[0] += 1
+                mth[0] += 1
         while nth[0] < len(thunks):
             thunks[nth[0]]()
             nth[0] += 1
@@ -691,6 +729,7 @@ def compile_fp4_gemm_4w(
     mn_aligned: bool = False,
     swap_operands: bool = False,
     wide_store: bool = True,
+    tile_2x2: bool = True,
 ):
     # mn_aligned: caller asserts M % BLOCK_M == 0 and N % BLOCK_N == 0, so every
     # epilogue store is in-bounds -> skip the per-store col-bounds select (saves
@@ -776,7 +815,7 @@ def compile_fp4_gemm_4w(
         # K-step (same constant fp8_gemm_4wave uses for b_preshuffled).
         B_K_STEP = 2 * 1024
 
-        mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B, swap_operands=swap_operands)
+        mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B, swap_operands=swap_operands, tile_2x2=tile_2x2)
 
         # Scale via dwordx4...lds gather + ds_read (see ScaleLoaderLDS). One gather
         # per operand per K-step into a triple-buffered scale-LDS slot; read[kc] /
