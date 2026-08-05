@@ -265,6 +265,25 @@ def _g2s_thunks(g2s, dst, gl_off, n_steps):
     return [lambda s=s: g2s.load_one(dst, gl_off, s) for s in range(n_steps)]
 
 
+def _riffle(glb, lds):
+    """Interleave the global and LDS thunk lists proportionally instead of
+    concatenating them. Concatenated, the 4 g2s issue back-to-back and each stalls
+    on a full TA queue (ATT: buffer_load ARBITER_WIN_EX 53%); riffled, LDS reads sit
+    between consecutive global loads so the TA queue drains. aiter's loop is built
+    the same way -- its sequence alternates global and LDS, never 4 global in a row."""
+    if not glb or not lds:
+        return list(glb) + list(lds)
+    out = []
+    step = len(lds) / len(glb)
+    li = 0
+    for gi, t in enumerate(glb):
+        out.append(t)
+        upto = int(round((gi + 1) * step))
+        out += lds[li:upto]
+        li = upto
+    return out + lds[li:]
+
+
 def _s2r_thunks(s2r, src, holder, n, pre):
     """List of thunks, each issuing one s2r.load_one (tile i, ksub) into holder[i]."""
     ts = []
@@ -384,7 +403,7 @@ class Mfma16x16x128Fp4:
                 order += [(i0 + di, j0 + dj) for di in range(2) for dj in range(2)]
         return order
 
-    def call(self, a, b, c, sa, sb, interleave=None, interleave_stride=1, zero_acc=False):
+    def call(self, a, b, c, sa, sb, interleave=None, zero_acc=False):
         """``sa`` / ``sb`` are lists (len n_groups) of packed-E8M0 i32 scales
         (4 sub-fields each, one full K=256 step for a 32-row pack-group).
 
@@ -405,8 +424,17 @@ class Mfma16x16x128Fp4:
         # ds_read/buffer_load fits free between MFMAs). Mirrors fp8 _interleaved_cluster.
         thunks = list(interleave) if interleave else []
         nth = [0]  # python-level counter (compile-time), not loop-carried
-        mth = [0]  # MFMA counter, for spacing thunks every `interleave_stride` MFMAs
+        mth = [0]  # MFMA counter, indexes into ``slots``
         order = self._order()
+        # Thunk placement. A fixed stride (the previous scheme) packs every thunk
+        # into the first stride*len(thunks) MFMAs and leaves the rest of the call a
+        # bare back-to-back MFMA tail -- ATT showed those tail MFMAs stalling 12 cyc
+        # each while the interleaved region cost a few hundred cycles in total.
+        # Spread thunks evenly over ALL n_mfma slots so every one gets the same
+        # execute-shadow and no tail is left uncovered: thunk t goes after MFMA
+        # floor(t * n_mfma / n_thunks). Max MFMA run drops 8 -> 3.
+        n_mfma = _FP4_PACK * len(order)
+        slots = {(t * n_mfma) // len(thunks) for t in range(len(thunks))} if thunks else set()
         for ksub in range_constexpr(_FP4_PACK):
             for i, j in order:
                 a_op = a[i][ksub]
@@ -421,10 +449,7 @@ class Mfma16x16x128Fp4:
                     c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, None, sa_v, sb_v, ksub, ia, jb)
                 else:
                     c[self.idx(i, j)] = self._mfma_agpr(a_op, b_op, c[self.idx(i, j)], sa_v, sb_v, ksub, ia, jb)
-                # Issue a thunk only every `interleave_stride` MFMAs so a load gets
-                # >1 MFMA execute-shadow to hide behind (vs bunched after the first
-                # few MFMAs). Spreads buffer_load/ds_read across the quad.
-                if nth[0] < len(thunks) and (mth[0] % interleave_stride) == 0:
+                if nth[0] < len(thunks) and mth[0] in slots:
                     thunks[nth[0]]()
                     nth[0] += 1
                 mth[0] += 1
@@ -1003,34 +1028,32 @@ def compile_fp4_gemm_4w(
 
             wait_barrier(_MAIN_VMCNT)
             il = (
-                _g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A) + _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True) + _rd_scn[:2]
+                _riffle(_g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A), _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True))
+                + _rd_scn[:2]
             )
-            c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il, interleave_stride=2, zero_acc=zero_acc)
+            c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il, zero_acc=zero_acc)
             b1f = _b1
 
             il = (
-                _g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A)
-                + _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False)
+                _riffle(_g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A), _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False))
                 + _rd_scn[2:]
             )
-            c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il, interleave_stride=2, zero_acc=zero_acc)
+            c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il, zero_acc=zero_acc)
             a1f = _a1
 
             wait_barrier(_MAIN_VMCNT)
             il = (
-                _g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A)
-                + _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False)
+                _riffle(_g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A), _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False))
                 + _sc_gather[:1]
             )
-            c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il, interleave_stride=2, zero_acc=zero_acc)
+            c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il, zero_acc=zero_acc)
             a0nf = _a0n
 
             il = (
-                _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A)
-                + _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B, True)
+                _riffle(_g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A), _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B, True))
                 + _sc_gather[1:]
             )
-            c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il, interleave_stride=2, zero_acc=zero_acc)
+            c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il, zero_acc=zero_acc)
             b0nf = _b0n
 
             sc_next = (_scn[0], _scn[1], _scn[2], _scn[3])
@@ -1154,7 +1177,7 @@ def compile_fp4_gemm_4w(
             + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
             + _rd_scn
         )
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il, interleave_stride=2)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
         b1_frag = _b1
         a1_frag = _a1
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
@@ -1162,7 +1185,7 @@ def compile_fp4_gemm_4w(
         _b0n = [None] * N_TILES_B
         wait_barrier((1 * N_TILES_A) + (1 * N_TILES_B))
         il = _s2r_thunks(a_s2r, a_next0, _a0n, N_TILES_A, False) + _s2r_thunks(b_s2r, b_next0, _b0n, N_TILES_B, True)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0, interleave=il, interleave_stride=2)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0, interleave=il)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1)
         a0_frag = _a0n
         b0_frag = _b0n
@@ -1178,7 +1201,7 @@ def compile_fp4_gemm_4w(
         wait_barrier(0)
         saR0, saR1, sbC0, sbC1 = (_scn[0], _scn[1], _scn[2], _scn[3])
         il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il, interleave_stride=2)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
         b1_frag = _b1
         a1_frag = _a1
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
