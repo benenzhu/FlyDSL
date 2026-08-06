@@ -39,7 +39,6 @@ from kernels.fp8_gemm_utils import (
     compute_global_swizzle,
     divmod,
     swizzle_128,
-    wait_barrier,
 )
 
 _N_WAVES = 4  # block is always 256 threads -> 4 waves (compile-time constant)
@@ -78,6 +77,27 @@ def _lds_ptr_t():
 def _asm_void(operands, asm_string, constraints):
     """Side-effecting void inline asm (LLVM sees no memory op -> no waitcnt added)."""
     _llvm.inline_asm(None, operands, asm_string, constraints, has_side_effects=True)
+
+
+def _enc_waitcnt_gfx9(vm, lgkm=15, exp=7):
+    """gfx9/CDNA ``s_waitcnt`` SIMM16 encoding: ``vmcnt[3:0] | expcnt[6:4] | lgkmcnt[11:8] | vmcnt[15:14]``.
+
+    The split-field mess is why gfx12 replaced it with s_wait_loadcnt/dscnt/storecnt,
+    but those intrinsics are gfx12+ only ("Cannot select" on gfx950).
+    """
+    return (vm & 0xF) | ((exp & 0x7) << 4) | ((lgkm & 0xF) << 8) | (((vm >> 4) & 0x3) << 14)
+
+
+def wait_barrier(count):
+    """``s_waitcnt vmcnt(count)`` + ``s_barrier``.
+
+    Same semantics as ``fp8_gemm_utils.wait_barrier`` but emitted as ROCDL ops
+    instead of inline asm: inline asm plants hard ``ASMSTART``/``ASMEND`` walls
+    the machine scheduler cannot move instructions across, costing us prologue
+    scheduling freedom. Hot-loop ISA is unchanged.
+    """
+    _rocdl.s_waitcnt(_enc_waitcnt_gfx9(count))
+    _rocdl.s_barrier()
 
 
 def _uniform_i32(value):
@@ -853,14 +873,9 @@ def compile_fp4_gemm_4w(
 
         mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B, swap_operands=swap_operands, tile_2x2=tile_2x2)
 
-        # Scale via dwordx4...lds gather + ds_read (see ScaleLoaderLDS). One gather
-        # per operand per K-step into a triple-buffered scale-LDS slot; read[kc] /
-        # gather[kc+2] use slots kc%3 / (kc+2)%3 (3 distinct -> race-free).
         _scale_base_ptr = lds.scale_lds.ptr
         a_scale_ld = ScaleLoaderLDS(A_scale, N_TILES_A, K, lane_id, wave_id, _scale_base_ptr, _SCALE_A_REGION)
         b_scale_ld = ScaleLoaderLDS(B_scale, N_TILES_B, K, lane_id, wave_id, _scale_base_ptr, _SCALE_B_REGION)
-        # Precompute each loader's wave-uniform LDS base into an SGPR once, so the
-        # per-gather m0 needs no readfirstlane (was 4/iter -> exposed ~19% in ATT).
         a_scale_ld.set_wave_base()
         b_scale_ld.set_wave_base()
 
@@ -930,8 +945,8 @@ def compile_fp4_gemm_4w(
         _gather_scales(1, _slot(1))
         _gather_scales(2, _slot(2))
 
-        a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)  # 4个load.
-        b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)  # 4个...
+        a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
+        b_g2s.load(b_cur0, B0_gl_offset + 0 * B_K_STEP)
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * A_K_STEP)
 
@@ -939,9 +954,6 @@ def compile_fp4_gemm_4w(
         b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
         b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
         a_g2s.load(a_next1, A1_gl_offset + 1 * A_K_STEP)
-
-        def _do_quad(a_frag, b_frag, c_frag, sa_ksub, sb_ksub):
-            return mfma.call(a_frag, b_frag, c_frag, sa_ksub, sb_ksub)
 
         wait_barrier((3 * N_TILES_A) + (4 * N_TILES_B))
         a0_frag = a_s2r.load(a_cur0)
