@@ -848,8 +848,7 @@ def compile_fp4_gemm_4w(
         A_K_STEP = BLOCK_K_BYTES
         B0_gl_offset = (tile_j * BLOCK_N) * K_BYTES
         B1_gl_offset = (tile_j * BLOCK_N + LDS_BLOCK_N) * K_BYTES
-        # B is preshuffled (16,16): one N-16 row-block spans 2*1024 bytes per
-        # K-step (same constant fp8_gemm_4wave uses for b_preshuffled).
+        # B is preshuffled (16,16): one N-16 row-block spans 2*1024 bytes per K-step
         B_K_STEP = 2 * 1024
 
         mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B, swap_operands=swap_operands, tile_2x2=tile_2x2)
