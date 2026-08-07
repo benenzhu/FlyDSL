@@ -125,14 +125,20 @@ def _enc_waitcnt_gfx9(vm, lgkm=15, exp=7):
 
 
 def wait_barrier(count):
-    """``s_waitcnt vmcnt(count)`` + ``s_barrier``.
+    """``s_waitcnt vmcnt(count) lgkmcnt(0)`` + ``s_barrier``.
+
+    The lgkmcnt(0) is not redundant with the barrier: it makes the barrier also
+    drain every outstanding ds_read, which lets the backend drop the standalone
+    per-consumer lgkmcnt waits (60 -> 8 s_waitcnt in the hot loop). It only pays
+    off because every s2r fragment is read one segment before it is consumed --
+    see the b1 carry in ``_one_step``.
 
     Same semantics as ``fp8_gemm_utils.wait_barrier`` but emitted as ROCDL ops
     instead of inline asm: inline asm plants hard ``ASMSTART``/``ASMEND`` walls
     the machine scheduler cannot move instructions across, costing us prologue
     scheduling freedom. Hot-loop ISA is unchanged.
     """
-    _rocdl.s_waitcnt(_enc_waitcnt_gfx9(count))
+    _rocdl.s_waitcnt(_enc_waitcnt_gfx9(count, lgkm=0))
     _rocdl.s_barrier()
 
 
@@ -987,6 +993,8 @@ def compile_fp4_gemm_4w(
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier((3 * N_TILES_A) + (3 * N_TILES_B))
         b0_frag = b_s2r.load(b_cur0, preshuffled=True)
+        # b1 is carried across steps (see _one_step); seed the carry here.
+        b1_frag = b_s2r.load(b_cur1, preshuffled=True)
 
         # Initial VGPR scale carry = scale[0] (gathered first in prologue, landed by
         # the barriers above). The loop carries scale[kc] in VGPR; each step reads
@@ -1004,6 +1012,11 @@ def compile_fp4_gemm_4w(
         # (Was 17 of 18 when every wave gathered both operands: same one-load
         # margin, since dropping the duplicate gather shrank the step by one.)
         _MAIN_VMCNT = int(os.environ.get("FP4_MAIN_VMCNT", "16"))
+        # The seg-2 barrier needs a tighter count than seg-1: it guards the b1
+        # fragment read for step kc+1, whose g2s went out in the PREVIOUS step's
+        # call3 and so has only 12 newer VMEM ops behind it (vs 21/17 for a0n/b0n,
+        # issued in call1/call2). 16 would let those 4 loads still be in flight.
+        _SEG2_VMCNT = int(os.environ.get("FP4_SEG2_VMCNT", "12"))
 
         def _read_scale_thunks(kc_idx, holder):
             """4 thunks, each doing one half-read of scale[kc_idx] into holder
@@ -1022,7 +1035,7 @@ def compile_fp4_gemm_4w(
                 lambda: _r(3, b_scale_ld, 1),
             ]
 
-        def _one_step(kc, a0f, b0f, sc, accs, bufs, zero_acc=False):
+        def _one_step(kc, a0f, b0f, b1f_in, sc, accs, bufs, zero_acc=False):
             # bufs = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
             ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
             # DEPTH-3 scale + VGPR carry: ``sc`` = scale[kc] ALREADY in VGPR (read in
@@ -1034,10 +1047,10 @@ def compile_fp4_gemm_4w(
             c00f, c01f, c10f, c11f = accs
             kc_i = fx.Int32(kc)
 
-            _b1 = [None] * N_TILES_B
             _a1 = [None] * N_TILES_A
             _a0n = [None] * N_TILES_A
             _b0n = [None] * N_TILES_B
+            _b1n = [None] * N_TILES_B
             # This step prefetches K-step (kc+2) for g2s. a*_off = base + (kc+2)*STEP.
             ak = (kc_i + fx.Int32(2)) * fx.Int32(A_K_STEP)
             bk = (kc_i + fx.Int32(2)) * fx.Int32(B_K_STEP)
@@ -1056,22 +1069,27 @@ def compile_fp4_gemm_4w(
             _gk = _min(kc_i + fx.Int32(3), fx.Int32(K_ITERS - 1))
             _sc_gather = _gather_scale_thunks(_gk, _slot(_gk))
 
+            # b1 is a loop carry (read in the PREVIOUS step's seg 2), exactly like
+            # a0/b0. That is what keeps every s2r read separated from its consumer
+            # by a barrier: with b1 read here in seg 1 and consumed by c01 in the
+            # same segment, the backend had to emit a standalone lgkmcnt wait for
+            # it (20 per hot loop). All four fragments now cross the barrier's
+            # lgkmcnt(0) instead, so those waits disappear.
+            #
+            # Only a1 is still read-and-used inside one segment, but its read sits
+            # in seg 1 and its use in seg 2 -- a barrier apart.
             wait_barrier(_MAIN_VMCNT)
             il = (
-                _riffle(_g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A), _s2r_thunks(b_s2r, bc1, _b1, N_TILES_B, True))
+                _riffle(_g2s_thunks(a_g2s, ac0, a0_off, N_TILES_A), _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False))
                 + _rd_scn[:2]
             )
             c00f = mfma.call(a0f, b0f, c00f, saR0, sbC0, interleave=il, zero_acc=zero_acc)
-            b1f = _b1
 
-            il = (
-                _riffle(_g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A), _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False))
-                + _rd_scn[2:]
-            )
-            c01f = mfma.call(a0f, b1f, c01f, saR0, sbC1, interleave=il, zero_acc=zero_acc)
+            il = _riffle(_g2s_thunks(b_g2s, bc0, b0_off, N_TILES_A), _rd_scn[2:])
+            c01f = mfma.call(a0f, b1f_in, c01f, saR0, sbC1, interleave=il, zero_acc=zero_acc)
             a1f = _a1
 
-            wait_barrier(_MAIN_VMCNT)
+            wait_barrier(_SEG2_VMCNT)
             il = (
                 _riffle(_g2s_thunks(b_g2s, bc1, b1_off, N_TILES_A), _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False))
                 + _sc_gather
@@ -1079,13 +1097,17 @@ def compile_fp4_gemm_4w(
             c10f = mfma.call(a1f, b0f, c10f, saR1, sbC0, interleave=il, zero_acc=zero_acc)
             a0nf = _a0n
 
-            il = _riffle(_g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A), _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B, True))
-            c11f = mfma.call(a1f, b1f, c11f, saR1, sbC1, interleave=il, zero_acc=zero_acc)
+            il = _riffle(
+                _g2s_thunks(a_g2s, ac1, a1_off, N_TILES_A),
+                _s2r_thunks(b_s2r, bn0, _b0n, N_TILES_B, True) + _s2r_thunks(b_s2r, bn1, _b1n, N_TILES_B, True),
+            )
+            c11f = mfma.call(a1f, b1f_in, c11f, saR1, sbC1, interleave=il, zero_acc=zero_acc)
             b0nf = _b0n
+            b1nf = _b1n
 
             sc_next = (_scn[0], _scn[1], _scn[2], _scn[3])
             new_bufs = (an0, an1, ac0, ac1, bn0, bn1, bc0, bc1)  # swap cur<->next
-            return a0nf, b0nf, sc_next, (c00f, c01f, c10f, c11f), new_bufs
+            return a0nf, b0nf, b1nf, sc_next, (c00f, c01f, c10f, c11f), new_bufs
 
         bufs0 = (a_cur0, a_cur1, a_next0, a_next1, b_cur0, b_cur1, b_next0, b_next1)
 
@@ -1124,13 +1146,14 @@ def compile_fp4_gemm_4w(
         # LDS ping-pong identity -- the pointer pairs swap twice, so the loop body
         # still sees ``bufs0``.
         _accs0 = ([None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS)
-        a0f, b0f, sc, accs, _ = _one_step(0, a0_frag, b0_frag, sc0, _accs0, bufs0, zero_acc=True)
-        a0f, b0f, sc, accs, _ = _one_step(1, a0f, b0f, sc, accs, _swap_bufs(bufs0))
+        a0f, b0f, b1f, sc, accs, _ = _one_step(0, a0_frag, b0_frag, b1_frag, sc0, _accs0, bufs0, zero_acc=True)
+        a0f, b0f, b1f, sc, accs, _ = _one_step(1, a0f, b0f, b1f, sc, accs, _swap_bufs(bufs0))
 
-        # Carry = a0/b0 fragments + VGPR scale carry (scale[kc]) + 4 accumulator groups.
+        # Carry = a0/b0/b1 fragments + VGPR scale carry (scale[kc]) + 4 accumulator groups.
         init_state = (
             _flat_frag(a0f)
             + _flat_frag(b0f)
+            + _flat_frag(b1f)
             + _flat_sc(sc)
             + [_R(x) for x in accs[0]]
             + [_R(x) for x in accs[1]]
@@ -1142,6 +1165,8 @@ def compile_fp4_gemm_4w(
             a0f = _unflat_frag(state[off : off + n_a], N_TILES_A)
             off += n_a
             b0f = _unflat_frag(state[off : off + n_b], N_TILES_B)
+            off += n_b
+            b1f = _unflat_frag(state[off : off + n_b], N_TILES_B)
             off += n_b
             sc = _unflat_sc(state[off : off + n_sc])
             off += n_sc
@@ -1160,11 +1185,12 @@ def compile_fp4_gemm_4w(
             # and need not be carried.
             bufs = bufs0
             for u in range_constexpr(UNROLL):
-                a0f, b0f, sc, accs, bufs = _one_step(kk + u, a0f, b0f, sc, accs, bufs)
+                a0f, b0f, b1f, sc, accs, bufs = _one_step(kk + u, a0f, b0f, b1f, sc, accs, bufs)
 
             new_state = (
                 _flat_frag(a0f)
                 + _flat_frag(b0f)
+                + _flat_frag(b1f)
                 + _flat_sc(sc)
                 + [_R(x) for x in accs[0]]
                 + [_R(x) for x in accs[1]]
@@ -1178,6 +1204,8 @@ def compile_fp4_gemm_4w(
         a0_frag = _unflat_frag(state[off : off + n_a], N_TILES_A)
         off += n_a
         b0_frag = _unflat_frag(state[off : off + n_b], N_TILES_B)
+        off += n_b
+        b1_frag = _unflat_frag(state[off : off + n_b], N_TILES_B)
         off += n_b
         # VGPR carry at loop exit = scale[K_ITERS-2] (each iter advances sc by UNROLL).
         sc = _unflat_sc(state[off : off + n_sc])
@@ -1196,26 +1224,29 @@ def compile_fp4_gemm_4w(
         saR0, saR1, sbC0, sbC1 = sc
         _scn = [None, None, None, None]
         _rd_scn = _read_scale_thunks(fx.Int32(K_ITERS - 1), _scn)
-        _b1 = [None] * N_TILES_B
         _a1 = [None] * N_TILES_A
         wait_barrier((2 * N_TILES_A) + (2 * N_TILES_B))
-        il = (
-            _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True)
-            + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
-            + _rd_scn
-        )
+        il = _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False) + _rd_scn
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
-        b1_frag = _b1
         a1_frag = _a1
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
         _a0n = [None] * N_TILES_A
         _b0n = [None] * N_TILES_B
-        wait_barrier((1 * N_TILES_A) + (1 * N_TILES_B))
-        il = _s2r_thunks(a_s2r, a_next0, _a0n, N_TILES_A, False) + _s2r_thunks(b_s2r, b_next0, _b0n, N_TILES_B, True)
+        _b1n = [None] * N_TILES_B
+        # One g2s batch of slack: b_next1 was issued by the last loop step's call3,
+        # so only call4's a_cur1 batch may still be in flight (was 2 batches when
+        # b1 was not read here).
+        wait_barrier(1 * N_TILES_A)
+        il = (
+            _s2r_thunks(a_s2r, a_next0, _a0n, N_TILES_A, False)
+            + _s2r_thunks(b_s2r, b_next0, _b0n, N_TILES_B, True)
+            + _s2r_thunks(b_s2r, b_next1, _b1n, N_TILES_B, True)
+        )
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0, interleave=il)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1)
         a0_frag = _a0n
         b0_frag = _b0n
+        b1_frag = _b1n
 
         a_cur0, a_next0 = a_next0, a_cur0
         a_cur1, a_next1 = a_next1, a_cur1
@@ -1223,13 +1254,11 @@ def compile_fp4_gemm_4w(
         b_cur1, b_next1 = b_next1, b_cur1
 
         # Tail step K_ITERS - 1: scale[K_ITERS-1] read into the carry above.
-        _b1 = [None] * N_TILES_B
         _a1 = [None] * N_TILES_A
         wait_barrier(0)
         saR0, saR1, sbC0, sbC1 = (_scn[0], _scn[1], _scn[2], _scn[3])
-        il = _s2r_thunks(b_s2r, b_cur1, _b1, N_TILES_B, True) + _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
+        il = _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
-        b1_frag = _b1
         a1_frag = _a1
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0)
