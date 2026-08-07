@@ -245,7 +245,6 @@ class G2SLoaderAsm:
         self.gl_offsets = gl_offsets
         self.n_load_steps = n_load_steps
         self.wave_id = wave_id
-        self.n_waves = fx.block_dim.x // 64
         # When `scopes` is given, emit the real rocdl.raw.ptr.buffer.load.lds
         # intrinsic tagged with per-buffer alias scopes instead of opaque inline
         # asm: the compiler then sees the LDS write, but the scopes prove it does
@@ -477,7 +476,15 @@ def _xcd_swizzle(num_pid_m, num_pid_n):
     num_wgid_in_group = WGM * num_pid_n
     group_id, intra_group = divmod(wgid_remap, num_wgid_in_group)
     first_pid_m = group_id * WGM
-    group_size_m = _min(num_pid_m - first_pid_m, WGM)
+    if const_expr(isinstance(num_pid_m, int) and num_pid_m % WGM == 0):
+        # group_id < num_pid_m/WGM, so first_pid_m <= num_pid_m - WGM and the min is
+        # always WGM. Worth special-casing: a variable group_size_m makes the divmod
+        # below a RUNTIME divide, and gfx950 has no scalar divider -- it becomes a
+        # ~45-instruction v_rcp_iflag_f32 Newton sequence sitting in front of every
+        # address, hence in front of the first buffer_load.
+        group_size_m = WGM
+    else:
+        group_size_m = _min(num_pid_m - first_pid_m, WGM)
     pid_n, intra_group_m = divmod(intra_group, group_size_m)
     pid_m = first_pid_m + intra_group_m
 
@@ -997,8 +1004,8 @@ def compile_fp4_gemm_4w(
         # Accumulators: 2x2 64x64 quadrants per wave. They are NOT zero-initialized --
         # K-step 0 runs with ``zero_acc`` so its ksub-0 MFMAs write C = A*B directly.
 
-        gl_off_a = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=False)
-        gl_off_b = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=True)
+        gl_off_a = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, False, _N_WAVES)
+        gl_off_b = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, True, _N_WAVES)
 
         # g2s (see G2SLoaderAsm): needs the raw buffer resource. Build it
         # once from the i8 buffer tensor (max_size OOB check; all addresses in-bounds).

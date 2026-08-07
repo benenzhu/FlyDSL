@@ -47,9 +47,17 @@ def swizzle_128(row, col):
     return swizzled_offset // 128, swizzled_offset % 128
 
 
-def compute_global_swizzle(lane_id, wave_id, K, n_rounds__4, preshuffled):
+def compute_global_swizzle(lane_id, wave_id, K, n_rounds__4, preshuffled, n_waves=None):
+    """``n_waves`` defaults to the runtime ``block_dim.x // 64``.
+
+    Pass it as a Python int when the block size is fixed: the runtime read is a
+    kernarg ``s_load`` of hidden_group_size_x, and because it lands after the
+    other kernarg loads it costs a SECOND ``s_waitcnt lgkmcnt(0)`` that every
+    g2s address VGPR then waits behind.
+    """
     offsets = []
-    n_waves = fx.block_dim.x // 64
+    if n_waves is None:
+        n_waves = fx.block_dim.x // 64
     for round in range_constexpr(n_rounds__4):
         if const_expr(preshuffled):
             row = lane_id % 8 + wave_id * 8 + round * (n_waves * 8)
