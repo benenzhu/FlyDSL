@@ -633,14 +633,11 @@ class Mfma16x16x128Fp4:
         return _llvm.inline_asm(self.res_ty, ops, asm, cons, has_side_effects=True)
 
 
-# Scale-LDS geometry. Each wave needs 4 scale blocks (256 B each) per operand:
-# blocks {R0g0, R0g1, R1g0, R1g1} for A, {C0g0, C0g1, C1g0, C1g1} for B. One
-# ``buffer_load_dwordx4 ... lds`` (64 lanes x 16 B = 1024 B/wave) gathers all 4
-# blocks of one operand. A region (1024 B) + B region (1024 B) = 2048 B/wave;
-# x4 waves = 8192 B per pipeline slot. Slots are indexed kstep%_SCALE_SLOTS.
-# With depth-2 prefetch AND an unroll-by-2 main loop, up to 4 K-steps are live at
-# once (read[kk], read[kk+1], gather[kk+2], gather[kk+3]), so 4 slots are needed
-# to avoid one being overwritten before its read (3 slots -> nan). 4*8192 = 32 KB.
+# Scale-LDS geometry. 4 blocks (256 B) per operand per wave = one
+# buffer_load_dwordx4...lds (64 lanes x 16 B); A + B = 2048 B/wave, x4 waves =
+# 8192 B per slot. Slots are indexed kstep%_SCALE_SLOTS. 4 K-steps are live at
+# once (carry[kc], read[kc+1], gather[kc+2], gather[kc+3]), so 4 slots are
+# needed or a slot is overwritten before its read (3 -> nan). 4*8192 = 32 KB.
 _SCALE_WAVE_BYTES = 2048
 _SCALE_SLOT_BYTES = _N_WAVES * _SCALE_WAVE_BYTES  # 8192
 _SCALE_SLOTS = 4
@@ -650,19 +647,15 @@ _SCALE_B_REGION = 1024
 
 
 class ScaleLoaderLDS:
-    """Loads ``shuffle_scale_w4``-PRESHUFFLED per-1x32 E8M0 scales via a single
-    ``buffer_load_dwordx4 ... lds`` per operand per K-step, into a scale LDS
-    region, then per-lane ``ds_read_b32`` -- replacing the 8 per-step
-    ``buffer_load_dword`` (each with a dur-6 voffset v_add, the #1 exposed
-    hot-loop cost).
+    """``shuffle_scale_w4``-PRESHUFFLED per-1x32 E8M0 scales: one
+    ``buffer_load_dwordx4 ... lds`` per operand per K-step into scale LDS, then
+    per-lane ``ds_read_b32``. (Replaced 8 per-step ``buffer_load_dword``, each
+    with a dur-6 voffset v_add -- the #1 exposed hot-loop cost.)
 
     Layout (gate_up=False): per (N1 group, K-step) the e8m0 form a 64-i32
     (256 B) block ``[K_Lane(4), N_Lane(16)]`` in which lane L's MFMA scale is
     element L. A wave's 4 blocks are groups ``{G, G+1, G+4, G+5}`` (G+4 == the
-    second M/N half's group, since LDS_BLOCK/32 == 4). The dwordx4 gather has
-    lane g fetch 4 contiguous i32 ``(g%16)*4..+3`` of block ``g//16`` and write
-    them to ``m0 + g*16``; that lands i32 j of block blk at LDS byte
-    ``blk*256 + j*4`` (natural order), so the read is ``region + blk*256 + L*4``.
+    second M/N half's group, since LDS_BLOCK/32 == 4).
     """
 
     def __init__(self, scale_arg, n_tiles, K, lane_id, wave_id, lds_base_ptr, region_off, scopes=None, slot_id=None):
@@ -673,9 +666,6 @@ class ScaleLoaderLDS:
         self.lane_id = lane_id
         self.wave_id = wave_id
         self.region_off = region_off
-        # The scale LDS is a separate allocation from the 8 A/B tile buffers, but
-        # the DMA-intrinsic g2s makes those writes visible -- so without a scope
-        # here every scale ds_read gets a conservative `s_waitcnt vmcnt(0)`.
         self.scopes = scopes
         self.slot_id = slot_id
         self.rsrc = arith._to_raw(_buffer_ops.create_buffer_resource(scale_arg, max_size=True))
@@ -692,24 +682,21 @@ class ScaleLoaderLDS:
         )
 
     def set_wave_base(self):
-        """Precompute the wave-uniform LDS base (lds_base + wave_id*2048 + region)
-        into an SGPR ONCE via a single readfirstlane. gather() then computes m0 =
-        wave_base_s + slot*8192 with scalar arithmetic, so the "s" constraint on m0
-        needs NO per-gather readfirstlane (was 4/iter: one per A/B gather per step)."""
+        """Readfirstlane the wave-uniform LDS base into an SGPR ONCE, so gather()'s
+        m0 = wave_base_s + slot*8192 is pure scalar arithmetic and the "s" operand
+        needs no per-gather readfirstlane (was 4/iter)."""
         wave_base = self._lds_base + fx.Int32(self.wave_id * _SCALE_WAVE_BYTES + self.region_off)
         self._wave_base_s = _rocdl.readfirstlane(_T.i32, arith._to_raw(wave_base))
         # soffset=0 as a wave-uniform SGPR (readfirstlane'd once, reused every gather).
         self._soff0 = _uniform_i32(fx.Int32(0))
 
     def gather(self, kstep, slot, base_tile):
-        """Issue ONE buffer_load_dwordx4...lds gathering all 4 blocks of this
-        operand into scale-LDS ``slot``. ``base_tile`` = the M/N-half-0 base row
-        (half 1 is reached via group +4). Alias-scoped DMA intrinsic (or inline asm
-        on the fallback path) so LLVM emits no LDS-write drain; vmcnt accounting is
-        owned by wait_barrier (hardware counts it)."""
-        # LDS write (layout A): lane L writes its 16 B to m0 + L*16. So lane L must
-        # READ from global the data destined for LDS slot L*16 = block (L//16),
-        # i32 chunk (L%16)*4..+3. block g//16 -> group G + (blk//2)*4 + (blk%2).
+        """ONE buffer_load_dwordx4...lds gathering all 4 blocks of this operand
+        into scale-LDS ``slot``. ``base_tile`` = the M/N-half-0 base row (half 1
+        is group +4). vmcnt accounting is owned by wait_barrier."""
+        # The LDS side is not addressable: lane L's 16 B always lands at m0 + L*16.
+        # So lane L must READ the global data destined for there: block (L//16),
+        # i32 chunk (L%16)*4..+3. block blk -> group G + (blk//2)*4 + (blk%2).
         G = fx.Int32(base_tile // 32)
         grp = G + (self._blk // 2) * fx.Int32(4) + (self._blk % 2)
         i32_off = grp * fx.Int32(self.row_i32) + fx.Int32(kstep) * fx.Int32(64) + self._in16 * fx.Int32(4)
@@ -730,9 +717,8 @@ class ScaleLoaderLDS:
         """Per-lane ds_read of ONE half (2 blocks) -> list[n_groups] of i32.
         Split from read() so half-1 can be issued as a thunk in an MFMA shadow
         (half-0 feeds c00/c01, half-1 feeds c10/c11 -- two MFMA clusters later)."""
-        # lane-contiguous write: lane g's 4 i32 at m0 + g*16. block-elem e of block
-        # blk was written by lane (blk*16 + e//4) as its (e%4)-th i32 -> LDS byte
-        # blk*256 + (e//4)*16 + (e%4)*4. MFMA lane L wants block-elem L.
+        # Inverse of gather's m0 + L*16 write: block-elem e of block blk sits at
+        # LDS byte blk*256 + (e//4)*16 + (e%4)*4. MFMA lane L wants elem L.
         L = self.lane_id
         base = self._slot_wave_byte(slot) + fx.Int32((L // 4) * 16 + (L % 4) * 4)
         grp_list = []
@@ -808,18 +794,15 @@ def compile_fp4_gemm_4w(
     K: int,
     use_xcd_remap: bool = True,
 ):
-    BLOCK_K = 256  # fp4 elements
-    BLOCK_K_BYTES = BLOCK_K // 2  # 128 bytes / row
+    BLOCK_K = 256
+    BLOCK_K_BYTES = BLOCK_K // 2
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
 
     assert K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K
-    # scf.for body length in K-steps. Steps 0/1 are peeled (see zero_acc) and the
-    # last 2 are the tail, so the loop covers K_ITERS-4 steps. 4 measured fastest:
-    # 2 -> 16KB .text, 4 -> 20KB (+0.7..1.6%), full unroll -> 111KB and -3% (blows
-    # the 32KB I-cache). Must be even -- see the ping-pong note at the loop.
+    # not fully unroll, cause full unroll -> 111KB > 32KB I-cache.
     UNROLL = 4 if (K_ITERS - 4) % 4 == 0 else 2
     assert (K_ITERS - 4) % UNROLL == 0, K_ITERS
     N_ACCUMS = N_TILES_A * N_TILES_B
@@ -830,18 +813,10 @@ def compile_fp4_gemm_4w(
     a_lds_size = LDS_BLOCK_M * BLOCK_K_BYTES
     b_lds_size = LDS_BLOCK_N * BLOCK_K_BYTES
 
-    # One contiguous LDS array (single static `make_ptr` -> single `@__shared_alloc`
-    # symbol), NOT 8 independent leaf fields. With one base symbol every cross-buffer
-    # offset is a compile-time constant against the same pointer, so the compiler
-    # folds it into the 16-bit ds_read offset: field instead of materializing ~24
-    # per-(buffer,tile) address VGPRs (252 -> ~228 arch VGPR). The catch: a single
-    # LDS symbol breaks the compiler's alias analysis between the g2s global->LDS DMA
-    # writes and the ds_reads, so it would insert a spurious `s_waitcnt vmcnt(0)`
-    # before every ds_read -- see G2SLoaderAsm for how that is avoided (per-buffer
-    # alias scopes by default, opaque inline asm on the fallback path).
+    # One contiguous LDS array will save ~24 address VGPRs.
     assert a_lds_size == b_lds_size
     assert a_lds_size == _LDS_BUF_BYTES
-    _lds_buf = a_lds_size  # 16KB; 8 buffers laid out contiguously # 128KB
+    _lds_buf = a_lds_size
 
     @fx.struct
     class SharedStorage:
@@ -853,7 +828,6 @@ def compile_fp4_gemm_4w(
         A: fx.Tensor, B_T: fx.Tensor, C: fx.Tensor, A_scale: fx.Tensor, B_scale: fx.Tensor, c_m: fx.Int32, c_n: fx.Int32
     ):
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        # 8 buffers as compile-time offsets off ONE base pointer (single symbol).
         _base_ptr = lds.all_lds.ptr
 
         def _buf(idx):
@@ -880,7 +854,6 @@ def compile_fp4_gemm_4w(
         wave_i = wave_id // 2
         wave_j = wave_id % 2
 
-        # Global byte offsets (fp4 packed: K bytes = K // 2).
         K_BYTES = K // 2
         A0_gl_offset = (tile_i * BLOCK_M) * K_BYTES
         A1_gl_offset = (tile_i * BLOCK_M + LDS_BLOCK_M) * K_BYTES
