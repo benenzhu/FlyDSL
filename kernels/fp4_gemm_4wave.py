@@ -25,6 +25,8 @@ A: row-major fp4 (uint8, 2 fp4/byte). B: ``shuffle_weight_w4(b_q, 16)``.
 Scales: ``shuffle_scale_w4(scale, 1, False)``.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
@@ -74,9 +76,19 @@ def _lds_ptr_t():
     return _ir.Type.parse("!llvm.ptr<3>")
 
 
-def _asm_void(operands, asm_string, constraints):
+def _asm_void(operands, asm_string, constraints, clobbers=""):
     """Side-effecting void inline asm (LLVM sees no memory op -> no waitcnt added)."""
+    if clobbers:
+        constraints = f"{constraints},{clobbers}"
     _llvm.inline_asm(None, operands, asm_string, constraints, has_side_effects=True)
+
+
+# The scale gather's inline asm writes m0. On the inline-asm g2s path nothing
+# else touches m0 so the omission was harmless, but the DMA-intrinsic path has
+# the BACKEND materializing m0 for each buffer_load...lds, and it will happily
+# hoist those s_mov_b32 m0 above the gather -- which then stomps m0 and sends
+# the DMA to the wrong LDS address. Declare the clobber.
+_M0_CLOBBER = "~{m0}"
 
 
 def _enc_waitcnt_gfx9(vm, lgkm=15, exp=7):
@@ -98,6 +110,56 @@ def wait_barrier(count):
     """
     _rocdl.s_waitcnt(_enc_waitcnt_gfx9(count))
     _rocdl.s_barrier()
+
+
+# Emit g2s as the real rocdl.raw.ptr.buffer.load.lds intrinsic + LLVM alias scopes
+# instead of opaque inline asm. Works and is correct, but measured 0.6% SLOWER at
+# 16384^3 (5185/5211/5205 -> 5160/5173/5177, 3 alternating pairs), so: default OFF.
+#
+# Why it loses, and why it is not fixable from here: gfx9 `buffer_load ... lds` has
+# no LDS-address field -- the destination can ONLY come from m0. Hand-written asm
+# sets m0 once per load group and advances it with s_add_u32; the intrinsic hands
+# m0 to the backend, which materializes one s_mov_b32 m0 per load unconditionally
+# (hot-loop s_mov_b32 24 -> 74, 919 -> 929 instrs). The scheduling freedom won by
+# dropping the ASMSTART/ASMEND walls does not pay for that.
+#
+# Kept because the alias scopes themselves work perfectly (zero vmcnt(0) in the hot
+# loop -- see _lds_scopes) and because it is the reference for anyone who tries this
+# again. See also _M0_CLOBBER: this path is what exposed that latent bug.
+_USE_DMA_INTRINSIC = os.environ.get("FP4_DMA_INTRINSIC", "0") == "1"
+_LDS_BUF_BYTES = 16384  # one of the 8 A/B tile buffers; asserted against a_lds_size
+_LDS_DOMAIN = '#llvm.alias_scope_domain<id = "fp4_gemm_4wave.lds">'
+# One scope per disjoint LDS region: the 8 A/B tile buffers, then the two scale
+# gather regions (separate allocation entirely).
+_LDS_SCOPE_NAMES = [f"buf.{i}" for i in range(8)] + ["Asc", "Bsc"]
+_SC_ASC = 8
+_SC_BSC = 9
+
+
+def _lds_scopes():
+    """One ``#llvm.alias_scope`` per disjoint LDS region, in a shared domain.
+
+    si-insert-waitcnts asks, for every LDS access, whether it may alias any
+    outstanding LDS DMA. With alias info it checks them one at a time and waits
+    only on the overlapping ones; without it, it conservatively waits on all of
+    them, which for this loop means a full ``s_waitcnt vmcnt(0)`` immediately
+    ahead of every ds_read. Our 8 buffers ping-pong so a ds_read never overlaps
+    an in-flight DMA -- but every address is ptrtoint arithmetic off ONE 128 KB
+    addrspace(3) symbol, which the backend cannot see through.
+    """
+    return [
+        _ir.Attribute.parse(f'#llvm.alias_scope<id = "fp4_gemm_4wave.{n}", domain = {_LDS_DOMAIN}>')
+        for n in _LDS_SCOPE_NAMES
+    ]
+
+
+def _tag_alias(op, scopes, slot):
+    """Mark ``op`` as touching only LDS region ``slot``, and no other."""
+    if os.environ.get("FP4_NO_ALIAS"):
+        return
+    op = getattr(op, "owner", op)
+    op.attributes["alias_scopes"] = _ir.ArrayAttr.get([scopes[slot]])
+    op.attributes["noalias_scopes"] = _ir.ArrayAttr.get([sc for i, sc in enumerate(scopes) if i != slot])
 
 
 def _uniform_i32(value):
@@ -128,12 +190,19 @@ class G2SLoaderAsm:
     the K-step offset is the scalar soffset operand (hardware-free add).
     """
 
-    def __init__(self, rsrc, gl_offsets, n_load_steps, wave_id):
+    def __init__(self, rsrc, gl_offsets, n_load_steps, wave_id, scopes=None, base_ptr=None):
         self.rsrc = arith._to_raw(rsrc)
         self.gl_offsets = gl_offsets
         self.n_load_steps = n_load_steps
         self.wave_id = wave_id
         self.n_waves = fx.block_dim.x // 64
+        # When `scopes` is given, emit the real rocdl.raw.ptr.buffer.load.lds
+        # intrinsic tagged with per-buffer alias scopes instead of opaque inline
+        # asm: the compiler then sees the LDS write, but the scopes prove it does
+        # not alias the ds_reads, so it still emits no drain -- while gaining the
+        # freedom to schedule the loads (inline asm is an immovable barrier).
+        self.scopes = scopes
+        self.base_ptr = base_ptr
 
     @property
     def _step_stride(self):
@@ -175,6 +244,19 @@ class G2SLoaderAsm:
         voff = self._voffset(step)
         soff = _uniform_i32(k_offset)  # scalar soffset (K-step), folded by hardware
         stride = self._step_stride
+        if self.scopes is not None:
+            # Intrinsic form: the LDS destination is an explicit addrspace(3) pointer
+            # (no m0 juggling -- the backend materializes m0 itself), and the alias
+            # scope tells si-insert-waitcnts this DMA touches only buffer `slot`.
+            slot = lds_dst.byte_off // _LDS_BUF_BYTES
+            # Build off the ONE readfirstlane'd wave base (set_wave_base) rather than
+            # ptrtoint(base)+wave_id*1024: wave_id is a VGPR, so the latter makes the
+            # backend emit a v_readfirstlane per load to get m0 into an SGPR.
+            addr = fx.Int64(fx.Int32(self._wave_base_s) + fx.Int32(lds_dst.byte_off + step * stride))
+            lds_ptr = _llvm.inttoptr(_lds_ptr_t(), arith._to_raw(addr))
+            dma = _rocdl.raw_ptr_buffer_load_lds(self.rsrc, lds_ptr, fx.Int32(16), voff, soff, fx.Int32(0), fx.Int32(0))
+            _tag_alias(dma, self.scopes, slot)
+            return
         if step == 0:
             m0 = self._lds_base_sgpr(lds_dst)
             asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
@@ -200,10 +282,14 @@ class S2RLoaderFp4:
     fragments and pushed arch VGPR to 256 (full) -> scale spilled. Each tile's
     value is [i32x4_ksub0, i32x4_ksub1]."""
 
-    def __init__(self, wave_idx, n_tiles):
+    def __init__(self, wave_idx, n_tiles, scopes=None):
         self.lane_id = fx.thread_idx.x % 64
         self.wave_idx = wave_idx
         self.n_tiles = n_tiles
+        # Tag each ds_read with the buffer it reads (see _lds_scopes). Only needed
+        # when g2s emits the real DMA intrinsic; with inline-asm g2s the write is
+        # invisible and there is nothing to disambiguate against.
+        self.scopes = scopes
 
     def _vec_load_16xf8(self, lds_src, dyn_offset, const_offset):
         # Plain LLVM ds_read (NOT inline-asm). The single-symbol LDS layout would
@@ -233,7 +319,10 @@ class S2RLoaderFp4:
         if imm != 0:
             lds_ptr = _gep(lds_ptr, static_byte_offset=imm)
         vec4_i32 = _ir.VectorType.get([4], fx.Int32.ir_type)
-        raw = _llvm.LoadOp(vec4_i32, lds_ptr, alignment=16).result
+        load = _llvm.LoadOp(vec4_i32, lds_ptr, alignment=16)
+        if self.scopes is not None:
+            _tag_alias(load, self.scopes, lds_src.byte_off // _LDS_BUF_BYTES)
+        raw = load.result
         return Vec(raw)
 
     def _dyn_offset(self, step, preshuffled):
@@ -546,7 +635,7 @@ class ScaleLoaderLDS:
     ``blk*256 + j*4`` (natural order), so the read is ``region + blk*256 + L*4``.
     """
 
-    def __init__(self, scale_arg, n_tiles, K, lane_id, wave_id, lds_base_ptr, region_off):
+    def __init__(self, scale_arg, n_tiles, K, lane_id, wave_id, lds_base_ptr, region_off, scopes=None, slot_id=None):
         assert n_tiles % _FP4_PACK == 0
         self.n_groups = n_tiles // _FP4_PACK  # pack-groups per M/N half (=2)
         self.K1 = K // 256
@@ -554,6 +643,11 @@ class ScaleLoaderLDS:
         self.lane_id = lane_id
         self.wave_id = wave_id
         self.region_off = region_off
+        # The scale LDS is a separate allocation from the 8 A/B tile buffers, but
+        # the DMA-intrinsic g2s makes those writes visible -- so without a scope
+        # here every scale ds_read gets a conservative `s_waitcnt vmcnt(0)`.
+        self.scopes = scopes
+        self.slot_id = slot_id
         self.rsrc = arith._to_raw(_buffer_ops.create_buffer_resource(scale_arg, max_size=True))
         # Gather per-lane block / within-block index (loop-invariant).
         self._blk = lane_id // 16  # 0..3 -> which of the 4 blocks
@@ -592,7 +686,7 @@ class ScaleLoaderLDS:
         # m0 = precomputed wave base (SGPR) + slot*8192 (scalar): no readfirstlane.
         m0 = arith._to_raw(fx.Int32(self._wave_base_s) + fx.Int32(slot) * fx.Int32(_SCALE_SLOT_BYTES))
         asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
-        _asm_void([m0, voff, self.rsrc, self._soff0], asm, "s,v,s,s")
+        _asm_void([m0, voff, self.rsrc, self._soff0], asm, "s,v,s,s", _M0_CLOBBER)
 
     def read_half(self, slot, half):
         """Per-lane ds_read of ONE half (2 blocks) -> list[n_groups] of i32.
@@ -608,8 +702,10 @@ class ScaleLoaderLDS:
             blk = half * 2 + gi
             vaddr = base + fx.Int32(blk * 256)
             lds_ptr = _llvm.inttoptr(_lds_ptr_t(), arith._to_raw(vaddr))
-            raw = _llvm.LoadOp(fx.Int32.ir_type, lds_ptr, alignment=4).result
-            grp_list.append(fx.Int32(raw))
+            load = _llvm.LoadOp(fx.Int32.ir_type, lds_ptr, alignment=4)
+            if self.scopes is not None:
+                _tag_alias(load, self.scopes, self.slot_id)
+            grp_list.append(fx.Int32(load.result))
         return grp_list
 
     def read(self, slot):
@@ -822,6 +918,7 @@ def compile_fp4_gemm_4w(
     # before every ds_read -- which is why g2s uses inline-asm buffer_load (see
     # G2SLoaderAsm) so LLVM sees no LDS write and emits no drain.
     assert a_lds_size == b_lds_size
+    assert a_lds_size == _LDS_BUF_BYTES
     _lds_buf = a_lds_size  # 16KB; 8 buffers laid out contiguously # 128KB
 
     @fx.struct
@@ -874,8 +971,13 @@ def compile_fp4_gemm_4w(
         mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B, swap_operands=swap_operands, tile_2x2=tile_2x2)
 
         _scale_base_ptr = lds.scale_lds.ptr
-        a_scale_ld = ScaleLoaderLDS(A_scale, N_TILES_A, K, lane_id, wave_id, _scale_base_ptr, _SCALE_A_REGION)
-        b_scale_ld = ScaleLoaderLDS(B_scale, N_TILES_B, K, lane_id, wave_id, _scale_base_ptr, _SCALE_B_REGION)
+        _sc = _lds_scopes() if _USE_DMA_INTRINSIC else None
+        a_scale_ld = ScaleLoaderLDS(
+            A_scale, N_TILES_A, K, lane_id, wave_id, _scale_base_ptr, _SCALE_A_REGION, _sc, _SC_ASC
+        )
+        b_scale_ld = ScaleLoaderLDS(
+            B_scale, N_TILES_B, K, lane_id, wave_id, _scale_base_ptr, _SCALE_B_REGION, _sc, _SC_BSC
+        )
         a_scale_ld.set_wave_base()
         b_scale_ld.set_wave_base()
 
@@ -915,14 +1017,14 @@ def compile_fp4_gemm_4w(
         # once from the i8 buffer tensor (max_size OOB check; all addresses in-bounds).
         a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=True)  # why max size here...
         b_rsrc = _buffer_ops.create_buffer_resource(B_T, max_size=True)  # why???
-        a_g2s = G2SLoaderAsm(a_rsrc, gl_off_a, N_TILES_A, wave_id)
-        b_g2s = G2SLoaderAsm(b_rsrc, gl_off_b, N_TILES_B, wave_id)
+        a_g2s = G2SLoaderAsm(a_rsrc, gl_off_a, N_TILES_A, wave_id, scopes=_sc, base_ptr=_base_ptr)
+        b_g2s = G2SLoaderAsm(b_rsrc, gl_off_b, N_TILES_B, wave_id, scopes=_sc, base_ptr=_base_ptr)
         # Precompute the g2s wave-uniform LDS base into SGPR once (all 8 buffers share
         # _base_ptr; per-buffer byte_off is compile-time) -> no per-load readfirstlane.
         a_g2s.set_wave_base(_base_ptr)
         b_g2s.set_wave_base(_base_ptr)
-        a_s2r = S2RLoaderFp4(wave_i, N_TILES_A)
-        b_s2r = S2RLoaderFp4(wave_j, N_TILES_B)
+        a_s2r = S2RLoaderFp4(wave_i, N_TILES_A, scopes=_sc)
+        b_s2r = S2RLoaderFp4(wave_j, N_TILES_B, scopes=_sc)
         store_c = StoreCFp4(
             C,
             c_m,
