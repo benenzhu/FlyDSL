@@ -136,30 +136,27 @@ def wait_barrier(count):
     _rocdl.s_barrier()
 
 
-# Emit g2s AND the scale gather as the real rocdl.raw.ptr.buffer.load.lds intrinsic
-# + LLVM alias scopes instead of opaque inline asm. DEFAULT ON: with this the hot
-# loop contains no inline asm at all except the MFMAs. Set FP4_DMA_INTRINSIC=0 to
-# get the old all-inline-asm g2s back for A/B.
+# Emit g2s AND the scale gather as inline asm rather than the real
+# rocdl.raw.ptr.buffer.load.lds intrinsic. DEFAULT ON; FP4_DMA_INTRINSIC=1 gets
+# the intrinsic + LLVM-alias-scope path back.
 #
-# This costs 0.65% at 16384^3 (5186/5188/5199 -> 5152/5155/5167, 3 alternating
-# pairs) and is taken deliberately: long-lived inline asm is the wrong foundation
-# to keep building on. It is opaque to the scheduler, it hides real dependencies
-# (a missing m0 clobber in the scale gather silently corrupted every DMA the
-# moment the backend started managing m0 -- see _M0_CLOBBER), and every future
-# change has to reason around it by hand.
-#
-# Where the 0.65% goes, and why it is not fixable from the DSL: gfx9
-# `buffer_load ... lds` has no LDS-address field -- the destination can ONLY come
-# from m0. Hand-written asm sets m0 once per load group and advances it with
+# gfx9 `buffer_load ... lds` has no LDS-address field -- the destination can ONLY
+# come from m0. The asm sets m0 once per load group and advances it with
 # s_add_u32; the intrinsic hands m0 to the backend, which materializes one
-# s_mov_b32 m0 per load unconditionally (hot-loop s_mov_b32 24 -> 76, 919 -> 931
-# instrs). The scheduling freedom won by dropping the ASMSTART/ASMEND walls does
-# not pay for that. Closing it needs the backend to amortize m0 across loads.
+# s_mov_b32 m0 per load unconditionally. Hot loop: s_mov_b32 20 vs 68 (49
+# s_add_u32 replacing them), 911 vs 915 instrs. Measured +0.9% at 16384^3
+# (5475/5484/5470 vs 5432/5415/5427, 3 alternating pairs).
 #
-# The alias scopes are what make this viable at all: without them LLVM cannot
-# prove the DMA misses the ds_reads and drops a `s_waitcnt vmcnt(0)` in front of
-# every one. With them the hot loop has zero vmcnt(0). See _lds_scopes.
-_USE_DMA_INTRINSIC = os.environ.get("FP4_DMA_INTRINSIC", "1") == "1"
+# The intrinsic path was the default for a while, deliberately eating that cost:
+# inline asm is opaque to the scheduler and hides real dependencies (a missing m0
+# clobber in the scale gather silently corrupted every DMA once the backend
+# started managing m0 -- see _M0_CLOBBER). Reverted because ~1% is too much to
+# pay for it here. Closing the gap needs the backend to amortize m0 across loads.
+#
+# What the intrinsic path needs to stay viable, if it is ever revived: the alias
+# scopes. Without them LLVM cannot prove the DMA misses the ds_reads and drops a
+# `s_waitcnt vmcnt(0)` in front of every one. See _lds_scopes.
+_USE_DMA_INTRINSIC = os.environ.get("FP4_DMA_INTRINSIC", "0") == "1"
 _LDS_BUF_BYTES = 16384  # one of the 8 A/B tile buffers; asserted against a_lds_size
 _LDS_DOMAIN = '#llvm.alias_scope_domain<id = "fp4_gemm_4wave.lds">'
 # One scope per disjoint LDS region: the 8 A/B tile buffers, then the two scale
