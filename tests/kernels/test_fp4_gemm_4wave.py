@@ -51,9 +51,11 @@ def _as_u8(t: torch.Tensor) -> torch.Tensor:
     return t if t.dtype in (torch.uint8, torch.int8) else t.view(torch.uint8)
 
 
-def _bench_fp4_gemm(M, N, K, tile_m=256, tile_n=256, num_warmups=10, num_iters=100):
+def _bench_fp4_gemm(M, N, K, num_warmups=10, num_iters=100):
     if ARCH != "gfx950":
         pytest.skip(f"FP4 4-wave GEMM requires gfx950, got {ARCH}")
+    # The kernel is hardcoded to a 256x256 block and an all-in-bounds epilogue.
+    assert M % 256 == 0 and N % 256 == 0, "kernel requires M/N aligned to 256"
 
     device = torch.device("cuda")
     M_a = (M + 31) // 32 * 32
@@ -80,10 +82,8 @@ def _bench_fp4_gemm(M, N, K, tile_m=256, tile_n=256, num_warmups=10, num_iters=1
 
     c_out = torch.zeros((M, N), dtype=OUT_DTYPE, device=device)
 
-    launch_fn = compile_fp4_gemm_4w(
-        K=K, BLOCK_M=tile_m, BLOCK_N=tile_n, mn_aligned=(M % tile_m == 0 and N % tile_n == 0)
-    )
-    print(f"\n[fp4_gemm_4wave] M={M} N={N} K={K} BLOCK_M={tile_m} BLOCK_N={tile_n}")
+    launch_fn = compile_fp4_gemm_4w(K=K)
+    print(f"\n[fp4_gemm_4wave] M={M} N={N} K={K}")
 
     def _args(c, a, b, sa, sb):
         # kernel signature: (A, B_T, C, A_scale, B_scale, c_m, c_n, stream)
@@ -129,14 +129,14 @@ def _bench_fp4_gemm(M, N, K, tile_m=256, tile_n=256, num_warmups=10, num_iters=1
 
 
 @pytest.mark.parametrize(
-    "M, N, K, tile_m, tile_n",
+    "M, N, K",
     [
-        pytest.param(8192, 8192, 8192, 256, 256, marks=pytest.mark.large_shape, id="8192x8192x8192"),
-        pytest.param(16384, 16384, 16384, 256, 256, marks=pytest.mark.large_shape, id="16384x16384x16384"),
+        pytest.param(8192, 8192, 8192, marks=pytest.mark.large_shape, id="8192x8192x8192"),
+        pytest.param(16384, 16384, 16384, marks=pytest.mark.large_shape, id="16384x16384x16384"),
     ],
 )
-def test_fp4_gemm_4wave(M, N, K, tile_m, tile_n):
-    _bench_fp4_gemm(M=M, N=N, K=K, tile_m=tile_m, tile_n=tile_n)
+def test_fp4_gemm_4wave(M, N, K):
+    _bench_fp4_gemm(M=M, N=N, K=K)
 
 
 if __name__ == "__main__":

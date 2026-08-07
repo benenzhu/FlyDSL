@@ -45,6 +45,10 @@ from kernels.fp8_gemm_utils import (
 )
 
 _N_WAVES = 4  # block is always 256 threads -> 4 waves (compile-time constant)
+BLOCK_M = 256
+BLOCK_N = 256
+N_TILES_A = 256 // 4 // 16
+N_TILES_B = 256 // 4 // 16
 
 
 class _Buf:
@@ -498,21 +502,13 @@ class Mfma16x16x128Fp4:
     ``k_sub * pack + tile_in_pair`` where tile_in_pair = i % pack / j % pack.
     """
 
-    def __init__(self, n_tiles_a, n_tiles_b, swap_operands=False, tile_2x2=True):
-        assert n_tiles_a % _FP4_PACK == 0 and n_tiles_b % _FP4_PACK == 0
+    def __init__(self):
+        assert N_TILES_A % _FP4_PACK == 0 and N_TILES_B % _FP4_PACK == 0
         self.accum_type = Vec.make_type(4, fx.Float32)
-        self.n_tiles_a = n_tiles_a
-        self.n_tiles_b = n_tiles_b
         self.res_ty = Vec.make_type(4, fx.Float32)
-        # See _mfma_agpr: feeds (B, A) so the accumulator comes out transposed
-        # (row-contiguous), which the epilogue needs to store wide.
-        self.swap_operands = swap_operands
-        # Emit MFMAs in 2x2 (i,j) tiles so both source operands stay resident in
-        # the XDL operand buffer. See _order.
-        self.tile_2x2 = tile_2x2 and n_tiles_a % 2 == 0 and n_tiles_b % 2 == 0
 
     def idx(self, i, j):
-        return i * self.n_tiles_b + j
+        return i * N_TILES_B + j
 
     def _order(self):
         """(i, j) emission order for one ksub.
@@ -540,11 +536,9 @@ class Mfma16x16x128Fp4:
         four-quadrant call structure. Order only; the (i,j) set and each
         accumulator's operands are unchanged.
         """
-        if not self.tile_2x2:
-            return [(i, j) for i in range(self.n_tiles_a) for j in range(self.n_tiles_b)]
         order = []
-        j0s = list(range(0, self.n_tiles_b, 2))
-        for n, i0 in enumerate(range(0, self.n_tiles_a, 2)):
+        j0s = list(range(0, N_TILES_B, 2))
+        for n, i0 in enumerate(range(0, N_TILES_A, 2)):
             for j0 in (reversed(j0s) if n % 2 else j0s):
                 order += [(i0 + di, j0 + dj) for di in range(2) for dj in range(2)]
         return order
@@ -616,10 +610,9 @@ class Mfma16x16x128Fp4:
         # lane%16, K from lane//16), so swapping needs no change to the S2R
         # loaders. Only the op_sel byte-select and the scale operands follow the
         # data to the other side.
-        if self.swap_operands:
-            a_op, b_op = b_op, a_op
-            sa_v, sb_v = sb_v, sa_v
-            ia, jb = jb, ia
+        a_op, b_op = b_op, a_op
+        sa_v, sb_v = sb_v, sa_v
+        ia, jb = jb, ia
         opsel = f"op_sel:[{ia},{jb},0]"
         opsel_hi = f"op_sel_hi:[{ksub},{ksub},0]"
         # acc=None -> src2 is the literal 0 (C = A*B, not A*B + C). Used for the
@@ -785,26 +778,14 @@ class StoreCFp4:
         c_rows,
         c_cols,
         c_idx_fn,
-        n_tiles_a,
-        n_tiles_b,
-        mn_aligned=False,
-        swapped=False,
-        wide_store=True,
     ):
         self.c_rows = c_rows
         self.c_cols = c_cols
         self.lane_id = fx.thread_idx.x % 64
         self.c_idx_fn = c_idx_fn
-        self.n_tiles_a = n_tiles_a
-        self.n_tiles_b = n_tiles_b
-        self.mn_aligned = mn_aligned
-        # With Mfma16x16x128Fp4(swap_operands=True) the accumulator is
+        # swapped_operand here, so the accumulator is
         # transposed: lane L holds C[L%16, 4 consecutive cols] rather than
         # C[4 consecutive rows, L%16]. Row/col roles below flip accordingly.
-        self.swapped = swapped
-        # Pair adjacent N-tiles and fuse them with v_permlane16_swap so each
-        # store is a full dwordx4. See ``store`` for the tag-access argument.
-        self.wide_store = swapped and mn_aligned and wide_store and (n_tiles_b % 2 == 0)
         c_nbytes = c_rows * c_cols * 2
         gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
@@ -869,65 +850,19 @@ class StoreCFp4:
         fx.copy(self.out_atom_8, self.reg_bf16_8, fx.slice(self.c_div, (None, fx.Int32(c_index))))
 
     def store(self, c_frag, base_row, base_col):
-        if const_expr(self.wide_store):
-            for ti in range_constexpr(self.n_tiles_a):
-                for tj in range_constexpr(0, self.n_tiles_b, 2):
-                    vec_lo = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                    vec_hi = Vec(c_frag[self.c_idx_fn(ti, tj + 1)])
-                    self._store_bf16x8_pair(vec_lo, vec_hi, base_row, base_col, ti, tj)
-            return
-
-        for ti in range_constexpr(self.n_tiles_a):
-            for tj in range_constexpr(self.n_tiles_b):
-                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                if const_expr(self.swapped):
-                    # Transposed accumulator: this lane owns one row and four
-                    # consecutive columns. The four values are contiguous in C.
-                    row = base_row + ti * 16 + self.lane_id % 16
-                    col = base_col + tj * 16 + (self.lane_id // 16) * 4
-                else:
-                    row = base_row + ti * 16 + (self.lane_id // 16) * 4
-                    col = base_col + tj * 16 + self.lane_id % 16
-
-                if const_expr(self.mn_aligned):
-                    # M/N aligned to BLOCK -> every store in-bounds, no select.
-                    if const_expr(self.swapped):
-                        self._store_bf16x4(vec_f32, row * self.c_cols + col)
-                    else:
-                        for i in range_constexpr(4):
-                            scaled = vec_f32[i].to(fx.BFloat16)
-                            self._store_bf16(scaled, (row + i) * self.c_cols + col)
-                else:
-                    # arbitrary M/N: guard each store; OOB redirected to a sentinel
-                    # index the bounded buffer resource drops.
-                    oob = fx.Int32(self.c_rows * self.c_cols)
-                    for i in range_constexpr(4):
-                        scaled = vec_f32[i].to(fx.BFloat16)
-                        if const_expr(self.swapped):
-                            c_index = row * self.c_cols + col + i
-                            valid = (col + i) < self.c_cols
-                        else:
-                            c_index = (row + i) * self.c_cols + col
-                            valid = col < self.c_cols
-                        self._store_bf16(scaled, arith.select(valid, c_index, oob))
+        for ti in range_constexpr(N_TILES_A):
+            for tj in range_constexpr(0, N_TILES_B, 2):
+                vec_lo = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                vec_hi = Vec(c_frag[self.c_idx_fn(ti, tj + 1)])
+                self._store_bf16x8_pair(vec_lo, vec_hi, base_row, base_col, ti, tj)
+        return
 
 
 def compile_fp4_gemm_4w(
     *,
     K: int,
-    BLOCK_M: int = 256,
-    BLOCK_N: int = 256,
     use_xcd_remap: bool = True,
-    mn_aligned: bool = False,
-    swap_operands: bool = False,
-    wide_store: bool = True,
-    tile_2x2: bool = True,
 ):
-    # mn_aligned: caller asserts M % BLOCK_M == 0 and N % BLOCK_N == 0, so every
-    # epilogue store is in-bounds -> skip the per-store col-bounds select (saves
-    # 256 v_cmp+v_cndmask/wave). Leave False for arbitrary M/N (correctness via the
-    # explicit bounds select). Common alignment-fast-path optimization.
-    # 256 fp4 per LDS K-step row = 128 bytes; reuse fp8's 128-byte LDS layout.
     BLOCK_K = 256  # fp4 elements
     BLOCK_K_BYTES = BLOCK_K // 2  # 128 bytes / row
     LDS_BLOCK_M = BLOCK_M // 2
@@ -943,8 +878,6 @@ def compile_fp4_gemm_4w(
     # the 32KB I-cache). Must be even -- see the ping-pong note at the loop.
     UNROLL = 4 if (K_ITERS - 4) % 4 == 0 else 2
     assert (K_ITERS - 4) % UNROLL == 0, K_ITERS
-    N_TILES_A = BLOCK_M // 4 // 16
-    N_TILES_B = BLOCK_N // 4 // 16
     N_ACCUMS = N_TILES_A * N_TILES_B
     assert N_ACCUMS > 0
 
@@ -1013,7 +946,7 @@ def compile_fp4_gemm_4w(
         # B is preshuffled (16,16): one N-16 row-block spans 2*1024 bytes per K-step
         B_K_STEP = 2 * 1024
 
-        mfma = Mfma16x16x128Fp4(N_TILES_A, N_TILES_B, swap_operands=swap_operands, tile_2x2=tile_2x2)
+        mfma = Mfma16x16x128Fp4()
 
         _scale_base_ptr = lds.scale_lds.ptr
         _sc = _lds_scopes() if _USE_DMA_INTRINSIC else None
@@ -1071,15 +1004,10 @@ def compile_fp4_gemm_4w(
         a_s2r = S2RLoaderFp4(wave_i, N_TILES_A, scopes=_sc)
         b_s2r = S2RLoaderFp4(wave_j, N_TILES_B, scopes=_sc)
         store_c = StoreCFp4(
-            C,
-            c_m,
-            c_n,
-            mfma.idx,
-            N_TILES_A,
-            N_TILES_B,
-            mn_aligned=mn_aligned,
-            swapped=swap_operands,
-            wide_store=wide_store,
+            C=C,
+            c_rows=c_m,
+            c_cols=c_n,
+            c_idx_fn=mfma.idx,
         )
 
         # Prologue. Scale gathers for step 0/1/2 go FIRST (before the 32 g2s) so they
@@ -1383,6 +1311,7 @@ def compile_fp4_gemm_4w(
         c_n: fx.Int32,
         stream: fx.Stream,
     ):
+        # should assert c_m % BLOCK_M == 0 and c_n % BLOCK_N == 0 here. but can't find a way to add it now.
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
         kernel_gemm(
             A,
