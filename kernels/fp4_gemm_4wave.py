@@ -84,11 +84,6 @@ def _asm_void(operands, asm_string, constraints, clobbers=""):
     _llvm.inline_asm(None, operands, asm_string, constraints, has_side_effects=True)
 
 
-# The scale gather's inline asm writes m0. On the inline-asm g2s path nothing
-# else touches m0 so the omission was harmless, but the DMA-intrinsic path has
-# the BACKEND materializing m0 for each buffer_load...lds, and it will happily
-# hoist those s_mov_b32 m0 above the gather -- which then stomps m0 and sends
-# the DMA to the wrong LDS address. Declare the clobber.
 def _cvt_pk_bf16(a, b):
     """Pack two f32 into 2xbf16 (i32), as ``arith.truncf <2xf32> -> <2xbf16>``.
 
@@ -109,6 +104,10 @@ def _cvt_pk_bf16(a, b):
     return _llvm.BitcastOp(fx.Int32.ir_type, _arith_d.TruncFOp(v2bf16, src).result).result
 
 
+# Any inline asm that writes m0 must say so. Only the FP4_DMA_INTRINSIC=0 fallback
+# still has such asm, but the omission was a live bug: once the BACKEND materializes
+# m0 for each buffer_load...lds it hoists those s_mov_b32 m0 freely, an undeclared
+# writer stomps one, and the DMA lands at the wrong LDS address (cos=nan).
 _M0_CLOBBER = "~{m0}"
 
 
@@ -134,23 +133,29 @@ def wait_barrier(count):
 
 
 # Emit g2s AND the scale gather as the real rocdl.raw.ptr.buffer.load.lds intrinsic
-# + LLVM alias scopes instead of opaque inline asm. Works and is correct, but
-# measured 0.65% SLOWER at 16384^3 (5186/5188/5199 -> 5152/5155/5167, 3 alternating
-# pairs), so: default OFF. With it on, the hot loop contains no inline asm at all
-# except the MFMAs -- so this is the complete form of the experiment, not a partial
-# one, and the slowdown is not "some asm was left behind".
+# + LLVM alias scopes instead of opaque inline asm. DEFAULT ON: with this the hot
+# loop contains no inline asm at all except the MFMAs. Set FP4_DMA_INTRINSIC=0 to
+# get the old all-inline-asm g2s back for A/B.
 #
-# Why it loses, and why it is not fixable from here: gfx9 `buffer_load ... lds` has
-# no LDS-address field -- the destination can ONLY come from m0. Hand-written asm
-# sets m0 once per load group and advances it with s_add_u32; the intrinsic hands
-# m0 to the backend, which materializes one s_mov_b32 m0 per load unconditionally
-# (hot-loop s_mov_b32 24 -> 74, 919 -> 929 instrs). The scheduling freedom won by
-# dropping the ASMSTART/ASMEND walls does not pay for that.
+# This costs 0.65% at 16384^3 (5186/5188/5199 -> 5152/5155/5167, 3 alternating
+# pairs) and is taken deliberately: long-lived inline asm is the wrong foundation
+# to keep building on. It is opaque to the scheduler, it hides real dependencies
+# (a missing m0 clobber in the scale gather silently corrupted every DMA the
+# moment the backend started managing m0 -- see _M0_CLOBBER), and every future
+# change has to reason around it by hand.
 #
-# Kept because the alias scopes themselves work perfectly (zero vmcnt(0) in the hot
-# loop -- see _lds_scopes) and because it is the reference for anyone who tries this
-# again. See also _M0_CLOBBER: this path is what exposed that latent bug.
-_USE_DMA_INTRINSIC = os.environ.get("FP4_DMA_INTRINSIC", "0") == "1"
+# Where the 0.65% goes, and why it is not fixable from the DSL: gfx9
+# `buffer_load ... lds` has no LDS-address field -- the destination can ONLY come
+# from m0. Hand-written asm sets m0 once per load group and advances it with
+# s_add_u32; the intrinsic hands m0 to the backend, which materializes one
+# s_mov_b32 m0 per load unconditionally (hot-loop s_mov_b32 24 -> 76, 919 -> 931
+# instrs). The scheduling freedom won by dropping the ASMSTART/ASMEND walls does
+# not pay for that. Closing it needs the backend to amortize m0 across loads.
+#
+# The alias scopes are what make this viable at all: without them LLVM cannot
+# prove the DMA misses the ds_reads and drops a `s_waitcnt vmcnt(0)` in front of
+# every one. With them the hot loop has zero vmcnt(0). See _lds_scopes.
+_USE_DMA_INTRINSIC = os.environ.get("FP4_DMA_INTRINSIC", "1") == "1"
 _LDS_BUF_BYTES = 16384  # one of the 8 A/B tile buffers; asserted against a_lds_size
 _LDS_DOMAIN = '#llvm.alias_scope_domain<id = "fp4_gemm_4wave.lds">'
 # One scope per disjoint LDS region: the 8 A/B tile buffers, then the two scale
@@ -195,18 +200,26 @@ def _uniform_i32(value):
 
 
 class G2SLoaderAsm:
-    """Global->LDS DMA via INLINE-ASM ``buffer_load_dwordx4 ... lds`` instead of the
+    """Global->LDS DMA via ``buffer_load_dwordx4 ... lds`` instead of the
     BufferCopyLDS128b copy atom.
 
-    Mirrors the mla_fwd_decode trick: with the 8 LDS buffers merged into ONE
-    symbol (so ds_read cross-buffer offsets fold into the 16-bit imm), LLVM can no
-    longer prove the g2s LDS writes don't alias the ds_reads, and would insert a
-    spurious ``s_waitcnt vmcnt(0)`` before every ds_read. Emitting the load as
-    opaque inline asm means LLVM sees no LDS write at all, so it adds no drain --
-    vmcnt ordering is managed entirely by our explicit ``wait_barrier`` (which is
-    itself inline-asm ``s_waitcnt vmcnt(N); s_barrier``). The inline-asm
-    buffer_load IS still counted toward vmcnt by hardware, so the manual counts in
-    wait_barrier stay correct.
+    The problem this class exists to solve: with the 8 LDS buffers merged into ONE
+    symbol (so ds_read cross-buffer offsets fold into the 16-bit imm), LLVM cannot
+    prove the g2s LDS writes don't alias the ds_reads, and inserts a spurious
+    ``s_waitcnt vmcnt(0)`` before every ds_read.
+
+    Two ways out, selected by ``scopes``:
+
+    * DEFAULT (``scopes`` set, _USE_DMA_INTRINSIC): the real
+      rocdl.raw.ptr.buffer.load.lds intrinsic, tagged with per-buffer alias scopes
+      so LLVM *can* prove the DMA misses the ds_reads. LLVM sees the write and
+      still emits no drain.
+    * FALLBACK (``scopes`` None): opaque inline asm, so LLVM sees no LDS write at
+      all and has nothing to be conservative about.
+
+    Either way vmcnt ordering is owned by our explicit ``wait_barrier``, and either
+    way hardware still counts the load toward vmcnt, so the manual counts stay
+    correct.
 
     Each ``buffer_load_dwordx4 vN, rsrc, soffset offen lds`` writes 16 bytes to the
     LDS address in m0; m0 holds the per-step LDS byte base (wave-uniform via
@@ -318,9 +331,9 @@ class S2RLoaderFp4:
     def _vec_load_16xf8(self, lds_src, dyn_offset, const_offset):
         # Plain LLVM ds_read (NOT inline-asm). The single-symbol LDS layout would
         # normally make the compiler insert an s_waitcnt vmcnt(0) drain before each
-        # ds_read (it can't prove the g2s global->LDS DMA writes don't alias) -- but
-        # because g2s is now inline-asm (G2SLoaderAsm), the LDS WRITE is invisible to
-        # the compiler, so no drain is emitted. And being a REAL LDS load, the
+        # ds_read (it can't prove the g2s global->LDS DMA writes don't alias) -- see
+        # G2SLoaderAsm for the two ways that is avoided (alias scopes by default).
+        # And being a REAL LDS load, the
         # compiler tracks it with fine-grained lgkmcnt (matching the 8-symbol
         # baseline's sync) instead of the conservative per-MFMA VMEM vmcnt it would
         # insert for an opaque inline-asm block.
@@ -698,8 +711,9 @@ class ScaleLoaderLDS:
     def gather(self, kstep, slot, base_tile):
         """Issue ONE buffer_load_dwordx4...lds gathering all 4 blocks of this
         operand into scale-LDS ``slot``. ``base_tile`` = the M/N-half-0 base row
-        (half 1 is reached via group +4). Inline-asm so LLVM emits no LDS-write
-        drain; vmcnt accounting is owned by wait_barrier (hardware counts it)."""
+        (half 1 is reached via group +4). Alias-scoped DMA intrinsic (or inline asm
+        on the fallback path) so LLVM emits no LDS-write drain; vmcnt accounting is
+        owned by wait_barrier (hardware counts it)."""
         # LDS write (layout A): lane L writes its 16 B to m0 + L*16. So lane L must
         # READ from global the data destined for LDS slot L*16 = block (L//16),
         # i32 chunk (L%16)*4..+3. block g//16 -> group G + (blk//2)*4 + (blk%2).
@@ -946,8 +960,8 @@ def compile_fp4_gemm_4w(
     # per-(buffer,tile) address VGPRs (252 -> ~228 arch VGPR). The catch: a single
     # LDS symbol breaks the compiler's alias analysis between the g2s global->LDS DMA
     # writes and the ds_reads, so it would insert a spurious `s_waitcnt vmcnt(0)`
-    # before every ds_read -- which is why g2s uses inline-asm buffer_load (see
-    # G2SLoaderAsm) so LLVM sees no LDS write and emits no drain.
+    # before every ds_read -- see G2SLoaderAsm for how that is avoided (per-buffer
+    # alias scopes by default, opaque inline asm on the fallback path).
     assert a_lds_size == b_lds_size
     assert a_lds_size == _LDS_BUF_BYTES
     _lds_buf = a_lds_size  # 16KB; 8 buffers laid out contiguously # 128KB
@@ -1044,7 +1058,7 @@ def compile_fp4_gemm_4w(
         gl_off_a = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=False)
         gl_off_b = compute_global_swizzle(lane_id, wave_id, K_BYTES, N_LDS_ROUNDS, preshuffled=True)
 
-        # Inline-asm g2s (see G2SLoaderAsm): needs the raw buffer resource. Build it
+        # g2s (see G2SLoaderAsm): needs the raw buffer resource. Build it
         # once from the i8 buffer tensor (max_size OOB check; all addresses in-bounds).
         a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=True)  # why max size here...
         b_rsrc = _buffer_ops.create_buffer_resource(B_T, max_size=True)  # why???
@@ -1100,8 +1114,9 @@ def compile_fp4_gemm_4w(
         sc0_sbC0, sc0_sbC1 = b_scale_ld.read(_slot(0))
         sc0 = (sc0_saR0, sc0_saR1, sc0_sbC0, sc0_sbC1)
 
-        # Main-loop wait_barrier vmcnt. g2s and scale gathers are inline-asm so the
-        # compiler uses our literal vmcnt verbatim. With depth-2 end-of-step scale,
+        # Main-loop wait_barrier vmcnt. The compiler never tightens our literal
+        # vmcnt: g2s and the scale gathers are either alias-scoped (proven not to
+        # alias the ds_reads) or opaque inline asm. With depth-2 end-of-step scale,
         # the scale[kc] gather (issued 2 steps ago) is the oldest outstanding VMEM at
         # the step top; vmcnt(17) drains exactly it while keeping the g2s window (16)
         # in flight, so the ds_read of scale[kc] sees landed LDS.
