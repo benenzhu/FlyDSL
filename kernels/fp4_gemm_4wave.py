@@ -30,6 +30,7 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
+from flydsl._mlir.dialects import arith as _arith_d
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import arith, const_expr, range_constexpr
 from flydsl.expr import buffer_ops as _buffer_ops
@@ -88,6 +89,26 @@ def _asm_void(operands, asm_string, constraints, clobbers=""):
 # the BACKEND materializing m0 for each buffer_load...lds, and it will happily
 # hoist those s_mov_b32 m0 above the gather -- which then stomps m0 and sends
 # the DMA to the wrong LDS address. Declare the clobber.
+def _cvt_pk_bf16(a, b):
+    """Pack two f32 into 2xbf16 (i32), as ``arith.truncf <2xf32> -> <2xbf16>``.
+
+    Selects to the same single ``v_cvt_pk_bf16_f32`` on gfx950 as
+    ``rocdl.cvt_pk_bf16_f32``, but that helper is inline asm (ROCDL has no op for
+    this instruction -- see expr/rocdl/inline_asm.py), which plants an
+    ASMSTART/ASMEND wall the machine scheduler cannot move across. 128 of them in
+    the epilogue. Going through arith.truncf lets the backend select it as a
+    normal SSA value: identical 128 v_cvt_pk_bf16_f32, identical 2578 instrs and
+    440/256/66 VGPR/AGPR/SGPR, only epilogue scheduling differs.
+    """
+    v2f32 = _ir.VectorType.get([2], fx.Float32.ir_type)
+    vec = Vec.from_elements([fx.Float32(a), fx.Float32(b)], fx.Float32)
+    src = arith._to_raw(vec)
+    if src.type != v2f32:
+        src = _llvm.BitcastOp(v2f32, src).result
+    v2bf16 = _ir.VectorType.get([2], fx.BFloat16.ir_type)
+    return _llvm.BitcastOp(fx.Int32.ir_type, _arith_d.TruncFOp(v2bf16, src).result).result
+
+
 _M0_CLOBBER = "~{m0}"
 
 
@@ -112,9 +133,12 @@ def wait_barrier(count):
     _rocdl.s_barrier()
 
 
-# Emit g2s as the real rocdl.raw.ptr.buffer.load.lds intrinsic + LLVM alias scopes
-# instead of opaque inline asm. Works and is correct, but measured 0.6% SLOWER at
-# 16384^3 (5185/5211/5205 -> 5160/5173/5177, 3 alternating pairs), so: default OFF.
+# Emit g2s AND the scale gather as the real rocdl.raw.ptr.buffer.load.lds intrinsic
+# + LLVM alias scopes instead of opaque inline asm. Works and is correct, but
+# measured 0.65% SLOWER at 16384^3 (5186/5188/5199 -> 5152/5155/5167, 3 alternating
+# pairs), so: default OFF. With it on, the hot loop contains no inline asm at all
+# except the MFMAs -- so this is the complete form of the experiment, not a partial
+# one, and the slowdown is not "some asm was left behind".
 #
 # Why it loses, and why it is not fixable from here: gfx9 `buffer_load ... lds` has
 # no LDS-address field -- the destination can ONLY come from m0. Hand-written asm
@@ -684,9 +708,16 @@ class ScaleLoaderLDS:
         i32_off = grp * fx.Int32(self.row_i32) + fx.Int32(kstep) * fx.Int32(64) + self._in16 * fx.Int32(4)
         voff = arith._to_raw(i32_off * fx.Int32(4))  # bytes
         # m0 = precomputed wave base (SGPR) + slot*8192 (scalar): no readfirstlane.
-        m0 = arith._to_raw(fx.Int32(self._wave_base_s) + fx.Int32(slot) * fx.Int32(_SCALE_SLOT_BYTES))
+        addr = fx.Int32(self._wave_base_s) + fx.Int32(slot) * fx.Int32(_SCALE_SLOT_BYTES)
+        if self.scopes is not None:
+            lds_ptr = _llvm.inttoptr(_lds_ptr_t(), arith._to_raw(fx.Int64(addr)))
+            dma = _rocdl.raw_ptr_buffer_load_lds(
+                self.rsrc, lds_ptr, fx.Int32(16), voff, self._soff0, fx.Int32(0), fx.Int32(0)
+            )
+            _tag_alias(dma, self.scopes, self.slot_id)
+            return
         asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
-        _asm_void([m0, voff, self.rsrc, self._soff0], asm, "s,v,s,s", _M0_CLOBBER)
+        _asm_void([arith._to_raw(addr), voff, self.rsrc, self._soff0], asm, "s,v,s,s", _M0_CLOBBER)
 
     def read_half(self, slot, half):
         """Per-lane ds_read of ONE half (2 blocks) -> list[n_groups] of i32.
@@ -800,10 +831,10 @@ class StoreCFp4:
         full 64 B line -> waste 1.0, and the store count drops 4x again.
         """
         # 4 f32 -> 2 packed-bf16 dwords per tile (lo = cols 0,1; hi = cols 2,3).
-        a0 = _rocdl.cvt_pk_bf16_f32(vec_lo[0], vec_lo[1])
-        a1 = _rocdl.cvt_pk_bf16_f32(vec_lo[2], vec_lo[3])
-        b0 = _rocdl.cvt_pk_bf16_f32(vec_hi[0], vec_hi[1])
-        b1 = _rocdl.cvt_pk_bf16_f32(vec_hi[2], vec_hi[3])
+        a0 = _cvt_pk_bf16(vec_lo[0], vec_lo[1])
+        a1 = _cvt_pk_bf16(vec_lo[2], vec_lo[3])
+        b0 = _cvt_pk_bf16(vec_hi[0], vec_hi[1])
+        b1 = _cvt_pk_bf16(vec_hi[2], vec_hi[3])
         a0, b0 = _permlane16_swap(a0, b0)
         a1, b1 = _permlane16_swap(a1, b1)
         # The two swaps leave every lane holding four dwords that are eight
