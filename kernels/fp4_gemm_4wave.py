@@ -815,33 +815,53 @@ class StoreCFp4:
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
 
+    def _store_one(self, c_frag, base_row, base_col, ti, tj):
+        vec_lo = Vec(c_frag[self.c_idx_fn(ti, tj)])
+        vec_hi = Vec(c_frag[self.c_idx_fn(ti, tj + 1)])
+        a0 = _cvt_pk_bf16(vec_lo[0], vec_lo[1])
+        a1 = _cvt_pk_bf16(vec_lo[2], vec_lo[3])
+        b0 = _cvt_pk_bf16(vec_hi[0], vec_hi[1])
+        b1 = _cvt_pk_bf16(vec_hi[2], vec_hi[3])
+
+        def _permlane16_swap(d_a, d_b):
+            pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
+            res = _rocdl.permlane16_swap(pair_ty, arith._to_raw(d_a), arith._to_raw(d_b), False, False)
+            return _llvm.extractvalue(_T.i32, res, [0]), _llvm.extractvalue(_T.i32, res, [1])
+
+        a0, b0 = _permlane16_swap(a0, b0)
+        a1, b1 = _permlane16_swap(a1, b1)
+        g = self.lane_id // 16
+        row = base_row + ti * 16 + self.lane_id % 16
+        col = base_col + (tj + g % 2) * 16 + (g // 2) * 8
+        pack = Vec.from_elements([fx.Int32(a0), fx.Int32(a1), fx.Int32(b0), fx.Int32(b1)], fx.Int32).bitcast(
+            fx.BFloat16
+        )
+        fx.memref_store_vec(pack, self.reg_bf16_8)
+        c_index = row * self.c_cols + col
+        fx.copy(self.out_atom_8, self.reg_bf16_8, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+
+    def thunks(self, c_frag, base_row, base_col):
+        """One zero-arg thunk per ``buffer_store_dwordx4`` (8 for a quadrant).
+
+        Handed to ``Mfma16x16x128Fp4.call(interleave=...)`` so a later quadrant's
+        MFMAs sit between this quadrant's stores. Back-to-back stores queue up on
+        L1 rather than on bandwidth, so spacing them out is what pays -- the MFMAs
+        are free filler, and the accumulator reads / bf16 converts that each thunk
+        drags along get hidden in the MFMA execute shadow too.
+
+        The body reads ``c_frag`` when the thunk RUNS, not when it is built, but
+        the caller always builds a quadrant's thunks after that quadrant's
+        ``mfma.call`` has returned, so the values are final either way.
+        """
+        return [
+            (lambda ti=ti, tj=tj: self._store_one(c_frag, base_row, base_col, ti, tj))
+            for ti in range_constexpr(N_TILES_A)
+            for tj in range_constexpr(0, N_TILES_B, 2)
+        ]
+
     def store(self, c_frag, base_row, base_col):
-        for ti in range_constexpr(N_TILES_A):
-            for tj in range_constexpr(0, N_TILES_B, 2):
-                vec_lo = Vec(c_frag[self.c_idx_fn(ti, tj)])
-                vec_hi = Vec(c_frag[self.c_idx_fn(ti, tj + 1)])
-                a0 = _cvt_pk_bf16(vec_lo[0], vec_lo[1])
-                a1 = _cvt_pk_bf16(vec_lo[2], vec_lo[3])
-                b0 = _cvt_pk_bf16(vec_hi[0], vec_hi[1])
-                b1 = _cvt_pk_bf16(vec_hi[2], vec_hi[3])
-
-                def _permlane16_swap(d_a, d_b):
-                    pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
-                    res = _rocdl.permlane16_swap(pair_ty, arith._to_raw(d_a), arith._to_raw(d_b), False, False)
-                    return _llvm.extractvalue(_T.i32, res, [0]), _llvm.extractvalue(_T.i32, res, [1])
-
-                a0, b0 = _permlane16_swap(a0, b0)
-                a1, b1 = _permlane16_swap(a1, b1)
-                g = self.lane_id // 16
-                row = base_row + ti * 16 + self.lane_id % 16
-                col = base_col + (tj + g % 2) * 16 + (g // 2) * 8
-                pack = Vec.from_elements([fx.Int32(a0), fx.Int32(a1), fx.Int32(b0), fx.Int32(b1)], fx.Int32).bitcast(
-                    fx.BFloat16
-                )
-                fx.memref_store_vec(pack, self.reg_bf16_8)
-                c_index = row * self.c_cols + col
-                fx.copy(self.out_atom_8, self.reg_bf16_8, fx.slice(self.c_div, (None, fx.Int32(c_index))))
-        return
+        for t in self.thunks(c_frag, base_row, base_col):
+            t()
 
 
 def compile_fp4_gemm_4w(
@@ -1257,21 +1277,40 @@ def compile_fp4_gemm_4w(
         _a1 = [None] * N_TILES_A
         wait_barrier(0)
         saR0, saR1, sbC0, sbC1 = (_scn[0], _scn[1], _scn[2], _scn[3])
-        il = _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
-        a1_frag = _a1
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1)
-
         store_c = StoreCFp4(
             C=C,
             c_rows=c_m,
             c_cols=c_n,
             c_idx_fn=mfma.idx,
         )
-        store_c.store(c00_frag, sa_R0, sb_C0)
-        store_c.store(c01_frag, sa_R0, sb_C1)
+        # Each quadrant's 8 stores ride in a LATER quadrant's MFMA slots. Issuing
+        # all 32 buffer_stores back to back queues them on L1 (not on bandwidth),
+        # so the win is spacing them out; the MFMAs are free filler and the
+        # accvgpr_read / cvt_pk_bf16 each thunk drags along hide in the MFMA
+        # execute shadow.
+        #
+        # The sched_barrier(0) after each call is load-bearing, not a hint.
+        # ``_mfma_agpr`` emits the MFMA as inline asm, so GCNHazardRecognizer
+        # cannot see the AGPR write and inserts no nops for the MFMA ->
+        # v_accvgpr_read RAW hazard. Without the barrier the machine scheduler
+        # sinks a c00 MFMA to 2 instructions before the thunk that reads that same
+        # accumulator, and the epilogue reads stale data (cos 0.999999 ->
+        # 0.999512). The barrier pins every quadrant's MFMAs ahead of the stores
+        # that read them, leaving a full 32-MFMA call in between.
+        #
+        # Stores go two calls back, not one: one call back still let a tail MFMA
+        # land inside the hazard window (cos 0.999877). c10/c11 have no later call
+        # to hide in.
+        il = _s2r_thunks(a_s2r, a_cur1, _a1, N_TILES_A, False)
+        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, saR0, sbC0, interleave=il)
+        a1_frag = _a1
+        _rocdl.sched_barrier(0)
+        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, saR0, sbC1)
+        _rocdl.sched_barrier(0)
+        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, saR1, sbC0, interleave=store_c.thunks(c00_frag, sa_R0, sb_C0))
+        _rocdl.sched_barrier(0)
+        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, saR1, sbC1, interleave=store_c.thunks(c01_frag, sa_R0, sb_C1))
+        _rocdl.sched_barrier(0)
         store_c.store(c10_frag, sa_R1, sb_C0)
         store_c.store(c11_frag, sa_R1, sb_C1)
 
