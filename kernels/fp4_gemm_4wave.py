@@ -482,6 +482,10 @@ def _xcd_swizzle(num_pid_m, num_pid_n):
     pid_m = first_pid_m + intra_group_m
 
     use_simple = (num_wg < SWIZZLE_THRESHOLD) | (num_wg % NUM_XCDS != 0)
+    if const_expr(isinstance(use_simple, bool)):
+        # num_pid_m/n are compile-time (M/N pinned), so the whole predicate folds
+        # and only one of the two mappings needs to be emitted.
+        return (simple_m, simple_n) if use_simple else (pid_m, pid_n)
     return (arith.select(use_simple, simple_m, pid_m), arith.select(use_simple, simple_n, pid_n))
 
 
@@ -868,7 +872,23 @@ def compile_fp4_gemm_4w(
     *,
     K: int,
     use_xcd_remap: bool = True,
+    MN: tuple = None,
 ):
+    """``MN=(M, N)`` bakes the output shape in as a compile-time constant.
+
+    The kernel still takes c_m/c_n as arguments (the signature is unchanged); they
+    are simply ignored, so the caller must pass the same M/N it compiled for.
+
+    Worth doing because c_m/c_n only ever feed integer DIVISIONS -- ceildiv to a
+    block count, then four divmods in ``_xcd_swizzle`` -- and a runtime scalar
+    divide is a ~20-instruction software sequence with no divider in hardware.
+    That whole dependency chain sits in front of the first buffer_load, so the
+    wave issues nothing to memory until it finishes: 272 instructions (199 SALU)
+    before the first global load, vs 168 (107 SALU) with M/N pinned.
+
+    +1.0% at 8192x8192x4096 (4662-4688 vs 4607-4633 TFLOPS, non-overlapping over
+    4 alternating pairs); neutral at 16384^3, where the fixed cost is amortized.
+    """
     BLOCK_K = 256
     BLOCK_K_BYTES = BLOCK_K // 2
     LDS_BLOCK_M = BLOCK_M // 2
@@ -920,6 +940,10 @@ def compile_fp4_gemm_4w(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
+        # Shadow the runtime c_m/c_n with compile-time constants so every divide
+        # below folds away. See compile_fp4_gemm_4w's docstring.
+        if const_expr(MN is not None):
+            c_m, c_n = const_expr(MN[0]), const_expr(MN[1])
         n_blocks = ceildiv(c_n, BLOCK_N)
         if const_expr(use_xcd_remap):
             tile_i, tile_j = _xcd_swizzle(ceildiv(c_m, BLOCK_M), n_blocks)

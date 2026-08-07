@@ -82,7 +82,7 @@ def setup(M, N, K):
         ait_args.append((xq, shuffle_weight(wq, layout=(16, 16)), xs, ws))
         del a, b, a_q, b_q, wq
 
-    compiled = flyc.compile(compile_fp4_gemm_4w(K=K), *fly_args[0])
+    compiled = flyc.compile(compile_fp4_gemm_4w(K=K, MN=(M, N)), *fly_args[0])
 
     def fly(i):
         compiled(*fly_args[i % N_SETS])

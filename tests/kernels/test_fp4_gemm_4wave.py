@@ -82,7 +82,7 @@ def _bench_fp4_gemm(M, N, K, num_warmups=10, num_iters=100):
 
     c_out = torch.zeros((M, N), dtype=OUT_DTYPE, device=device)
 
-    launch_fn = compile_fp4_gemm_4w(K=K)
+    launch_fn = compile_fp4_gemm_4w(K=K, MN=(M, N))
     print(f"\n[fp4_gemm_4wave] M={M} N={N} K={K}")
 
     def _args(c, a, b, sa, sb):
