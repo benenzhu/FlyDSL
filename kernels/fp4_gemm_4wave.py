@@ -461,6 +461,22 @@ def _min(a, b):
     return arith.select(a < b, a, b)
 
 
+def _divmod_nonneg(a, b):
+    """``divmod(a, b)`` where ``a >= 0`` is known and ``b`` may be a constant.
+
+    Everything in ``_xcd_swizzle`` derives from ``block_idx.x``, so it is always
+    non-negative -- but its type is signed i32, so plain ``//`` and ``%`` lower to
+    ``floordivsi``/``floormodsi``, and those carry a sign-correction chain
+    (``s_ashr 31`` / ``s_lshr`` / ``s_add`` / ``s_ashr``, plus a ``s_cmp`` +
+    ``s_cselect`` + ``s_subb`` fixup) that is dead code here. For a power-of-two
+    divisor the whole thing collapses to one shift and one mask.
+    """
+    if const_expr(isinstance(b, int) and b > 0 and (b & (b - 1)) == 0):
+        sh = b.bit_length() - 1
+        return (a >> sh, a & (b - 1)) if const_expr(sh > 0) else (a, 0)
+    return divmod(a, b)
+
+
 def _xcd_swizzle(num_pid_m, num_pid_n):
     NUM_XCDS = 8
     WGM = 4
@@ -469,12 +485,12 @@ def _xcd_swizzle(num_pid_m, num_pid_n):
 
     wgid = fx.block_idx.x
     num_wg = num_pid_m * num_pid_n
-    simple_m, simple_n = divmod(wgid, num_pid_n)
+    simple_m, simple_n = _divmod_nonneg(wgid, num_pid_n)
 
-    intra_xcd, xcd = divmod(wgid, NUM_XCDS)
+    intra_xcd, xcd = _divmod_nonneg(wgid, NUM_XCDS)
     wgid_remap = xcd * (num_wg // NUM_XCDS) + intra_xcd
     num_wgid_in_group = WGM * num_pid_n
-    group_id, intra_group = divmod(wgid_remap, num_wgid_in_group)
+    group_id, intra_group = _divmod_nonneg(wgid_remap, num_wgid_in_group)
     first_pid_m = group_id * WGM
     if const_expr(isinstance(num_pid_m, int) and num_pid_m % WGM == 0):
         # group_id < num_pid_m/WGM, so first_pid_m <= num_pid_m - WGM and the min is
@@ -485,7 +501,7 @@ def _xcd_swizzle(num_pid_m, num_pid_n):
         group_size_m = WGM
     else:
         group_size_m = _min(num_pid_m - first_pid_m, WGM)
-    pid_n, intra_group_m = divmod(intra_group, group_size_m)
+    pid_n, intra_group_m = _divmod_nonneg(intra_group, group_size_m)
     pid_m = first_pid_m + intra_group_m
 
     use_simple = (num_wg < SWIZZLE_THRESHOLD) | (num_wg % NUM_XCDS != 0)
