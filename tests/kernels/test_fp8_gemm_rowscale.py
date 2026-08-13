@@ -243,8 +243,117 @@ def test_fp8_gemm_8wave(M, N, K, tile_m, tile_n, preshuffle_b):
     )
 
 
+# ---------------------------------------------------------------------------
+# Steady-state benchmark
+# ---------------------------------------------------------------------------
+# ``_bench_fp8_gemm`` above uses run_perftest, which is right for a smoke check
+# but reads a few percent low and drifts run to run. The one below is built for
+# A/B-ing a single optimization instead: it costs ~1500 launches per config, so
+# it is deliberately NOT a pytest test -- run it via
+#
+#     python3 tests/kernels/test_fp8_gemm_rowscale.py --steady-state
+
+BENCH_PAIRS = 3
+BENCH_ITERS = 500
+BENCH_WARMUP = 500
+BENCH_SETS = 5  # rotated per iteration so the inputs do not stay MALL-resident
+
+BENCH_SHAPES = (
+    (8192, 8192, 8192),
+    (8192, 8192, 16384),
+    (16384, 16384, 8192),
+    (16384, 16384, 16384),
+)
+
+
+def _steady_state_us(step, base):
+    """WARMUP + ITERS back-to-back launches under ONE event pair.
+
+    No per-iteration events (they need a sync each time, which drains the pipe
+    and measures single-launch latency instead of steady-state throughput) and
+    no sync between warmup and the timed region (leaving the queue full means
+    the timed region starts with no launch-gap bubble).
+    """
+    st, en = torch.cuda.Event(True), torch.cuda.Event(True)
+    for n in range(BENCH_WARMUP):
+        step(base + n)
+    st.record()
+    for n in range(BENCH_ITERS):
+        step(base + n)
+    en.record()
+    torch.cuda.synchronize()
+    return st.elapsed_time(en) / BENCH_ITERS * 1e3
+
+
+def _make_steady_state_step(M, N, K, *, b_preshuffled, tile_m=256, tile_n=256):
+    """BENCH_SETS input sets rotated per call, so at large shapes a set has been
+    evicted from MALL by the time it comes around again."""
+    device = torch.device("cuda")
+    stream = torch.cuda.current_stream()
+    c = torch.zeros(M * N, dtype=OUT_DTYPE, device=device).view(-1)
+    arg_sets = []
+
+    for s in range(BENCH_SETS):
+        torch.manual_seed(s)
+        a_q, scale_a = pertoken_quant(torch.rand(M, K, device=device), quant_dtype=FP8_DTYPE)
+        b_q, scale_b = pertoken_quant(torch.rand(N, K, device=device), quant_dtype=FP8_DTYPE)
+        b_kernel = preshuffle_b(b_q.contiguous()) if b_preshuffled else b_q.contiguous()
+        # static_weight_scale: B and both scales go in as DLPack adaptors, so
+        # each set needs its own (they are baked per compiled call, not shared).
+        arg_sets.append(
+            (
+                _as_i8(a_q.contiguous()).contiguous().view(-1),
+                flyc.from_torch_tensor(_as_i8(b_kernel).contiguous().view(-1)),
+                c,
+                flyc.from_torch_tensor(scale_a.squeeze().contiguous().view(-1)),
+                flyc.from_torch_tensor(scale_b.squeeze().contiguous().view(-1)),
+                M,
+                N,
+                stream,
+            )
+        )
+        del a_q, b_q, b_kernel
+
+    launch_fn = compile_fp8_gemm_4w(K=K, BLOCK_M=tile_m, BLOCK_N=tile_n, b_preshuffled=b_preshuffled)
+    compiled = flyc.compile(launch_fn, *arg_sets[0])
+
+    def step(i):
+        compiled(*arg_sets[i % BENCH_SETS])
+
+    return step
+
+
+def bench_steady_state(M, N, K, *, b_preshuffled, tile_m=256, tile_n=256):
+    if "gfx95" not in ARCH:
+        raise RuntimeError(f"FP8 row-scale GEMMs require CDNA4 (gfx95*), got {ARCH}")
+
+    step = _make_steady_state_step(M, N, K, b_preshuffled=b_preshuffled, tile_m=tile_m, tile_n=tile_n)
+    step(0)  # first-call costs: module load
+    torch.cuda.synchronize()
+
+    flops = 2 * M * N * K
+    tag = "preshuffle_b" if b_preshuffled else "rowmajor"
+    print(
+        f"\n[fp8_gemm_4wave] {M}x{N}x{K} {tag}  ({BENCH_SETS} sets, warmup {BENCH_WARMUP}, {BENCH_PAIRS}x{BENCH_ITERS} iters)"
+    )
+    best = float("inf")
+    for p in range(BENCH_PAIRS):
+        us = _steady_state_us(step, p * BENCH_ITERS)
+        best = min(best, us)
+        print(f"  pair {p}:  {us:8.1f} us  {flops / (us / 1e6) / 1e12:6.0f} TFLOPS")
+    print(f"  BEST:    {best:8.1f} us  {flops / (best / 1e6) / 1e12:6.0f} TFLOPS")
+    return flops / (best / 1e6) / 1e12
+
+
 if __name__ == "__main__":
     import argparse
+
+    if "--steady-state" in sys.argv:
+        torch.set_default_device("cuda")
+        for shape in BENCH_SHAPES:
+            for pre in (False, True):
+                bench_steady_state(*shape, b_preshuffled=pre)
+        sys.exit(0)
 
     parser = argparse.ArgumentParser(description="FP8 row-scale GEMM benchmark")
     parser.add_argument("-M", type=int, default=8192)
