@@ -28,6 +28,7 @@ from kernels.gemm.fp8_gemm_utils import (
     Mfma16x16x128,
     S2RLoader,
     StoreC,
+    StoreCTransposed,
     ceildiv,
     compute_global_swizzle,
     divmod,
@@ -185,6 +186,9 @@ def compile_fp8_gemm_4w(
     N_LDS_ROUNDS = max(N_TILES_A, N_TILES_B)
 
     _use_interleaved_block = BLOCK_M == 256 and BLOCK_N == 256
+    # Transposed epilogue: needs an even N_TILES_B, since it stores a pair of
+    # N-tiles per buffer_store_dwordx4. Small tiles keep the per-element path.
+    _swap_ab = N_TILES_B % 2 == 0
 
     a_lds_size = LDS_BLOCK_M * BLOCK_K
     b_lds_size = LDS_BLOCK_N * BLOCK_K
@@ -256,7 +260,7 @@ def compile_fp8_gemm_4w(
                 lds_swz.append(swz)
             return lds_swz
 
-        mfma = Mfma16x16x128AGPR(N_TILES_A, N_TILES_B)
+        mfma = Mfma16x16x128AGPR(N_TILES_A, N_TILES_B, swap_ab=_swap_ab)
 
         def _interleaved_cluster(
             lds_dst,
@@ -397,7 +401,8 @@ def compile_fp8_gemm_4w(
         else:
             a_s2r = LayoutS2R(wave_i, N_TILES_A)
             b_s2r = S2RLoader(wave_j, N_TILES_B) if b_preshuffled else LayoutS2R(wave_j, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        _store_cls = StoreCTransposed if const_expr(_swap_ab) else StoreC
+        store_c = _store_cls(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         # Prologue: 8-buffer LDS pipeline pre-fill.
         a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)

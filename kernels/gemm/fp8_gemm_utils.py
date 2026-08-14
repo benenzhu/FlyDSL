@@ -2,9 +2,11 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 
 import flydsl.expr as fx
+from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import llvm as _llvm
 from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl
+from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 
 # ceildiv is the canonical cdiv from the shared layer; re-exported here for the
@@ -198,6 +200,125 @@ class StoreC:
                     self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
 
 
+def _cvt_pk_bf16(a, b):
+    """Pack two f32 into 2xbf16 (i32), as ``arith.truncf <2xf32> -> <2xbf16>``.
+
+    Selects to the same single ``v_cvt_pk_bf16_f32`` on gfx950 as
+    ``rocdl.cvt_pk_bf16_f32``, but that helper is inline asm (ROCDL has no op
+    for this instruction), which plants an ASMSTART/ASMEND wall the machine
+    scheduler cannot move across -- 128 of them in the epilogue.
+    """
+    v2f32 = _ir.VectorType.get([2], fx.Float32.ir_type)
+    vec = Vec.from_elements([fx.Float32(a), fx.Float32(b)], fx.Float32)
+    src = fx.as_ir_value(vec)
+    if src.type != v2f32:
+        src = fx.arith.bitcast(v2f32, src)
+    v2bf16 = _ir.VectorType.get([2], fx.BFloat16.ir_type)
+    # llvm.bitcast, not arith.bitcast: the latter requires operand and result to
+    # have the same shape, and this one is <2xbf16> -> i32.
+    return _llvm.BitcastOp(fx.Int32.ir_type, fx.arith.trunc_f(v2bf16, src)).result
+
+
+def _permlane16_swap(d_a, d_b):
+    """Exchange the row-16 halves of two VGPRs between lane groups."""
+    pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
+    res = rocdl.permlane16_swap(pair_ty, fx.as_ir_value(d_a), fx.as_ir_value(d_b), False, False)
+    return _llvm.extractvalue(_T.i32, res, [0]), _llvm.extractvalue(_T.i32, res, [1])
+
+
+class StoreCTransposed:
+    """``StoreC`` for a kernel whose MFMAs are fed (B, A) instead of (A, B).
+
+    Since C^T = B^T A^T that swap transposes the accumulator: lane L holds
+    ``C[L%16, 4 consecutive cols]`` instead of ``C[4 consecutive rows, L%16]``.
+    The 4 values per accumulator are then CONTIGUOUS in memory, so a pair of
+    N-tiles can be permlane16_swap'd into 16 bytes per lane and written with one
+    ``buffer_store_dwordx4`` -- vs 4 separate ``buffer_store_short`` per
+    accumulator on the untransposed path.
+
+    The two scales swap roles to match: A's (per row) becomes a per-lane scalar,
+    B's (per col) becomes the 8 consecutive columns this lane ends up owning.
+
+    Requires ``n_tiles_b`` even (tiles are consumed in pairs).
+    """
+
+    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
+        assert n_tiles_b % 2 == 0, f"StoreCTransposed needs an even n_tiles_b, got {n_tiles_b}"
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+
+        c_nbytes = c_rows * c_cols * 2  # BFloat16 = 2 bytes
+        sa_nbytes = c_rows * 4  # Float32 row-wise scale
+        sb_nbytes = c_cols * 4  # Float32 col-wise scale
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=sa_nbytes)
+        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=sb_nbytes)
+        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+
+        self.scale_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        self.reg_f32_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+
+    def _load_a_scale(self, row):
+        """Transposed: A's scale is per ROW, and a lane owns ONE row -> scalar."""
+        fx.copy(self.scale_atom_1, fx.slice(self.sa_div, (None, fx.Int32(row))), self.reg_f32_1)
+        return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
+
+    def _load_b_scale_vec4(self, col):
+        """Transposed: B's scale is per COL, and a lane owns 4 consecutive cols."""
+        fx.copy(self.scale_atom_4, fx.slice(self.sb_div, (None, fx.Int32(col))), self.reg_f32_4)
+        return Vec(fx.memref_load_vec(self.reg_f32_4))
+
+    def _store_one(self, c_frag, base_row, base_col, ti, tj, a_scale, b_scales):
+        """One 16-byte store covering N-tiles ``tj`` and ``tj+1``."""
+        vec_lo = Vec(c_frag[self.c_idx_fn(ti, tj)])
+        vec_hi = Vec(c_frag[self.c_idx_fn(ti, tj + 1)])
+        sc_lo, sc_hi = b_scales[tj], b_scales[tj + 1]
+        lo = [(vec_lo[i] * (a_scale * sc_lo[i])) for i in range_constexpr(4)]
+        hi = [(vec_hi[i] * (a_scale * sc_hi[i])) for i in range_constexpr(4)]
+        a0 = _cvt_pk_bf16(lo[0], lo[1])
+        a1 = _cvt_pk_bf16(lo[2], lo[3])
+        b0 = _cvt_pk_bf16(hi[0], hi[1])
+        b1 = _cvt_pk_bf16(hi[2], hi[3])
+
+        # Swap halves between lane groups so each lane ends up with 8 consecutive
+        # columns (16 bytes) instead of two disjoint 4-column runs.
+        a0, b0 = _permlane16_swap(a0, b0)
+        a1, b1 = _permlane16_swap(a1, b1)
+
+        g = self.lane_id // 16
+        row = base_row + ti * 16 + self.lane_id % 16
+        col = base_col + (tj + g % 2) * 16 + (g // 2) * 8
+        pack = Vec.from_elements([fx.Int32(a0), fx.Int32(a1), fx.Int32(b0), fx.Int32(b1)], fx.Int32).bitcast(
+            fx.BFloat16
+        )
+        fx.memref_store_vec(pack, self.reg_bf16_8)
+        c_index = row * self.c_cols + col
+        fx.copy(self.out_atom_8, self.reg_bf16_8, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+
+    def store(self, c_frag, base_row, base_col):
+        # b_scales[tj] = the 4 columns tile tj contributes for this lane; the
+        # permlane16_swap below re-groups them, but the scale must be applied
+        # BEFORE the swap, while each value is still with its own column.
+        b_scales = [
+            self._load_b_scale_vec4(base_col + tj * 16 + (self.lane_id // 16) * 4)
+            for tj in range_constexpr(self.n_tiles_b)
+        ]
+        for ti in range_constexpr(self.n_tiles_a):
+            a_scale = self._load_a_scale(base_row + ti * 16 + self.lane_id % 16)
+            for tj in range_constexpr(0, self.n_tiles_b, 2):
+                self._store_one(c_frag, base_row, base_col, ti, tj, a_scale, b_scales)
+
+
 def wait_barrier(count):
     _llvm.inline_asm(
         res=None,
@@ -209,11 +330,16 @@ def wait_barrier(count):
 
 
 class Mfma16x16x128:
-    def __init__(self, n_tiles_a, n_tiles_b):
+    """``swap_ab`` feeds the MFMA (B, A) instead of (A, B). Since C^T = B^T A^T
+    that produces the transposed accumulator ``StoreCTransposed`` expects, whose
+    4 values per lane are contiguous in C and so store 16 bytes at a time."""
+
+    def __init__(self, n_tiles_a, n_tiles_b, swap_ab=False):
         self.atom = fx.make_mma_atom(fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN))
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
+        self.swap_ab = swap_ab
 
     def idx(self, i, j):
         return i * self.n_tiles_b + j
@@ -248,7 +374,10 @@ class Mfma16x16x128:
         for i in range_constexpr(self.n_tiles_a):
             for j in range_constexpr(self.n_tiles_b):
                 cf = c_frags[self.idx(i, j)]
-                fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
+                if const_expr(self.swap_ab):
+                    fx.gemm(self.atom, cf, b_frags[j], a_frags[i], cf)
+                else:
+                    fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
         if const_expr(set_prio):
             rocdl.s_setprio(0)
             rocdl.s_barrier()
@@ -257,4 +386,6 @@ class Mfma16x16x128:
     def call_one(self, a, b, c, i, j):
         assert i < self.n_tiles_a and j < self.n_tiles_b
 
+        if const_expr(self.swap_ab):
+            return self._do_mma(b[j], a[i], c[self.idx(i, j)])
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
