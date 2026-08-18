@@ -96,7 +96,7 @@ def mla(query,
                             + (k_step // 2) * 8 * 256 * 2
                         )
                         k = float2 * shared_KV[lane_offset + n_offset + k_offset] # TODO: offset not right.
-                        score_acc[n_sub] += mfma(q, k, score_acc[n_sub])
+                        score_acc[n_sub] += mfma(q, k)
 
             with thread(): # row_max? P=exp(S)
                 ...
