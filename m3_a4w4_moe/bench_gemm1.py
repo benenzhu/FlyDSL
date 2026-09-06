@@ -38,8 +38,10 @@ p.add_argument("--fake-dense", choices=["rows", "gather"], default=None,
                     "rows (pure kernel overhead vs the dense kernel); 'gather' = expert 0 everywhere but the real "
                     "gathered rows (isolates the A gather from expert switching); disables the check")
 p.add_argument("--wgm", type=int, default=4, help="m-tiles per XCD group in the block remap")
-p.add_argument("--kernel", choices=["2x2", "1x4"], default="2x2",
-               help="2x2 = gemm1.py (4-wave 2x2 quadrants); 1x4 = gemm1_1x4.py (Kimi v36 port, BM128 only)")
+p.add_argument("--kernel", choices=["2x2", "1x4", "persist"], default="2x2",
+               help="2x2 = gemm1.py (4-wave 2x2 quadrants); 1x4 = gemm1_1x4.py (Kimi v36 port, BM128 only); "
+                    "persist = gemm1_persist.py (2x2, one CTA per CU, cross-block pipelined)")
+p.add_argument("--ctas", type=int, default=256, help="persist: number of CTAs (multiple of 8)")
 p.add_argument("--order", choices=["expert", "xcd"], default="expert",
                help="block order: expert = host tile_map, n-slab-major per expert (default); xcd = dense-style WGM groups")
 args = p.parse_args()
@@ -47,6 +49,7 @@ args = p.parse_args()
 import flydsl.compiler as flyc  # noqa: E402
 from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
 from m3_a4w4_moe.gemm1_1x4 import compile_moe_gemm1_1x4, ptr_arg  # noqa: E402
+from m3_a4w4_moe.gemm1_persist import compile_moe_gemm1_persist  # noqa: E402
 
 import aiter  # noqa: E402,F401
 from aiter import dtypes  # noqa: E402
@@ -128,7 +131,8 @@ def build_tile_map(sorted_eids, num_valid, num_m_blocks):
     val = (m_idx[:, None] << 3) | n[None, :]
     tm = torch.full((grid + 1,), -1, dtype=torch.long, device=dev)
     tm.scatter_(0, idx.reshape(-1), val.reshape(-1))
-    return tm[:grid].to(torch.int32).contiguous(), grid
+    tm[grid] = valid_m.sum() * NB_N  # valid entries are [0, n_valid); the persistent kernel reads this
+    return tm.to(torch.int32).contiguous(), grid
 
 
 class Case:
@@ -144,6 +148,7 @@ class Case:
             self.sorted_eids = torch.zeros_like(self.sorted_eids)
         self.num_m_blocks = int(self.sorted_eids.shape[0])
         self.tile_map, self.grid = build_tile_map(self.sorted_eids, self.num_valid, self.num_m_blocks)
+        self.dbg = torch.zeros(args.ctas, dtype=torch.int32, device=dev)  # persist: progress markers (debug)
         rows = self.num_m_blocks * BM
         self.out_q = torch.empty((rows, I // 2), dtype=torch.uint8, device=dev)
         self.out_s = torch.empty((rows * (I // 32),), dtype=torch.uint8, device=dev)
@@ -165,7 +170,7 @@ class Case:
             self.tile_map,
             self.grid,
             torch.cuda.current_stream(),
-        )
+        ) + ((ptr_arg(self.dbg),) if args.kernel == "persist" else ())
 
     def args_1x4(self):
         def pa(t):
@@ -209,8 +214,12 @@ if args.kernel == "1x4":
     def call(case):
         launch_1x4(*case.args_1x4())
 else:
-    launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
-                               tile_map=args.order == "expert")
+    if args.kernel == "persist":
+        assert args.order == "expert"
+        launch = compile_moe_gemm1_persist(H=H, I=I, E=E, BLOCK_M=BM, n_cta=args.ctas)
+    else:
+        launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
+                                   tile_map=args.order == "expert")
     fn = flyc.compile(launch, *c0.args())
 
     def call(case):
