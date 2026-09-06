@@ -85,7 +85,6 @@ _NUM_XCDS = 8
 import os as _os
 
 _NO_EPI = _os.environ.get("M3_G2_NO_EPI", "0") == "1"  # skip the epilogue entirely (no stores)
-_STORE_MASK = _os.environ.get("M3_G2_STORE_MASK", "0") == "1"  # issue the stores but all lanes out of range
 
 
 class _MfmaAgprA(Mfma16x16x128Fp4):
@@ -138,6 +137,43 @@ def _e8m0_fp8(amax):
     inside e4m3 (max 448) with one bit of headroom, never saturates."""
     e = (_bits(amax) >> 23) - fx.Int32(7)
     return fx.arith.select(e > fx.Int32(0), e, fx.Int32(0))
+
+
+def _fabs(v):
+    return _intrin_f32("llvm.fabs.f32", [v])
+
+
+def _maxf(a, b):
+    """v_max_f32 (arith.maxnumf), not the select-based gemm1 helper"""
+    return fx.Float32(fx.arith.maxnumf(fx.as_ir_value(a), fx.as_ir_value(b)))
+
+
+def _permlane32_swap(d_a, d_b):
+    pair_ty = _ir.Type.parse("!llvm.struct<(i32, i32)>")
+    res = _rocdl.permlane32_swap(pair_ty, fx.as_ir_value(d_a), fx.as_ir_value(d_b), False, False)
+    return fx.Int32(_llvm.extractvalue(_T.i32, res, [0])), fx.Int32(_llvm.extractvalue(_T.i32, res, [1]))
+
+
+def _xlane_max4(x):
+    """max over the 4 lanes {L, L^16, L^32, L^48} (one row's 4 column groups), in every lane.
+    permlane32_swap(x, x) yields [lo, lo] / [hi, hi]; permlane16_swap(y, y) yields
+    [r0, r0, r2, r2] / [r1, r1, r3, r3]; a max after each gives the butterfly."""
+    xi = _bits(x)
+    a, b = _permlane32_swap(xi, xi)
+    m = _maxf(_as_f32(a), _as_f32(b))
+    mi = _bits(m)
+    a, b = _permlane16_swap(mi, mi)
+    return _maxf(_as_f32(a), _as_f32(b))
+
+
+def _pin_vec4(v):
+    """Route an accumulator through a side-effecting no-op asm with a VGPR operand.
+    The AGPR -> VGPR copies feeding an inline-asm operand are glued to the asm, so they
+    are emitted where the asm sits in the (ordered) asm stream instead of being hoisted
+    by the SelectionDAG scheduler to right behind the MFMA that produced the value
+    (which the compiler cannot see as an MFMA -> no hazard wait states)."""
+    ty = Vec.make_type(4, fx.Float32)
+    return _llvm.inline_asm(ty, [fx.as_ir_value(v)], "; pin $0", "=v,0", has_side_effects=True)
 
 
 def _v2i32(a, b):
@@ -410,50 +446,60 @@ def compile_moe_gemm2(
                     sc_off[h][ti] = orow * fx.Int32(OUT_SC_COLS)
             g_is0 = g4 == fx.Int32(0)
 
-            def _epilogue(accs, nt):
+            # ---- epilogue pieces, interleaved into the MFMA shadow ----
+            def _epi_group(cq, h, hb, ti, p, nt, mask):
+                """one 32-col group of one 16-row tile: amax over the row's 4 lanes, e8m0,
+                8 fp8, dwordx2 store. Returns the e8m0 (i32)."""
+                cv = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p)]))
+                cw = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p + 1)]))
+                v = [fx.Float32(cv[k]) for k in range_constexpr(4)] + [fx.Float32(cw[k]) for k in range_constexpr(4)]
+                amax = _fabs(v[0])
+                for k in range_constexpr(1, 8):
+                    amax = _maxf(amax, _fabs(v[k]))
+                amax = _xlane_max4(amax)
+                e8 = _e8m0_fp8(amax)
+                sf = _as_f32(e8 << 23)
+                da = _cvt_pk_fp8(fx.Int32(0), v[0], v[1], sf, False)
+                da = _cvt_pk_fp8(da, v[2], v[3], sf, True)
+                db = _cvt_pk_fp8(fx.Int32(0), v[4], v[5], sf, False)
+                db = _cvt_pk_fp8(db, v[6], v[7], sf, True)
+                da, db = _permlane16_swap(da, db)
+                # lane group g now holds tile (2p + g%2), cols (g//2)*8 .. +8
+                col = (chunk_n0 + nt) * fx.Int32(BN) + wave_j * 128 + hb * 64 + (2 * p + (g4 % 2)) * 16 + (g4 // 2) * 8
+                _buffer_ops.buffer_store(_v2i32(da, db), out_rsrc, out_off[h][ti] + col, mask=mask, offset_is_bytes=True)
+                return e8
+
+            def _epi_scale(h, ti, e4, nt, mask):
+                """the row's 4 scale bytes of this wave's 128 columns -> one dword (lanes g==0)"""
+                packed = e4[0] | (e4[1] << 8) | (e4[2] << 16) | (e4[3] << 24)
+                sc_col = (chunk_n0 + nt) * fx.Int32(BN // 32) + wave_j * 4
+                m = g_is0 if mask is None else (g_is0 & mask)
+                _buffer_ops.buffer_store(packed, osc_rsrc, sc_off[h][ti] + sc_col, mask=fx.as_ir_value(m), offset_is_bytes=True)
+
+            def _group_thunks(cq, h, hb, nt, hold, mask=None):
+                ts = []
                 if const_expr(_NO_EPI):
-                    return
-                c00, c01, c10, c11 = accs
-                st_mask = fx.as_ir_value(lane_id < fx.Int32(0)) if const_expr(_STORE_MASK) else None
-                cq = ((c00, c01), (c10, c11))  # [A half][B half]
-                col_wave = (chunk_n0 + nt) * fx.Int32(BN) + wave_j * 128
-                for h in range_constexpr(2):
-                    for ti in range_constexpr(N_TILES_A):
-                        e_list = []
-                        for hb in range_constexpr(2):
-                            for p in range_constexpr(NB // 2):
-                                cv = Vec(cq[h][hb][mfma.idx(ti, 2 * p)])
-                                cw = Vec(cq[h][hb][mfma.idx(ti, 2 * p + 1)])
-                                v = [fx.Float32(cv[k]) for k in range_constexpr(4)] + [
-                                    fx.Float32(cw[k]) for k in range_constexpr(4)
-                                ]
-                                amax = _intrin_f32("llvm.fabs.f32", [v[0]])
-                                for k in range_constexpr(1, 8):
-                                    amax = _fmax(amax, _intrin_f32("llvm.fabs.f32", [v[k]]))
-                                amax = _fmax(amax, amax.shuffle_xor(16, 64))
-                                amax = _fmax(amax, amax.shuffle_xor(32, 64))
-                                e8 = _e8m0_fp8(amax)
-                                e_list.append(e8)
-                                sf = _as_f32(e8 << 23)
-                                da = _cvt_pk_fp8(fx.Int32(0), v[0], v[1], sf, False)
-                                da = _cvt_pk_fp8(da, v[2], v[3], sf, True)
-                                db = _cvt_pk_fp8(fx.Int32(0), v[4], v[5], sf, False)
-                                db = _cvt_pk_fp8(db, v[6], v[7], sf, True)
-                                da, db = _permlane16_swap(da, db)
-                                # lane group g now holds tile (2p + g%2), cols (g//2)*8 .. +8
-                                col = col_wave + hb * 64 + (2 * p + (g4 % 2)) * 16 + (g4 // 2) * 8
-                                _buffer_ops.buffer_store(
-                                    _v2i32(da, db), out_rsrc, out_off[h][ti] + col, mask=st_mask, offset_is_bytes=True
-                                )
-                        packed = e_list[0] | (e_list[1] << 8) | (e_list[2] << 16) | (e_list[3] << 24)
-                        sc_col = (chunk_n0 + nt) * fx.Int32(BN // 32) + wave_j * 4
-                        _buffer_ops.buffer_store(
-                            packed,
-                            osc_rsrc,
-                            sc_off[h][ti] + sc_col,
-                            mask=st_mask if const_expr(_STORE_MASK) else fx.as_ir_value(g_is0),
-                            offset_is_bytes=True,
-                        )
+                    return ts
+                for ti in range_constexpr(N_TILES_A):
+                    for p in range_constexpr(NB // 2):
+
+                        def t(ti=ti, p=p):
+                            hold[(hb, ti, p)] = _epi_group(cq, h, hb, ti, p, nt, mask)
+
+                        ts.append(t)
+                return ts
+
+            def _scale_thunks(h, nt, hold, mask=None):
+                ts = []
+                if const_expr(_NO_EPI):
+                    return ts
+                for ti in range_constexpr(N_TILES_A):
+
+                    def t(ti=ti):
+                        _epi_scale(h, ti, [hold[(0, ti, 0)], hold[(0, ti, 1)], hold[(1, ti, 0)], hold[(1, ti, 1)]], nt, mask)
+
+                    ts.append(t)
+                return ts
 
             def _wb2(first, c_first, c_other):
                 """``first`` is a Python bool (static) or a wave-uniform DSL bool"""
@@ -467,8 +513,27 @@ def compile_moe_gemm2(
                     else:
                         wait_barrier(c_other)
 
-            def _one_step(nt, nt_next, n_par, kb, first, b0f, b1f, sc, accs):
-                """flat step s = (nt, kb); B(s) in set (n_par+kb)%2; issues B(s+2), scales(s+3)."""
+            # vmcnt allowances (loads AND stores retire in issue order). Per step the loads are
+            # b0 (NB) in phase 1, b1 (NB) + gather (NG) in phase 3; the last K-step of a tile
+            # also stores c00 (4) in phase 2, c01 (4) + h0 scales (2) in phase 3, c10 (4) in
+            # phase 4, and the next tile's first step stores c11 (4) + h1 scales (2) in phase 1.
+            ST_A, ST_B, ST_C = 4, 4 + 2, 4  # phase 2 / 3 / 4 stores of a last step
+            ST_P = 4 + 2  # pending stores in phase 1 of a first step
+            TOP0 = P_STEP + ST_A + ST_B + ST_C  # 24
+            SEG0 = NG + ST_B + ST_C + NB + ST_P  # 22
+            TOP1 = ST_B + ST_C + P_STEP + ST_P  # 26
+            SEG1 = NG + NB  # 6
+            TOP2 = P_STEP  # 10
+            SEG2L = NG + NB + ST_A  # 10
+            TOP0_F, SEG0_F, TOP1_F = P_STEP, NG + NB + ST_P, P_STEP + ST_P  # first tile (prologue order)
+            for c in (TOP0, SEG0, TOP1, SEG1, TOP2, SEG2L, TOP0_F, SEG0_F, TOP1_F):
+                assert c <= 63, c
+
+            def _one_step(nt, nt_next, n_par, kb, first, b0f, b1f, sc, accs, pend):
+                """flat step s = (nt, kb); B(s) in set (n_par+kb)%2; issues B(s+2), scales(s+3).
+                ``pend`` (kb == 0 only): thunks of the previous tile's c11 epilogue for phase 1.
+                Returns (b0n, b1n, sc_next, accs, hold) with hold = e8m0 of this step's groups
+                (kb == 2 only)."""
                 s_par = (n_par + kb) % 2
                 bc0, bc1 = b_buf(s_par, 0), b_buf(s_par, 1)
                 bn0, bn1 = b_buf(1 - s_par, 0), b_buf(1 - s_par, 1)
@@ -480,34 +545,43 @@ def compile_moe_gemm2(
                 c00, c01, c10, c11 = accs
                 a0f, a1f = aF[kb][0], aF[kb][1]
                 zero = kb == 0
-                after_epi = kb == 0  # stores were issued between step s-1 and s (except n-tile 0)
+                last = kb == K_ITERS - 1
+                hold = {}
 
                 _scn = [None] * 4
                 rd_scn = _read_bsc_thunks(nt1, kb1, _scn)
                 b_off2 = _b_soff(nt2, kb2)
 
                 # top: everything issued at step s-2 landed (B(s), scales(s+1))
-                if kb == 2:
-                    wait_barrier(P_STEP)
+                if kb == 0:
+                    _wb2(first, TOP0_F, TOP0)
+                elif kb == 1:
+                    _wb2(first, TOP1_F, TOP1)
                 else:
-                    _wb2(first, P_STEP, P_STEP + ST)
-                il = _riffle(_g2s_thunks(b0_g2s, bc0, b_off2, NB), rd_scn[:2])
-                c00 = mfma.call(a0f, b0f, c00, [saA[0][kb]], sbC0, interleave=il, zero_acc=zero)
-                c01 = mfma.call(a0f, b1f, c01, [saA[0][kb]], sbC1, interleave=rd_scn[2:], zero_acc=zero)
+                    wait_barrier(TOP2)
+                il = _g2s_thunks(b0_g2s, bc0, b_off2, NB) + rd_scn[:2]
+                c00 = mfma.call(a0f, b0f, c00, [saA[0][kb]], sbC0, interleave=il, zero_acc=zero,
+                                late=(pend if kb == 0 else None))
+                c01 = mfma.call(a0f, b1f, c01, [saA[0][kb]], sbC1, interleave=rd_scn[2:], zero_acc=zero,
+                                late=(_group_thunks(c00, 0, 0, nt, hold) if last else None))
 
-                # SEG2: B(s+1) landed (issued at s-1); scales(s+2) + b0(s+2) may fly
-                if after_epi:
-                    _wb2(first, SEG2, SEG2 + ST)
+                # SEG2: B(s+1) landed (issued at s-1)
+                if kb == 0:
+                    _wb2(first, SEG0_F, SEG0)
+                elif kb == 1:
+                    wait_barrier(SEG1)
                 else:
-                    wait_barrier(SEG2)
+                    wait_barrier(SEG2L)
                 _b0n = [None] * NB
                 _b1n = [None] * NB
                 # the gather sets m0 too: it must follow the whole m0-relative DMA sequence
                 il = _g2s_thunks(b1_g2s, bc1, b_off2, NB) + [lambda: _gather(nt_next, kb)]
-                c10 = mfma.call(a1f, b0f, c10, [saA[1][kb]], sbC0, interleave=il, zero_acc=zero)
+                late = (_group_thunks(c01, 0, 1, nt, hold) + _scale_thunks(0, nt, hold)) if last else None
+                c10 = mfma.call(a1f, b0f, c10, [saA[1][kb]], sbC0, interleave=il, zero_acc=zero, late=late)
                 il = _s2r_thunks(b_s2r, bn0, _b0n, NB, True) + _s2r_thunks(b_s2r, bn1, _b1n, NB, True)
-                c11 = mfma.call(a1f, b1f, c11, [saA[1][kb]], sbC1, interleave=il, zero_acc=zero)
-                return _b0n, _b1n, (_scn[:2], _scn[2:]), (c00, c01, c10, c11)
+                late = _group_thunks(c10, 1, 0, nt, hold) if last else None
+                c11 = mfma.call(a1f, b1f, c11, [saA[1][kb]], sbC1, interleave=il, zero_acc=zero, late=late)
+                return _b0n, _b1n, (_scn[:2], _scn[2:]), (c00, c01, c10, c11), hold
 
             _R = fx.as_ir_value
 
@@ -517,33 +591,62 @@ def compile_moe_gemm2(
             def _unflat_b(flat):
                 return [[flat[i], flat[NB + i]] for i in range(NB)]
 
-            def _flat_state(b0f, b1f, sc):
-                return _flat_b(b0f) + _flat_b(b1f) + [_R(v) for v in sc[0]] + [_R(v) for v in sc[1]]
+            def _flat_state(b0f, b1f, sc, c11, e10):
+                return (
+                    _flat_b(b0f) + _flat_b(b1f) + [_R(v) for v in sc[0]] + [_R(v) for v in sc[1]]
+                    + [_R(v) for v in c11] + [_R(v) for v in e10]
+                )
 
             def _unflat_state(st):
-                b0f = _unflat_b(st[0 : 2 * NB])
-                b1f = _unflat_b(st[2 * NB : 4 * NB])
-                sc = (list(st[4 * NB : 4 * NB + 2]), list(st[4 * NB + 2 : 4 * NB + 4]))
-                return b0f, b1f, sc
+                o = 0
+                b0f = _unflat_b(st[o : o + 2 * NB])
+                o += 2 * NB
+                b1f = _unflat_b(st[o : o + 2 * NB])
+                o += 2 * NB
+                sc = (list(st[o : o + 2]), list(st[o + 2 : o + 4]))
+                o += 4
+                c11 = list(st[o : o + N_ACCUMS])
+                o += N_ACCUMS
+                e10 = [fx.Int32(v) for v in st[o : o + 4]]
+                return b0f, b1f, sc, c11, e10
 
-            def _n_tile(nt, nt_next, n_par, first, b0f, b1f, sc):
+            def _pending_thunks(c11_prev, e10_prev, nt_prev, mask):
+                """previous tile's c11 groups + its h=1 scale dwords"""
+                hold = {(0, ti, p): e10_prev[2 * ti + p] for ti in range(N_TILES_A) for p in range(NB // 2)}
+                return _group_thunks(c11_prev, 1, 1, nt_prev, hold, mask) + _scale_thunks(1, nt_prev, hold, mask)
+
+            def _n_tile(nt, nt_next, n_par, first, b0f, b1f, sc, pend):
                 accs = tuple([None] * N_ACCUMS for _ in range(4))
+                hold = {}
                 for kb in range_constexpr(K_ITERS):
-                    b0f, b1f, sc, accs = _one_step(nt, nt_next, n_par, kb, first, b0f, b1f, sc, accs)
-                _epilogue(accs, nt)
-                return b0f, b1f, sc
+                    b0f, b1f, sc, accs, h = _one_step(nt, nt_next, n_par, kb, first, b0f, b1f, sc, accs, pend)
+                    hold.update(h)
+                e10 = [hold.get((0, ti, p), fx.Int32(0)) for ti in range(N_TILES_A) for p in range(NB // 2)]
+                return b0f, b1f, sc, accs[3], e10
 
-            init_state = _flat_state(b0f, b1f, (_sc0[:2], _sc0[2:]))
+            zero_v4 = _arith.ConstantOp(
+                mfma.res_ty, _ir.DenseElementsAttr.get_splat(mfma.res_ty, _ir.FloatAttr.get(_T.f32, 0.0))
+            ).result
+            init_state = _flat_state(
+                b0f, b1f, (_sc0[:2], _sc0[2:]), [zero_v4] * N_ACCUMS, [fx.Int32(0)] * 4
+            )
             for np_, state in range(0, NT // 2, init=init_state):
-                b0f, b1f, sc = _unflat_state(state)
+                b0f, b1f, sc, c11p, e10p = _unflat_state(state)
                 np_i = fx.Int32(np_)
                 first = np_i == fx.Int32(0)
                 nt_e = np_i * fx.Int32(2)
                 nt_o = nt_e + fx.Int32(1)
                 nt_o_next = _min(nt_e + fx.Int32(2), fx.Int32(NT - 1))  # last pair: redundant reloads
-                b0f, b1f, sc = _n_tile(nt_e, nt_o, 0, first, b0f, b1f, sc)
-                b0f, b1f, sc = _n_tile(nt_o, nt_o_next, 1, False, b0f, b1f, sc)
-                state = yield _flat_state(b0f, b1f, sc)
+                pend = _pending_thunks(c11p, e10p, nt_e - fx.Int32(1), np_i > fx.Int32(0))
+                b0f, b1f, sc, c11e, e10e = _n_tile(nt_e, nt_o, 0, first, b0f, b1f, sc, pend)
+                pend = _pending_thunks(c11e, e10e, nt_e, None)
+                b0f, b1f, sc, c11o, e10o = _n_tile(nt_o, nt_o_next, 1, False, b0f, b1f, sc, pend)
+                state = yield _flat_state(b0f, b1f, sc, c11o, e10o)
+
+            # the last tile's c11 epilogue has no next step to hide in
+            b0f, b1f, sc, c11p, e10p = _unflat_state(state)
+            for t in _pending_thunks(c11p, e10p, fx.Int32(NT - 1), None):
+                t()
 
             # never retire with LDS DMA in flight (the CU reuses the LDS)
             wait_barrier(0)

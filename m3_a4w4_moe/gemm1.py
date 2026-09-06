@@ -325,13 +325,22 @@ class Mfma16x16x128Fp4:
                 order += [(i0 + di, j0 + dj) for di in range(2) for dj in range(2)]
         return order
 
-    def call(self, a, b, c, sa, sb, interleave=None, zero_acc=False):
+    def call(self, a, b, c, sa, sb, interleave=None, zero_acc=False, late=None, late_start=8):
+        """``interleave``: thunks spread evenly over the MFMAs (loads, LDS reads).
+        ``late``: thunks spread over the MFMAs from ``late_start`` on -- for work that
+        reads accumulators finished by the previous call: the MFMAs are inline asm, so the
+        compiler inserts no MFMA -> v_accvgpr_read hazard waits; 8 MFMAs (128+ cycles)
+        cover the last one's latency."""
         thunks = list(interleave) if interleave else []
+        lates = list(late) if late else []
         nth = [0]
+        nlt = [0]
         mth = [0]
         order = self._order()
         n_mfma = _FP4_PACK * len(order)
         slots = {(t * n_mfma) // len(thunks) for t in range(len(thunks))} if thunks else set()
+        n_late_slots = max(n_mfma - late_start, 1)
+        lslots = {late_start + (t * n_late_slots) // len(lates) for t in range(len(lates))} if lates else set()
         for ksub in range_constexpr(_FP4_PACK):
             for i, j in order:
                 a_op = a[i][ksub]
@@ -347,10 +356,16 @@ class Mfma16x16x128Fp4:
                 if nth[0] < len(thunks) and mth[0] in slots:
                     thunks[nth[0]]()
                     nth[0] += 1
+                if nlt[0] < len(lates) and mth[0] in lslots:
+                    lates[nlt[0]]()
+                    nlt[0] += 1
                 mth[0] += 1
         while nth[0] < len(thunks):
             thunks[nth[0]]()
             nth[0] += 1
+        while nlt[0] < len(lates):
+            lates[nlt[0]]()
+            nlt[0] += 1
         return c
 
     def _mfma_agpr(self, a_op, b_op, acc, sa_v, sb_v, ksub, ia, jb):
