@@ -696,11 +696,23 @@ def compile_moe_gemm1(
         ids_rsrc = _buffer_ops.create_buffer_resource(sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BLOCK_M * 4))
         eid_rsrc = _buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4)
         if const_expr(tile_map):
-            # contiguous chunk of the table per XCD (grid_size % 8 == 0)
+            # The table's valid entries are [0, n_valid) with n_valid stored at
+            # tile_map[grid_size]. Split THOSE evenly over the 8 XCDs (block id b
+            # runs on XCD b % 8): with the whole allocation split instead, the
+            # last XCD(s) got only idle entries at every size (4096 tokens: 2 of 8
+            # XCDs idle, 8192: 1.5, 32768: 0.35).
             intra_xcd, xcd = _divmod_nonneg(fx.block_idx.x, 8)
-            remapped = xcd * (grid_size // 8) + intra_xcd
-            tm_rsrc = _buffer_ops.create_buffer_resource(tile_map_t, max_size=False, num_records_bytes=grid_size * 4)
-            entry = fx.Int32(_buffer_ops.buffer_load(tm_rsrc, remapped, vec_width=1, dtype=fx.Int32))
+            tm_rsrc = _buffer_ops.create_buffer_resource(tile_map_t, max_size=False, num_records_bytes=(grid_size + 1) * 4)
+            n_valid = fx.Int32(_buffer_ops.buffer_load(tm_rsrc, grid_size, vec_width=1, dtype=fx.Int32, is_scalar=True))
+            per_xcd = (n_valid + fx.Int32(7)) // fx.Int32(8)
+            remapped = xcd * per_xcd + intra_xcd
+            in_chunk = (intra_xcd < per_xcd) & (remapped < n_valid)
+            entry = fx.Int32(
+                _buffer_ops.buffer_load(
+                    tm_rsrc, fx.arith.select(in_chunk, remapped, fx.Int32(0)), vec_width=1, dtype=fx.Int32
+                )
+            )
+            entry = fx.arith.select(in_chunk, entry, fx.Int32(-1))
             tile_i = entry >> 3
             tile_j = entry & 7
             block_valid = entry >= 0

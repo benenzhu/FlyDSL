@@ -30,6 +30,8 @@ p.add_argument("--inter", type=int, default=768)
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--n-split", type=int, default=2)
+p.add_argument("--bm", type=int, choices=[128, 256], default=128,
+               help="sort block size: gemm1 tile rows (256 = fewer W13 bytes per FLOP, more padding); gemm2 stays 128-row tiles")
 p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
@@ -63,7 +65,7 @@ from aiter.utility import fp4_utils  # noqa: E402
 torch.manual_seed(args.seed)
 dev = "cuda"
 M, H, I, E, K = args.tokens, args.hidden, args.inter, args.experts, args.topk
-BM = 128
+BM = args.bm
 fp4 = torch.float4_e2m1fn_x2
 
 
@@ -122,7 +124,7 @@ launch_sort = compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.sort_ctas
 launch_tm = compile_tile_map(I=I, BM=BM)
 fn_tm = None
 launch1 = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM)
-launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out)
+launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out, sort_block_m=BM)
 launch_r = compile_moe_reduce_fp8(H=H, topk=K) if args.out == "fp8" else None
 fn1 = fn2 = fnr = None
 
@@ -134,12 +136,13 @@ class Case:
         self.bufs = SortBuffers.allocate(M, E, K, BM, args.sort_ctas, dev)
         self.num_m_blocks = self.bufs.max_sorted // BM
         rows = self.num_m_blocks * BM
+        self.num_m_blocks2 = rows // 128  # gemm2 tiles are always 128 rows
         self.h_q = torch.zeros((rows, I // 2), dtype=torch.uint8, device=dev)
         self.h_s = torch.zeros((rows * (I // 32),), dtype=torch.uint8, device=dev)
         self.out = torch.zeros((M * K, H), dtype=torch.uint8 if args.out == "fp8" else torch.bfloat16, device=dev)
         self.out_s = torch.zeros((M * K, H // 32), dtype=torch.uint8, device=dev)
         self.y = torch.zeros((M, H), dtype=torch.bfloat16, device=dev)
-        self.grid2 = gemm2_grid(self.num_m_blocks, args.n_split)
+        self.grid2 = gemm2_grid(self.num_m_blocks2, args.n_split)
         self.grid1 = tile_map_grid(self.num_m_blocks, I)
         self.tile_map = torch.empty((self.grid1 + 1,), dtype=torch.int32, device=dev)
         # run once eagerly (compiles on first use)
@@ -213,7 +216,7 @@ class Case:
             b.sorted_weights,
             b.num_valid_ids,
             M,
-            self.num_m_blocks,
+            self.num_m_blocks2,
             self.grid2,
             torch.cuda.current_stream(),
         )

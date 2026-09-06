@@ -305,12 +305,18 @@ def compile_moe_gemm2(
     topk: int,
     n_split: int = 2,
     out_dtype: str = "bf16",
+    sort_block_m: int = 128,
 ):
     """fp4 grouped down-projection with token-major output (see the module doc).
-    Sorted inputs must come from a block_m = 128 sort."""
+    The CTA tile is always 128 sorted rows; ``sort_block_m`` (128 or 256) is the
+    block size of the sort that produced the rows: with 256, ``sorted_expert_ids``
+    has one entry per 256 rows (index ``tile_i >> 1``) and a 128-row tile that
+    starts with a padding sentinel is all padding and is skipped."""
     assert out_dtype in ("bf16", "fp8"), out_dtype
     FP8 = out_dtype == "fp8"
     BM = 128
+    assert sort_block_m in (128, 256), sort_block_m
+    EID_SHIFT = (sort_block_m // BM).bit_length() - 1  # 0 or 1
     BN = 256
     K = I
     K_BYTES = K // 2
@@ -418,7 +424,15 @@ def compile_moe_gemm2(
         tile_i, chunk = _divmod_nonneg(work_safe, n_split)
         m_base = tile_i * BM
         eid_rsrc = _buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4)
-        expert = fx.Int32(_buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32, is_scalar=True))
+        expert = fx.Int32(
+            _buffer_ops.buffer_load(eid_rsrc, tile_i >> EID_SHIFT, vec_width=1, dtype=fx.Int32, is_scalar=True)
+        )
+        if const_expr(EID_SHIFT > 0):
+            # a 256-sort pads each expert to 256 rows: a 128-row tile whose first
+            # row is the sentinel (tok == n_tokens) holds nothing to compute
+            ids_pre = _buffer_ops.create_buffer_resource(sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BM * 4))
+            first_sid = fx.Int32(_buffer_ops.buffer_load(ids_pre, m_base, vec_width=1, dtype=fx.Int32, is_scalar=True))
+            block_valid = block_valid & ((first_sid & fx.Int32(0x00FFFFFF)) < n_tokens)
         chunk_n0 = chunk * NT  # first n-tile (global index) of this CTA
         # ---- rotated n-tile sweep (32768 tokens: 830 -> 669 us) ----
         # The m-tiles of one expert run concurrently on one XCD. Sweeping the n-tiles
@@ -437,12 +451,12 @@ def compile_moe_gemm2(
         _hi_ok = tile_i + _d < num_m_blocks
         _e_lo = fx.Int32(
             _buffer_ops.buffer_load(
-                eid_rsrc, fx.arith.select(_lo_ok, tile_i - _d, fx.Int32(0)), vec_width=1, dtype=fx.Int32, is_scalar=True
+                eid_rsrc, fx.arith.select(_lo_ok, tile_i - _d, fx.Int32(0)) >> EID_SHIFT, vec_width=1, dtype=fx.Int32, is_scalar=True
             )
         )
         _e_hi = fx.Int32(
             _buffer_ops.buffer_load(
-                eid_rsrc, fx.arith.select(_hi_ok, tile_i + _d, fx.Int32(0)), vec_width=1, dtype=fx.Int32, is_scalar=True
+                eid_rsrc, fx.arith.select(_hi_ok, tile_i + _d, fx.Int32(0)) >> EID_SHIFT, vec_width=1, dtype=fx.Int32, is_scalar=True
             )
         )
         rot_on = (_lo_ok & (_e_lo == expert)) | (_hi_ok & (_e_hi == expert))
