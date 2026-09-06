@@ -1,14 +1,16 @@
 """Correctness + timing of ``m3_a4w4_moe.gemm2`` (MiniMax-M3 prefill MoE stage 2,
-mxfp8 token-major output).
+token-major output; ``--out bf16`` = production layout bf16(y * w), ``--out fp8`` =
+mxfp8 route-out).
 
     PYTHONPATH=/flydsl python /flydsl/m3_a4w4_moe/bench_gemm2.py --tokens 16384
 
 Inputs: the production prologue (aiter ``moe_sorting`` + fused fp4 quant) and
 ``gemm1.py`` (bit-exact with production stage 1) produce the sorted fp4 A tile;
 W2 is random bf16 -> mxfp4 in the production preshuffled layouts.
-Check: sampled valid rows against an fp32 reference from the dequantised fp4
-inputs (error = the mxfp8 output quantisation, ~2.6 % rel), and against the
-same reference quantised in torch with the kernel's e8m0 rule (byte-level).
+Check (sampled valid rows, fp32 reference from the dequantised fp4 inputs):
+bf16 mode counts the rows / values bit-identical to ``bf16(ref * w)`` (differences
+are fp32 summation order only); fp8 mode compares bytes against the same
+reference quantised in torch with the kernel's e8m0 rule.
 Timing: HIP graph of ``--copies`` calls with different inputs.
 """
 
@@ -25,6 +27,7 @@ p.add_argument("--inter", type=int, default=768)
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--n-split", type=int, default=2, help="CTAs per m-tile (1, 2, 4, 6, 12)")
+p.add_argument("--out", choices=["bf16", "fp8"], default="bf16", help="gemm2 output mode")
 p.add_argument("--copies", type=int, default=8)
 p.add_argument("--reps", type=int, default=20)
 p.add_argument("--rounds", type=int, default=5)
@@ -149,8 +152,11 @@ class Case:
         if fn1 is None:
             fn1 = flyc.compile(launch1, *a1)
         fn1(*a1)
-        # gemm2 output (token-major); sentinel 0x7F (e4m3 NaN) to detect unwritten rows
-        self.out = torch.full((M * K, H), 0x7F, dtype=torch.uint8, device=dev)
+        # gemm2 output (token-major); NaN sentinel to detect unwritten rows
+        if args.out == "fp8":
+            self.out = torch.full((M * K, H), 0x7F, dtype=torch.uint8, device=dev)  # e4m3 NaN
+        else:
+            self.out = torch.full((M * K, H), float("nan"), dtype=torch.bfloat16, device=dev)
         self.out_s = torch.zeros((M * K, H // 32), dtype=torch.uint8, device=dev)
         self.grid2 = gemm2_grid(self.num_m_blocks, args.n_split)
 
@@ -164,6 +170,7 @@ class Case:
             self.out_s.view(-1),
             self.sorted_ids.contiguous(),
             self.sorted_eids.contiguous(),
+            self.sorted_w.contiguous(),
             self.num_valid.contiguous(),
             M,
             self.num_m_blocks,
@@ -184,7 +191,7 @@ print(
 )
 
 t0 = time.time()
-launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split)
+launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out)
 fn2 = flyc.compile(launch2, *c0.args())
 print(f"[gemm2] compile {time.time() - t0:.1f}s", flush=True)
 fn2(*c0.args())
@@ -196,7 +203,8 @@ if args.check_rows > 0:
     slot = (sid >> 24).long()
     real = tok < M
     orow_all = tok * K + slot
-    unwritten = int((c0.out == 0x7F).all(dim=1).sum())
+    is_sent = (c0.out == 0x7F) if args.out == "fp8" else torch.isnan(c0.out)
+    unwritten = int(is_sent.all(dim=1).sum())
     print(f"[gemm2] rows never written: {unwritten} / {M * K}", flush=True)
     h_s_unsh = e8m0_unshuffle(c0.h_s, c0.num_m_blocks * BM, I // 32)
     rows_all = torch.nonzero(real).flatten()
@@ -222,11 +230,31 @@ if args.check_rows > 0:
     n_bad_q, n_bad_s, n_tot = 0, 0, 0
     rel, cos_all, rel_q = [], [], []
     bad_grp = torch.zeros(H // 32, dtype=torch.long, device=dev)  # mismatched scale groups per column group
-    sentinel = (c0.out[orow_all[real]] == 0x7F).sum(dim=0)  # never-written bytes per column
+    sentinel = is_sent[orow_all[real]].sum(dim=0)  # never-written elements per column
     if int(sentinel.sum()) > 0:
         cols = torch.nonzero(sentinel > 0).flatten()
-        print(f"[gemm2] sentinel bytes left in {int(sentinel.sum())} places; columns {cols[:16].tolist()} .. {cols[-16:].tolist()}")
+        print(f"[gemm2] sentinel values left in {int(sentinel.sum())} places; columns {cols[:16].tolist()} .. {cols[-16:].tolist()}")
+    n_exact_rows, n_exact_vals, max_ulp = 0, 0, 0
     for r in sel.tolist():
+        if args.out == "bf16":
+            e = int(c0.sorted_eids[r // BM])
+            orow = int(orow_all[r])
+            av = fp4_utils.mxfp4_to_f32(c0.h_q[r]).view(I)
+            asc = fp4_utils.e8m0_to_f32(h_s_unsh[r]).view(I // 32)
+            ad = (av.view(I // 32, 32) * asc.unsqueeze(-1)).view(I)
+            y_ref = (ad @ w2_deq(e).T) * c0.sorted_w[r]  # [H] fp32, weighted like production
+            ref_b = y_ref.to(torch.bfloat16)
+            mine_b = c0.out[orow]
+            same = mine_b.view(torch.int16) == ref_b.view(torch.int16)
+            n_exact_vals += int(same.sum())
+            n_exact_rows += int(same.all())
+            ulp = (mine_b.view(torch.int16).int() - ref_b.view(torch.int16).int()).abs()
+            max_ulp = max(max_ulp, int(ulp.max()))
+            n_tot += H
+            mine = mine_b.float()
+            rel.append(float((mine - y_ref).norm() / (y_ref.norm() + 1e-12)))
+            cos_all.append(float((mine @ y_ref) / (mine.norm() * y_ref.norm() + 1e-12)))
+            continue
         e = int(c0.sorted_eids[r // BM])
         orow = int(orow_all[r])
         av = fp4_utils.mxfp4_to_f32(c0.h_q[r]).view(I)
@@ -249,12 +277,20 @@ if args.check_rows > 0:
         print("[gemm2] mismatched scale groups per (n-tile row, 32-col group):")
         for t in range(H // 256):
             print(f"   n-tile {t:2d}: {bg[t].tolist()}")
-    print(
-        f"[gemm2] check {len(sel)} rows: scale bytes mismatched {n_bad_s}/{n_tot // 32}, fp8 bytes mismatched "
-        f"{n_bad_q}/{n_tot} ({n_bad_q / n_tot:.2%}); vs fp32 ref: rel err mean {statistics.mean(rel):.4f} "
-        f"max {max(rel):.4f}, cos min {min(cos_all):.5f}; vs torch-fp8 ref: rel err mean {statistics.mean(rel_q):.5f}",
-        flush=True,
-    )
+    if args.out == "bf16":
+        print(
+            f"[gemm2] check {len(sel)} rows vs bf16(fp32 ref * w): rows bit-identical {n_exact_rows}/{len(sel)}, "
+            f"values bit-identical {n_exact_vals}/{n_tot} ({n_exact_vals / n_tot:.4%}), max diff {max_ulp} bf16 ulp; "
+            f"rel err mean {statistics.mean(rel):.5f} max {max(rel):.5f}, cos min {min(cos_all):.6f}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[gemm2] check {len(sel)} rows: scale bytes mismatched {n_bad_s}/{n_tot // 32}, fp8 bytes mismatched "
+            f"{n_bad_q}/{n_tot} ({n_bad_q / n_tot:.2%}); vs fp32 ref: rel err mean {statistics.mean(rel):.4f} "
+            f"max {max(rel):.4f}, cos min {min(cos_all):.5f}; vs torch-fp8 ref: rel err mean {statistics.mean(rel_q):.5f}",
+            flush=True,
+        )
 
 for c in cases:
     fn2(*c.args())
@@ -279,9 +315,9 @@ meds.sort()
 us = meds[len(meds) // 2]
 flop_useful = 2.0 * (M * K) * I * H
 flop_padded = 2.0 * nv * I * H
-out_gb = (M * K) * (H + H // 32) / 1e9
+out_gb = (M * K) * ((H + H // 32) if args.out == "fp8" else 2 * H) / 1e9
 print(
-    f"[gemm2] tokens={M} n_split={args.n_split} per call: median {us:.1f} us (range {meds[0]:.1f}..{meds[-1]:.1f}), "
+    f"[gemm2] tokens={M} out={args.out} n_split={args.n_split} per call: median {us:.1f} us (range {meds[0]:.1f}..{meds[-1]:.1f}), "
     f"{flop_useful / us / 1e9:.2f} PF/s useful ({flop_padded / us / 1e9:.2f} incl. padding), "
     f"output {out_gb:.2f} GB = {out_gb / us * 1e6 / 1e3:.2f} TB/s",
     flush=True,

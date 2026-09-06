@@ -47,6 +47,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import arith as _arith
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
@@ -512,14 +513,50 @@ def _fmin(a, b):
 
 
 def _swiglu_oai(g, u):
-    """MiniMax-M3 activation: g clamped above, u clamped both sides,
-    g * sigmoid(alpha g) * (u + 1). sigmoid via exp2 + rcp."""
+    """MiniMax-M3 activation, op for op the production stage-1 epilogue (aiter
+    mixed_moe_gemm_2stage ``swiglu_mul_vec4``): g clamped above, u clamped both
+    sides, t = (g * alpha) * (-log2 e), sigmoid = rcp(1 + exp2(t)), g * sig * (u + 1).
+    The two separate multiplies matter: folding the constant changes the last bit."""
     lim = _f32(SWIGLU_LIMIT)
     g = _fmin(g, lim)
     u = _fmax(_fmin(u, lim), _f32(-SWIGLU_LIMIT))
-    t = _intrin_f32("llvm.amdgcn.exp2.f32", [g * _f32(-SWIGLU_ALPHA * 1.4426950408889634)])
-    sig = _intrin_f32("llvm.amdgcn.rcp.f32", [t + _f32(1.0)])
+    t = (g * _f32(SWIGLU_ALPHA)) * _f32(-1.4426950408889634)
+    e = _intrin_f32("llvm.amdgcn.exp2.f32", [t])
+    sig = _intrin_f32("llvm.amdgcn.rcp.f32", [_f32(1.0) + e])
     return g * sig * (u + _f32(1.0))
+
+
+def _round_bf16x2(a, b):
+    """(a, b) -> the f32 values of their bf16 roundings (RNE, v_cvt_pk_bf16_f32):
+    production stage 1 stores bf16 and quantises from it."""
+    v2f32 = _ir.VectorType.get([2], _T.f32)
+    v2bf16 = _ir.VectorType.get([2], _ir.BF16Type.get())
+    v = _vector.FromElementsOp(v2f32, [fx.as_ir_value(a), fx.as_ir_value(b)]).result
+    w = fx.Int32(_llvm.bitcast(_T.i32, _arith.TruncFOp(v2bf16, v).result))
+    return _as_f32(w << 16), _as_f32(w & fx.Int32(-65536))
+
+
+def _quant_prep_fp4(h8):
+    """Production's inter-stage quant on 8 values of one 32-block: round them to
+    bf16 and return (rounded values, this lane's |max|)."""
+    hb = []
+    for k in range_constexpr(0, 8, 2):
+        lo, hi = _round_bf16x2(h8[k], h8[k + 1])
+        hb += [lo, hi]
+    amax = _intrin_f32("llvm.fabs.f32", [hb[0]])
+    for v in range_constexpr(1, 8):
+        amax = _fmax(amax, _intrin_f32("llvm.fabs.f32", [hb[v]]))
+    return hb, amax
+
+
+def _e8m0_roundup_fp4(amax):
+    """aiter's default MX scale rule (kDefaultMxScaleRoundMode = RoundUp):
+    ceil_pow2(amax / 6) as a biased exponent (fp4 max = 6): the block's max lands in
+    (3, 6]. Exponent 0xFF (NaN/Inf) is not bumped."""
+    u = _bits(amax * _f32(1.0 / 6.0))
+    e = (u >> 23) & fx.Int32(0xFF)
+    bump = ((u & fx.Int32(0x7FFFFF)) != fx.Int32(0)) & (e < fx.Int32(0xFF))
+    return fx.arith.select(bump, e + fx.Int32(1), e)
 
 
 def _bits(f):
@@ -1025,13 +1062,11 @@ def compile_moe_gemm1(
                         h = [_swiglu_oai(_f32(gv[v]), _f32(uv[v])) for v in range_constexpr(4)] + [
                             _swiglu_oai(_f32(gw[v]), _f32(uw[v])) for v in range(4)
                         ]
-                        amax = _intrin_f32("llvm.fabs.f32", [h[0]])
-                        for v in range_constexpr(1, 8):
-                            amax = _fmax(amax, _intrin_f32("llvm.fabs.f32", [h[v]]))
+                        h, amax = _quant_prep_fp4(h)
                         # the 4 lanes {L, L^16, L^32, L^48} hold the same row
                         amax = _fmax(amax, amax.shuffle_xor(16, 64))
                         amax = _fmax(amax, amax.shuffle_xor(32, 64))
-                        e8m0 = _e8m0_even_headroom2(amax)
+                        e8m0 = _e8m0_roundup_fp4(amax)
                         e8m0_of_ti.append(e8m0)
                         scale_f = _as_f32(e8m0 << 23)
                         pa = _cvt_pk_fp4(fx.Int32(0), h[0], h[1], scale_f, 0)

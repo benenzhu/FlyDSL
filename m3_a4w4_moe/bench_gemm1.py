@@ -254,12 +254,14 @@ if args.check_rows > 0 and not args.fake_dense:
             w1_deq_cache[e] = (v.view(2 * I, H // 32, 32) * sc.unsqueeze(-1)).view(2 * I, H)
         return w1_deq_cache[e]
 
-    def quant_ref(h):  # kernel's rule: nearest pow2 of amax, exponent - 2, floor 0; RNE fp4
-        hg = h.view(-1, 32)
+    def quant_ref(h):
+        """production's inter-stage quant: the stage-1 values are bf16, e8m0 =
+        ceil_pow2(amax / 6) (aiter RoundUp), RNE fp4 of value / 2^(e8m0 - 127)"""
+        hg = h.to(torch.bfloat16).float().view(-1, 32)
         amax = hg.abs().amax(dim=1)
-        bits = amax.view(torch.int32)
-        e8 = (((bits + 0x400000) & -0x800000) >> 23) - 2
-        e8 = e8.clamp(min=0)
+        u = (amax * (1.0 / 6.0)).view(torch.int32)
+        e8 = (u >> 23) & 0xFF
+        e8 = e8 + (((u & 0x7FFFFF) != 0) & (e8 < 255)).int()
         scale = torch.ldexp(torch.ones_like(amax), (e8 - 127))
         q = hg / scale.unsqueeze(1)
         # RNE onto the fp4 grid {0,.5,1,1.5,2,3,4,6}

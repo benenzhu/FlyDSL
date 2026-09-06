@@ -59,7 +59,7 @@ from m3_a4w4_moe.gemm1 import (
     _Buf,
     _cvt_pk_fp4,
     _divmod_nonneg,
-    _e8m0_even_headroom2,
+    _e8m0_roundup_fp4,
     _as_f32,
     _f32,
     _flat_frag,
@@ -70,6 +70,7 @@ from m3_a4w4_moe.gemm1 import (
     _permlane16_swap,
     _riffle,
     _s2r_thunks,
+    _quant_prep_fp4,
     _swiglu_oai,
     _swizzled_col,
     _unflat_frag,
@@ -473,12 +474,10 @@ def compile_moe_gemm1_persist(*, H: int, I: int, E: int, BLOCK_M: int = 256, n_c
                     h = [_swiglu_oai(_f32(gv[v]), _f32(uv[v])) for v in range_constexpr(4)] + [
                         _swiglu_oai(_f32(gw[v]), _f32(uw[v])) for v in range(4)
                     ]
-                    amax = _intrin_f32("llvm.fabs.f32", [h[0]])
-                    for v in range_constexpr(1, 8):
-                        amax = _fmax(amax, _intrin_f32("llvm.fabs.f32", [h[v]]))
+                    h, amax = _quant_prep_fp4(h)
                     amax = _fmax(amax, amax.shuffle_xor(16, 64))
                     amax = _fmax(amax, amax.shuffle_xor(32, 64))
-                    e8m0 = _e8m0_even_headroom2(amax)
+                    e8m0 = _e8m0_roundup_fp4(amax)
                     e8m0_of_ti.append(e8m0)
                     scale_f = _as_f32(e8m0 << 23)
                     pa = _cvt_pk_fp4(fx.Int32(0), h[0], h[1], scale_f, 0)
