@@ -38,9 +38,10 @@ p.add_argument("--fake-dense", choices=["rows", "gather"], default=None,
                     "rows (pure kernel overhead vs the dense kernel); 'gather' = expert 0 everywhere but the real "
                     "gathered rows (isolates the A gather from expert switching); disables the check")
 p.add_argument("--wgm", type=int, default=4, help="m-tiles per XCD group in the block remap")
-p.add_argument("--kernel", choices=["2x2", "1x4", "persist"], default="2x2",
+p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist"], default="2x2",
                help="2x2 = gemm1.py (4-wave 2x2 quadrants); 1x4 = gemm1_1x4.py (Kimi v36 port, BM128 only); "
-                    "persist = gemm1_persist.py (2x2, one CTA per CU, cross-block pipelined)")
+                    "persist = gemm1_persist.py (2x2, one CTA per CU, cross-block pipelined); "
+                    "s3 = gemm1_s3.py (2x2, 3-stage LDS ring, DMA three K-steps ahead, BM128)")
 p.add_argument("--ctas", type=int, default=256, help="persist: number of CTAs (multiple of 8)")
 p.add_argument("--order", choices=["expert", "xcd"], default="expert",
                help="block order: expert = host tile_map, n-slab-major per expert (default); xcd = dense-style WGM groups")
@@ -50,6 +51,7 @@ import flydsl.compiler as flyc  # noqa: E402
 from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
 from m3_a4w4_moe.gemm1_1x4 import compile_moe_gemm1_1x4, ptr_arg  # noqa: E402
 from m3_a4w4_moe.gemm1_persist import compile_moe_gemm1_persist  # noqa: E402
+from m3_a4w4_moe.gemm1_s3 import compile_moe_gemm1_s3  # noqa: E402
 
 import aiter  # noqa: E402,F401
 from aiter import dtypes  # noqa: E402
@@ -217,6 +219,9 @@ else:
     if args.kernel == "persist":
         assert args.order == "expert"
         launch = compile_moe_gemm1_persist(H=H, I=I, E=E, BLOCK_M=BM, n_cta=args.ctas)
+    elif args.kernel == "s3":
+        launch = compile_moe_gemm1_s3(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
+                                      tile_map=args.order == "expert")
     else:
         launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
                                    tile_map=args.order == "expert")
