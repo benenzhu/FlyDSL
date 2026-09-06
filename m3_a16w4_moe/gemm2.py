@@ -358,7 +358,7 @@ def _gemm2_body_a16w4(
             else:
                 _tok = fx.Int32(_global_i32_at(arg_stids, m_row + fx.Int32(mi * 16) + lane_mod_16))
             _ok = (_tok & fx.Int32(0x00FFFFFF)) < i32_M
-            a_row_bytes[mi] = _ok.select(a_row_bytes[mi], fx.Int32(0xFFFFC000 - 0x4000))
+            a_row_bytes[mi] = _ok.select(a_row_bytes[mi], fx.Int32(0xFFFFC000))  # >= num_records -> OOB zero
 
     def load_a_direct(base_k):
         base_k_bytes = base_k * fx.Int32(elem_bytes)

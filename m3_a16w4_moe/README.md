@@ -93,15 +93,26 @@ the weights stop coming from HBM. All rows above are one-call / same-input numbe
 | 09-06 | same | tn256 / tk128 ks3 / tk128 ks6 (+pm +hoist) | 31.12 / 31.48 / 32.17 | |
 | 09-06 | gemm1 **pf2** | tn128 tk256 xcd0 ks3 pm hoist | **30.71 us** | current best, -27.6% vs CK-tile 42.44 |
 | 09-06 | same, **`--sort pairs`** (no sort kernel) | same | **27.80 us** | 2 kernels: each block derives expert + rows from the 20 routing pairs (ballot + 16-entry LDS table), duplicate-expert blocks exit, gemm1's pair-0 blocks zero the output; cos 0.99999. -34.5% vs CK-tile |
+| 09-06 | pairs, gemm1 only (`--stages 2`) | | 17.26 | so gemm2 (ks3 pm hoist) is ~10.5 us in the 2-kernel chain |
+| 09-06 | pairs, gemm1 pf1 / pf3 / pf4 | tn128 ks3 pm hoist | 32.89 / 27.75 / 28.44 | pf1 collapses without the sort kernel in front (5 us worse); pf2-3 fine |
+| 09-06 | pairs, gemm1 tn16 pf2 / tn16 pf3 / tn64 pf2 | same | 28.81 / 29.84 / 28.94 | tn32 stays best |
+| 09-06 | pairs, gemm1 **`--g1-b-nt 2`** (streaming W loads) | same | **26.96** | -0.84: the non-temporal hint now helps because W really streams from HBM (it hurt in the cache-warm setup) |
+| 09-06 | pairs, gemm1 pf2 | ks1 / **tn256** ks3 / tn64 ks3 / tn128 ks3 **nt2** | 27.94 / 27.42 / 29.04 / 27.38 | gemm2: split-K is worth only 0.14 now; tn256 and the nt hint each -0.4 |
+| 09-06 | pairs, gemm2 a_direct pf2 pad-mask | | fault | bug: the a_direct pad sentinel sat below num_records; fixed (0xFFFFC000) |
+| 09-06 | pairs, gemm1 nt2 pf2 | **tn256** ks3 pm hoist **nt2** | 26.68 | |
+| 09-06 | pairs, gemm1 nt2 **pf3** | same | **26.49 us** | current best, -37.6% vs CK-tile 42.44; cos 0.99999 |
+| 09-06 | pairs, gemm1 nt1 / nt3 / nt4 | same | 26.84 / 26.64 / 26.84 | cache-policy bits are all within 0.2 of nt2 |
+| 09-06 | pairs, gemm1 nt2 pf2 | ks1 / tn128 / g2 nt1 / g2 nt3 | 28.19 / 27.07 / 26.68 / 26.68 | with tn256 the split-K is worth 1.5 us again |
+| 09-06 | pairs, gemm1 nt2 pf2 | tn256 **a_direct** pf2 / pf3, tn128 a_direct pf3 | 27.39 / 27.37 / 28.32 | sentinel fix verified (cos 0.99999); LDS path still wins in gemm2 |
 
-Compare only numbers measured with 100 different inputs per graph: **27.8 us vs 42.4 us CK-tile**.
+Compare only numbers measured with 100 different inputs per graph: **26.5 us vs 42.4 us CK-tile**.
 
 Current best command:
 
 ```bash
 PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --k-wave 4 --sort pairs \
-    --g1-tile-n 32 --g1-tile-k 128 --g1-a-direct 1 --g1-pf 2 --g1-ss 1 \
-    --g2-tile-n 128 --g2-tile-k 256 --g2-xcd 0 --g2-ksplit 3 --g2-pad-mask 1 --g2-hoist 1
+    --g1-tile-n 32 --g1-tile-k 128 --g1-a-direct 1 --g1-pf 3 --g1-ss 1 --g1-b-nt 2 \
+    --g2-tile-n 256 --g2-tile-k 256 --g2-xcd 0 --g2-ksplit 3 --g2-pad-mask 1 --g2-hoist 1 --g2-b-nt 2
 ```
 
 Sort-free routing (`--sort pairs`, `pairs=True` in host.py): valid whenever n_tokens <= BM,
@@ -120,6 +131,17 @@ CTAs zero the output. Same contract as `moe_sorting` (token | slot<<24, padding 
 `num_valid_ids[0]` = padded rows, `sorted_expert_ids` per BM block, zeroed `moe_buf`).
 
 Correctness gate: `cos vs swigluoai ref` >= 0.9999 (bf16-intermediate reference); 0.99999 measured.
+
+### ATT traces of the pairs-mode kernels (09-06, `/work/att_g1d`, `/work/att_g2d`)
+
+gemm1 (tn32 tk128 kw4 a_direct pf2 ss nt2, 176 VGPRs): 74% of cycles stalled: VMEM-load
+(issue back-pressure) 44%, VMEM-wait 31%, barrier 5%, lgkm 5%. ISA per wave: 96 dwordx4
+(12 tiles x (4 W + 4 A)) + 24 dword loads. Half of the vector-memory instructions are A
+loads whose lanes are ~94% OOB (padding rows), so they cost issue slots but move no data.
+gemm2 (tn256 tk256 ks3 pm hoist nt2, 88 VGPRs): 83% stalled: VMEM-load 41%, VMEM-wait 31%,
+barrier 8%. The hot VMEM-load stalls are the per-lane scale gathers (`buffer_load_dword`):
+8 per wave for only 2 distinct dwords (both 128-K halves and both 16-col halves of a
+32-col block read the same dword).
 
 ### ATT trace of gemm1 (bm16 tn64 tk128 kw4, LDS A path), one CU, 4 waves
 
