@@ -78,6 +78,12 @@ the weights stop coming from HBM. All rows above are one-call / same-input numbe
 |---|---|---|---|---|
 | 09-06 | CK-tile production path (`bench_moe_m4.py --variant a16w4`) | | **42.44 us** | baseline measured the same way |
 | 09-06 | bm16 tn16 tk128 kw4 a_direct ss, sort mxfp4 | tn128 tk256 xcd0 | **32.36 us** | -24%; stages: sort 2.67, +gemm1 18.66, +gemm2 11.03. W from HBM: gemm1 ~85 MB -> 4.6 TB/s, gemm2 ~43 MB -> 3.9 TB/s (17 distinct experts per call) |
+| 09-06 | re-sweep, gemm1 tn16 tk128 kw4 a_direct pf1/2/3/4 | tn128 tk256 xcd0 | 32.68 / 32.68 / 32.34 / 33.73 | with W really coming from HBM, prefetch depth matters a little (pf3) |
+| 09-06 | gemm1 **tn32** tk128 kw4 a_direct pf1/2/**3** | same | 32.13 / 32.11 / **31.95** | tn32 beats tn16 again under the new rule (408 WGs, 2 W loads per lane per tile) |
+| 09-06 | gemm1 tn16 tk256 kw4 a_direct pf1/2 | same | 34.14 / 33.74 | |
+| 09-06 | gemm1 tn16 tk128 pf1 + `--g1-ss 1` | same | 32.28 | vs 32.68 without: sharing the 256-K scale dword is now worth 0.4 us |
+| 09-06 | gemm1 tn16 tk128 pf1 | tn128 **xcd1** / **tn256** / **tn64** / **tk768** / **tk384** | 32.67 / 32.95 / 33.60 / 32.64 / 33.13 | gemm2 tile shape is flat around tn128 tk256 |
+| 09-06 | gemm1 tn16 tk128 pf1 | tn128 xcd0 **a_direct** pf1 / pf3 | 37.10 / 37.04 | gemm2 a_direct still loses (4x A traffic without a K split) |
 
 Compare only numbers measured with 100 different inputs per graph: **32.4 us vs 42.4 us CK-tile**.
 
