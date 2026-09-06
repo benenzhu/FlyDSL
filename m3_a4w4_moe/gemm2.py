@@ -623,7 +623,7 @@ def compile_moe_gemm2(
 
                     def _st_sc():
                         scv = _lds_load_i32(stg_sc_base + (lane_id % 32) * 4)
-                        sc_col = (chunk_n0 + nt) * fx.Int32(BN // 32) + wave_j * 4
+                        sc_col = (chunk_n0 + _pn(nt)) * fx.Int32(BN // 32) + wave_j * 4
                         _buffer_ops.buffer_store(scv, osc_rsrc, sc_off[h] + sc_col, mask=mask, offset_is_bytes=True)
 
                     ts.append(_st_sc)

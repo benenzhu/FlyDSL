@@ -17,6 +17,7 @@ as separate graphs.
 """
 
 import argparse
+import os
 import statistics
 import time
 
@@ -36,7 +37,11 @@ p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--check-tokens", type=int, default=64)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--no-prod", action="store_true")
-p.add_argument("--out", choices=["bf16", "fp8"], default="bf16", help="gemm2 output mode")
+p.add_argument("--out", choices=["bf16", "fp8"], default="fp8" if os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1" else "bf16",
+               help="gemm2 output mode; default follows aiter's AITER_FLYDSL_STAGE2_FP8 switch")
+p.add_argument("--sim-fp8-formats", action="store_true",
+               help="on the --check-tokens fp32 reference: cos of the final sum when the gemm2 rows are "
+                    "bf16 / mxfp8 per 32 / mxfp8 per 8 / plain e4m3 / plain e4m3 of y*w / per-row-scaled e4m3")
 args = p.parse_args()
 
 import flydsl.compiler as flyc  # noqa: E402
@@ -308,7 +313,9 @@ def _stage_determinism():
         torch.cuda.synchronize()
         return {
             "a_q": u8(c0.a_q).clone(), "a_s": u8(c0.a_s).clone(), "tile_map": c0.tile_map.clone(),
-            "h_q": c0.h_q.clone(), "h_s": c0.h_s.clone(), "out": c0.out.view(torch.int16).clone(), "y": c0.y.view(torch.int16).clone(),
+            "h_q": c0.h_q.clone(), "h_s": c0.h_s.clone(), "y": c0.y.view(torch.int16).clone(),
+            "out": (c0.out.clone() if args.out == "fp8" else c0.out.view(torch.int16).clone()),
+            **({"out_s": c0.out_s.clone()} if args.out == "fp8" else {}),
         }
 
     r1, r2 = _run(), _run()
@@ -330,6 +337,7 @@ def _stage_determinism():
         "h_q (valid rows)": lambda r: r["h_q"].view(rows_alloc, -1)[vrows],
         "h_s (valid rows)": lambda r: _unsh(r["h_s"], rows_alloc, I // 32)[vrows],
         "out (valid rows)": lambda r: r["out"].view(M * K, H)[orow],
+        **({"out_s (valid rows)": lambda r: r["out_s"].view(M * K, H // 32)[orow]} if args.out == "fp8" else {}),
         "y": lambda r: r["y"],
     }
     for k, f in views.items():
@@ -381,6 +389,20 @@ if args.check_tokens > 0:
     toks = torch.randperm(M, device=dev)[: args.check_tokens].tolist()
     w13d, w2d = {}, {}
     cm, cp = [], []
+    sim = {k: [] for k in ("bf16", "mx32", "mx8", "plain", "plain_w", "row")}
+
+    def _e4m3(v):
+        return v.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).to(torch.float32)
+
+    def _mx(v, blk):
+        """e8m0 = floor(log2 amax) - 7 per block (gemm2.py's rule): amax lands in [128, 256)"""
+        vb = v.view(-1, blk)
+        amax = vb.abs().amax(dim=1, keepdim=True)
+        e = torch.floor(torch.log2(amax.clamp(min=1e-30))) - 7.0
+        e = e.clamp(min=-127.0)
+        sc = torch.exp2(e)
+        return (_e4m3(vb / sc) * sc).view(-1)
+
     for t in toks:
         xd = _dequant(xq[t : t + 1], xs[t : t + 1], H).view(H)
         out = torch.zeros(H, dtype=torch.float32, device=dev)
@@ -393,7 +415,21 @@ if args.check_tokens > 0:
             g = hh[:I].clamp(max=SWIGLU_LIMIT)
             uu = hh[I:].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
             a = g * torch.sigmoid(SWIGLU_ALPHA * g) * (uu + 1.0)
-            out += float(c0.topk_w[t, j]) * (a @ w2d[e].T)
+            ye = a @ w2d[e].T
+            wj = float(c0.topk_w[t, j])
+            out += wj * ye
+            if args.sim_fp8_formats:
+                acc = sim.setdefault("_acc", {})
+                acc.setdefault("bf16", torch.zeros_like(out)).add_((ye * wj).to(torch.bfloat16).float())
+                acc.setdefault("mx32", torch.zeros_like(out)).add_(wj * _mx(ye, 32))
+                acc.setdefault("mx8", torch.zeros_like(out)).add_(wj * _mx(ye, 8))
+                acc.setdefault("plain", torch.zeros_like(out)).add_(wj * _e4m3(ye))
+                acc.setdefault("plain_w", torch.zeros_like(out)).add_(_e4m3(ye * wj))
+                acc.setdefault("row", torch.zeros_like(out)).add_(wj * _mx(ye, H))
+        if args.sim_fp8_formats:
+            acc = sim.pop("_acc")
+            for k, v in acc.items():
+                sim[k].append(_cos(v.to(torch.bfloat16), out))
         cm.append(_cos(y_mine[t], out))
         if not args.no_prod:
             cp.append(_cos(y_prod[t], out))
@@ -401,6 +437,12 @@ if args.check_tokens > 0:
     if cp:
         msg += f"; prod min {min(cp):.5f} mean {statistics.mean(cp):.5f}"
     print(msg, flush=True)
+    if args.sim_fp8_formats:
+        print(
+            "[moe] fp8 format sim (cos of the bf16 final sum vs fp32 ref, min / mean): "
+            + "; ".join(f"{k} {min(v):.5f} / {statistics.mean(v):.5f}" for k, v in sim.items()),
+            flush=True,
+        )
 
 
 # ---- timing ----
