@@ -148,13 +148,15 @@ class G2SLoaderAsm:
         voff = self._voffset(step)
         soff = _uniform_i32(k_offset)  # scalar soffset (K-step)
         stride = self._step_stride
+        # s_add_u32 writes SCC: declare it, or the compiler may keep a live SCC
+        # (e.g. a loop-exit compare) across this asm and branch on garbage.
         if step == 0:
             m0 = self._lds_base_sgpr(lds_dst)
             asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
-            _asm_void([m0, voff, self.rsrc, soff], asm, "s,v,s,s")
+            _asm_void([m0, voff, self.rsrc, soff], asm, "s,v,s,s", "~{scc}")
         else:
             asm = f"s_add_u32 m0, {stride}, m0\nbuffer_load_dwordx4 $0, $1, $2 offen lds"
-            _asm_void([voff, self.rsrc, soff], asm, "v,s,s")
+            _asm_void([voff, self.rsrc, soff], asm, "v,s,s", "~{scc}")
 
     def load(self, lds_dst, k_offset):
         for step in range_constexpr(self.n_load_steps):
