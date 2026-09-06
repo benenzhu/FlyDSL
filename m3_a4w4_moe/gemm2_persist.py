@@ -107,6 +107,8 @@ from m3_a4w4_moe.gemm2 import (
 )
 
 
+_STORE_CPOL = int(os.environ.get("M3_G2_STORE_CPOL", "0x2"), 0)  # data stores non-temporal (see gemm2.py)
+
 def _ld_dword(rsrc, voff_bytes, soff, old=None):
     """buffer_load_dword tracked by our own vmcnt accounting (LLVM sees no load). With
     ``old`` the destination is tied to the value it replaces: same register, ordered
@@ -776,7 +778,8 @@ def compile_moe_gemm2_persist(
                         data = _lds_load_vec(_stg_addr(row, chunk, 0), 4)
                         if const_expr(not NOSTORE):
                             _buffer_ops.buffer_store(
-                                data, out_rsrc, cur["off"][h][k] + col_wave + chunk * 16, mask=mask, offset_is_bytes=True
+                                data, out_rsrc, cur["off"][h][k] + col_wave + chunk * 16, mask=mask, offset_is_bytes=True,
+                                cache_modifier=_STORE_CPOL,  # nt, as in gemm2.py
                             )
 
                     ts.append(_st)
