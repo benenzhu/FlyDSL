@@ -119,7 +119,7 @@ class SortBuffers:
 
 
 @functools.lru_cache(maxsize=None)
-def compile_moe_sort(*, E: int, topk: int, block_m: int, sort_ctas: int = 16, threads: int = 1024, stages: int = 3):
+def compile_moe_sort(*, E: int, topk: int, block_m: int, sort_ctas: int = 32, threads: int = 1024, stages: int = 3):
     assert sort_ctas % 4 == 0 and (sort_ctas & (sort_ctas - 1)) == 0, "sort_ctas: power of two, multiple of 4"
     assert (block_m & (block_m - 1)) == 0 and threads >= block_m and threads >= E
     experts_per_cta = (E + sort_ctas - 1) // sort_ctas
@@ -398,7 +398,7 @@ def compile_moe_sort(*, E: int, topk: int, block_m: int, sort_ctas: int = 16, th
     return launch_sort
 
 
-def moe_sort_3stage(topk_ids, topk_weights, E, block_m, *, sort_ctas=16, threads=1024, bufs=None):
+def moe_sort_3stage(topk_ids, topk_weights, E, block_m, *, sort_ctas=32, threads=1024, bufs=None):
     """Drop-in for aiter ``moe_sorting`` (returns ``SortBuffers``)."""
     n_tokens, topk = topk_ids.shape
     if bufs is None:
