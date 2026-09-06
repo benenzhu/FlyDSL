@@ -38,12 +38,15 @@ p.add_argument("--fake-dense", choices=["rows", "gather"], default=None,
                     "rows (pure kernel overhead vs the dense kernel); 'gather' = expert 0 everywhere but the real "
                     "gathered rows (isolates the A gather from expert switching); disables the check")
 p.add_argument("--wgm", type=int, default=4, help="m-tiles per XCD group in the block remap")
+p.add_argument("--kernel", choices=["2x2", "1x4"], default="2x2",
+               help="2x2 = gemm1.py (4-wave 2x2 quadrants); 1x4 = gemm1_1x4.py (Kimi v36 port, BM128 only)")
 p.add_argument("--order", choices=["expert", "xcd"], default="expert",
                help="block order: expert = host tile_map, n-slab-major per expert (default); xcd = dense-style WGM groups")
 args = p.parse_args()
 
 import flydsl.compiler as flyc  # noqa: E402
 from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
+from m3_a4w4_moe.gemm1_1x4 import compile_moe_gemm1_1x4, ptr_arg  # noqa: E402
 
 import aiter  # noqa: E402,F401
 from aiter import dtypes  # noqa: E402
@@ -164,6 +167,28 @@ class Case:
             torch.cuda.current_stream(),
         )
 
+    def args_1x4(self):
+        def pa(t):
+            assert t.is_contiguous()
+            return ptr_arg(t)
+
+        return (
+            pa(self.out_q),
+            pa(self.out_s),
+            pa(u8(self.a_q)),
+            pa(u8(w1_k)),
+            pa(u8(self.a_s)),
+            pa(u8(w1_sk)),
+            pa(self.sorted_eids),
+            pa(self.sorted_ids),
+            pa(self.tile_map),
+            M,
+            self.num_m_blocks,
+            int(u8(self.a_s).numel()),
+            self.grid,
+            torch.cuda.current_stream(),
+        )
+
 
 t0 = time.time()
 cases = [Case() for _ in range(max(1, args.copies))]
@@ -177,11 +202,21 @@ print(
 )
 
 t0 = time.time()
-launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
-                           tile_map=args.order == "expert")
-fn = flyc.compile(launch, *c0.args())
-print(f"[gemm1] compile {time.time() - t0:.1f}s", flush=True)
-fn(*c0.args())
+if args.kernel == "1x4":
+    assert BM == 128 and args.order == "expert", "1x4 kernel: BM128 + expert-order tile_map only"
+    launch_1x4 = compile_moe_gemm1_1x4(H=H, I=I, E=E, tile_m=BM)
+
+    def call(case):
+        launch_1x4(*case.args_1x4())
+else:
+    launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
+                               tile_map=args.order == "expert")
+    fn = flyc.compile(launch, *c0.args())
+
+    def call(case):
+        fn(*case.args())
+print(f"[gemm1:{args.kernel}] compile {time.time() - t0:.1f}s", flush=True)
+call(c0)
 torch.cuda.synchronize()
 
 # ---- correctness on sampled valid rows ----
@@ -264,12 +299,12 @@ if args.check_rows > 0 and not args.fake_dense:
 
 # ---- timing: graph of `copies` calls, each its own input ----
 for c in cases:
-    fn(*c.args())
+    call(c)
 torch.cuda.synchronize()
 g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):
     for c in cases:
-        fn(*c.args())
+        call(c)
 torch.cuda.synchronize()
 g.replay()
 torch.cuda.synchronize()
@@ -287,7 +322,7 @@ us = meds[len(meds) // 2]
 flop_useful = 2.0 * (M * K) * (2 * I) * H
 flop_padded = 2.0 * nv * (2 * I) * H
 print(
-    f"[gemm1] M={M} BM={BM} per call: median {us:.1f} us (range {meds[0]:.1f}..{meds[-1]:.1f}), "
+    f"[gemm1:{args.kernel}] tokens={M} BM={BM} per call: median {us:.1f} us (range {meds[0]:.1f}..{meds[-1]:.1f}), "
     f"{flop_useful / us / 1e9:.2f} PF/s useful ({flop_padded / us / 1e9:.2f} incl. padding)",
     flush=True,
 )
