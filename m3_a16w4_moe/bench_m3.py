@@ -47,6 +47,9 @@ p.add_argument("--reps", type=int, default=200)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--no-check", action="store_true")
 p.add_argument("--loop", type=int, default=0, help="run N eager iterations and exit (for rocprofv3)")
+p.add_argument("--graph-copies", type=int, default=1,
+               help="capture N back-to-back calls in one graph and report per-call time (amortises the per-graph launch cost, closer to vLLM's full-model graph)")
+p.add_argument("--stages", type=int, default=3, help="1: sort only, 2: sort+gemm1, 3: full chain (timing breakdown; skips the check)")
 args = p.parse_args()
 
 import torch  # noqa: E402
@@ -121,11 +124,15 @@ def run():
         sorted_ids, sorted_w, sorted_eids, num_valid, out = moe_sorting(
             topk_ids, topk_w, E, H, torch.bfloat16, block_size=BM
         )
+    if args.stages < 2:
+        return out
     a16w4_gemm1(
         x_bf16=x, w1_u8=w1_k, w1_scale_u8=w1_sk, sorted_expert_ids=sorted_eids,
         num_valid_ids=num_valid, sorted_token_ids=sorted_ids, inter_sorted_bf16=inter_sorted,
         n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, topk=K, **g1_kw,
     )
+    if args.stages < 3:
+        return out
     a16w4_gemm2(
         inter_sorted_bf16=inter_sorted, w2_u8=w2_k, w2_scale_u8=w2_sk, sorted_expert_ids=sorted_eids,
         num_valid_ids=num_valid, sorted_token_ids=sorted_ids, sorted_weights=sorted_w, out_bf16=out,
@@ -177,6 +184,8 @@ if args.loop:
     torch.cuda.synchronize()
     sys.exit(0)
 
+if args.stages < 3:
+    args.no_check = True
 if not args.no_check:
     ref = reference()
     err = (out.float() - ref).abs().max().item()
@@ -192,7 +201,8 @@ with torch.cuda.stream(s):
 torch.cuda.current_stream().wait_stream(s)
 g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):
-    out_g = run()
+    for _ in range(args.graph_copies):
+        out_g = run()
 g.replay()
 torch.cuda.synchronize()
 if not args.no_check:
@@ -207,7 +217,8 @@ for r in range(args.rounds):
         g.replay()
     en.record()
     torch.cuda.synchronize()
-    meds.append(st.elapsed_time(en) * 1000.0 / args.reps)
+    meds.append(st.elapsed_time(en) * 1000.0 / args.reps / args.graph_copies)
 meds.sort()
 print(f"[a16w4-flydsl] M={M} graph replay per call: median {meds[len(meds) // 2]:.2f} us "
-      f"(min {meds[0]:.2f}, max {meds[-1]:.2f}) over {args.rounds} rounds x {args.reps}  {tag}")
+      f"(min {meds[0]:.2f}, max {meds[-1]:.2f}) over {args.rounds} rounds x {args.reps}"
+      f"{f' x {args.graph_copies} copies/graph' if args.graph_copies > 1 else ''}  {tag}")

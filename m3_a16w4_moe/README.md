@@ -65,12 +65,18 @@ rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/benc
 | 09-06 | same | **tn128** tk256 xcd0 | 33.55 us | 816 gemm2 WGs |
 | 09-06 | same, **sort = aiter#3832 single-CTA sort+zero** | tn256 xcd0 | 32.4 us | sort 2.9 us instead of 6.1 (`_adaptive_moe_sort`, `--sort mxfp4`) |
 | 09-06 | g1 bm16 **tn16** tk128 kw4 a_direct, sort mxfp4 | tn128 tk256 xcd0 | **31.6 us** | current best; kernel sum sort 2.9 + gemm1 15.5 + gemm2 8.5 = 26.9, rest is 3 launch gaps |
+| 09-06 | same + `--g1-ss 1` (share the 256-K scale dword across 8 K tiles) | same | 31.65 us | correct (cos 0.99999) but flat; scale loads were not the limiter |
+| 09-06 | same, `--stages 1/2/3` | same | 8.75 / 23.35 / 31.62 us | one call per graph: the sort-only graph costs 8.75 us for a 2.9 us kernel, so ~5.5 us of the 31.6 is the per-graph launch cost, not our kernels |
+| 09-06 | same, **`--graph-copies 10`** | same | **26.28 us/call** | 10 calls per graph amortise the launch cost: sort 3.25, +gemm1 14.94, +gemm2 8.09. CK-tile measured the same way: **39.94 us** -> 34% faster |
+
+The per-graph launch cost is invisible in production (vLLM captures the whole model forward
+in one graph), so `--graph-copies 10` is the number to compare: **26.3 us vs 39.9 us CK-tile**.
 
 Current best command:
 
 ```bash
 PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --g1-tile-n 16 --g1-tile-k 128 --k-wave 4 \
-    --g1-a-direct 1 --g2-tile-n 128 --g2-xcd 0 --sort mxfp4
+    --g1-a-direct 1 --g2-tile-n 128 --g2-xcd 0 --sort mxfp4 --graph-copies 10
 ```
 
 Sorting: `aiter.fused_moe._adaptive_moe_sort` (already in the image) launches aiter#3832's
