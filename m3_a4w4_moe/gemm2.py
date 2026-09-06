@@ -350,6 +350,38 @@ def compile_moe_gemm2(
         eid_rsrc = _buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4)
         expert = fx.Int32(_buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32, is_scalar=True))
         chunk_n0 = chunk * NT  # first n-tile (global index) of this CTA
+        # ---- rotated n-tile sweep (32768 tokens: 830 -> 669 us) ----
+        # The m-tiles of one expert run concurrently on one XCD. Sweeping the n-tiles
+        # in lockstep, every CTA takes the HBM latency on every n-tile (the 3-step DMA
+        # prefetch is shorter than the loaded latency). Starting CTA j at n-tile 2*j,
+        # the tile CTA j needs next was used by CTA j+1 one tile earlier and sits in
+        # L2. Stride 2 rather than 1: with stride 1 the neighbour fetches that tile at
+        # the same instant (no lead time); strides 2/3/5/7 measure alike, 4/6 worse.
+        # Only inside runs of >= 4 m-tiles (a same-expert tile 3 away): in short
+        # runs lockstep is better, one HBM fetch serves both CTAs, whereas rotated
+        # neighbours find the line evicted (~5 MB flows through L2 per tile time).
+        # Measured: 4096/8192 unchanged, 16384 -8%, 32768 -19%; ungated 4096/8192 +5%.
+        ROT_STRIDE, ROT_GATE = 2, 3
+        _d = fx.Int32(ROT_GATE)
+        _lo_ok = tile_i >= _d
+        _hi_ok = tile_i + _d < num_m_blocks
+        _e_lo = fx.Int32(
+            _buffer_ops.buffer_load(
+                eid_rsrc, fx.arith.select(_lo_ok, tile_i - _d, fx.Int32(0)), vec_width=1, dtype=fx.Int32, is_scalar=True
+            )
+        )
+        _e_hi = fx.Int32(
+            _buffer_ops.buffer_load(
+                eid_rsrc, fx.arith.select(_hi_ok, tile_i + _d, fx.Int32(0)), vec_width=1, dtype=fx.Int32, is_scalar=True
+            )
+        )
+        rot_on = (_lo_ok & (_e_lo == expert)) | (_hi_ok & (_e_hi == expert))
+        nt_rot = fx.arith.select(rot_on, _divmod_nonneg(tile_i * fx.Int32(ROT_STRIDE), NT)[1], fx.Int32(0))
+
+        def _pn(nt):
+            """CTA-local logical n-tile (sweep order) -> physical n-tile of the chunk"""
+            x = nt + nt_rot
+            return fx.arith.select(x >= fx.Int32(NT), x - fx.Int32(NT), x)
 
         if block_valid:
             ids_rsrc = _buffer_ops.create_buffer_resource(
@@ -415,10 +447,10 @@ def compile_moe_gemm2(
 
             def _b_soff(nt, kb):
                 """W2 byte offset of (n-tile nt [CTA-local], K-step kb)"""
-                return b_base_bytes + (chunk_n0 + nt) * fx.Int32(B_TILE_BYTES) + fx.Int32(kb * B_K_STEP)
+                return b_base_bytes + (chunk_n0 + _pn(nt)) * fx.Int32(B_TILE_BYTES) + fx.Int32(kb * B_K_STEP)
 
             def _g_soff(nt, kb):
-                return bs_base_bytes + (chunk_n0 + nt) * fx.Int32(BN * SC_COLS) + fx.Int32(kb * 256)
+                return bs_base_bytes + (chunk_n0 + _pn(nt)) * fx.Int32(BN * SC_COLS) + fx.Int32(kb * 256)
 
             def _slot_off(nt, kb):
                 """scale slot of flat step 3*nt + kb"""
@@ -574,7 +606,7 @@ def compile_moe_gemm2(
 
             def _flush_thunks(h, nt, mask):
                 """the wave's staged 32 x 128 outputs -> token-major rows, full lines"""
-                col_wave = ((chunk_n0 + nt) * fx.Int32(BN) + wave_j * WAVE_COLS) * OUT_ELEM
+                col_wave = ((chunk_n0 + _pn(nt)) * fx.Int32(BN) + wave_j * WAVE_COLS) * OUT_ELEM
                 ts = []
                 for k in range_constexpr(N_ST):
 
