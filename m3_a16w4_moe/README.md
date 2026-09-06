@@ -92,18 +92,29 @@ the weights stop coming from HBM. All rows above are one-call / same-input numbe
 | 09-06 | same | + ksplit 3 + pad-mask + hoist | **30.93** | |
 | 09-06 | same | tn256 / tk128 ks3 / tk128 ks6 (+pm +hoist) | 31.12 / 31.48 / 32.17 | |
 | 09-06 | gemm1 **pf2** | tn128 tk256 xcd0 ks3 pm hoist | **30.71 us** | current best, -27.6% vs CK-tile 42.44 |
+| 09-06 | same, **`--sort pairs`** (no sort kernel) | same | **27.80 us** | 2 kernels: each block derives expert + rows from the 20 routing pairs (ballot + 16-entry LDS table), duplicate-expert blocks exit, gemm1's pair-0 blocks zero the output; cos 0.99999. -34.5% vs CK-tile |
 
-Compare only numbers measured with 100 different inputs per graph: **30.7 us vs 42.4 us CK-tile**.
+Compare only numbers measured with 100 different inputs per graph: **27.8 us vs 42.4 us CK-tile**.
 
 Current best command:
 
 ```bash
-PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --k-wave 4 --sort mxfp4 \
+PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --k-wave 4 --sort pairs \
     --g1-tile-n 32 --g1-tile-k 128 --g1-a-direct 1 --g1-pf 2 --g1-ss 1 \
     --g2-tile-n 128 --g2-tile-k 256 --g2-xcd 0 --g2-ksplit 3 --g2-pad-mask 1 --g2-hoist 1
 ```
 
-Sorting: `aiter.fused_moe._adaptive_moe_sort` (already in the image) launches aiter#3832's
+Sort-free routing (`--sort pairs`, `pairs=True` in host.py): valid whenever n_tokens <= BM,
+i.e. decode. Routing pair q = token*topk + slot. Block p (of n_tokens*topk per n-block) loads
+the <= 64 pair expert ids into one wave, `ballot(pv == topk_ids[p])` gives the rows of its
+expert; block p owns the expert iff no earlier pair has it (mbcnt rank at lane p == 0),
+otherwise it exits. Matching lanes write `token | slot<<24` to a 16-entry LDS table at
+their rank; padding rows hold token = n_tokens, so the rest of both kernels is unchanged
+(`decode_pairs_table` in utils.py). gemm2 reads the intermediate at rows p*BM + row and
+the routing weight at topk_weights[token*topk + slot]; gemm1's pair-0 blocks zero the
+gemm2 output. Costs one 80 B load + 2 LDS stores per block instead of a 2.7 us kernel.
+
+Sorted path: `aiter.fused_moe._adaptive_moe_sort` (already in the image) launches aiter#3832's
 `sort_quant_kernel_impl<..., kSkipQuant=true>`: block 0 sorts with LDS counters, the other
 CTAs zero the output. Same contract as `moe_sorting` (token | slot<<24, padding token = M,
 `num_valid_ids[0]` = padded rows, `sorted_expert_ids` per BM block, zeroed `moe_buf`).

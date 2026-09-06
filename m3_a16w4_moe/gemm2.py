@@ -29,6 +29,7 @@ from .utils import (  # noqa: F401
     _udiv,
     _umod,
     a16wmix_use_k16,
+    decode_pairs_table,
     kmchunks_for,
     lds_acc_bytes_for,
 )
@@ -614,8 +615,14 @@ def compile_gemm2_a16w4_port(
     ksplit=1,
     pad_mask=False,
     hoist=None,
+    pairs=False,
+    TOPK=None,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
+
+    ``pairs`` (+ ``TOPK``): sort-free decode routing, see gemm1 / decode_pairs_table.
+    arg_stids is topk_ids, arg_sweights is topk_weights [n_tokens, TOPK]; the stage-1
+    intermediate is read at rows pair*BM + row. Implies hoist (identity tile map).
 
     ``ksplit``: split-K across CTAs (grid x ksplit; partials summed by the atomic epilogue).
     ``pad_mask``: padding rows are OOB-masked in the A loads (zero fill, no L2 traffic).
@@ -643,6 +650,13 @@ def compile_gemm2_a16w4_port(
     _a_bytes = BM * KH_TILE_BYTES
     _acc_bytes = lds_acc_bytes_for(BM, TILE_N)
     _lds_bytes = _a_bytes + _acc_bytes
+    _tab_off = _lds_bytes  # pairs: 32-dword routing table after the A / acc regions
+    if pairs:
+        assert TOPK, "pairs needs TOPK"
+        if hoist is None:
+            hoist = True
+        assert hoist, "pairs needs the hoisted prologue"
+        _lds_bytes += 128
 
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
     _name = f"gemm2_a16w4{_wd_tag}_port_ne{NE}_h{N_OUT}_i{_K}_bm{BM}_tn{TILE_N}"
@@ -667,6 +681,8 @@ def compile_gemm2_a16w4_port(
         _name += "_pm"
     if hoist and not a_direct:
         _name += "_hoist"
+    if pairs:
+        _name += "_pairs"
 
     @fx.struct
     class SharedStorage:
@@ -690,7 +706,8 @@ def compile_gemm2_a16w4_port(
         bx_i32 = fx.Int32(gpu.block_id("x"))
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-        cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+        if const_expr(not pairs):
+            cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         if const_expr(ksplit > 1):
             tile_i32 = bx_i32 // fx.Int32(ksplit)
             ks_i32 = bx_i32 % fx.Int32(ksplit)
@@ -703,31 +720,53 @@ def compile_gemm2_a16w4_port(
         pre_e = pre_packed = pre_weight = pre_rowtok = pre_dirtok = None
         if const_expr(hoist):
             _mb = tile_i32 // fx.Int32(_num_n_blocks)
-            pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
             _mrow = _mb * fx.Int32(BM)
             _mlane = tx_i32 // fx.Int32(32)
             _stids_base = _global_base_ptr1(arg_stids)
             _sw_base = _global_base_ptr1(arg_sweights)
+            if const_expr(pairs):
+                _tab = _lds_ptr3(fx.Int32(fx.ptrtoint(lds_raw_ptr)), fx.Int32(_tab_off))
+                pre_e, _owner = decode_pairs_table(arg_stids, i32_M, TOPK, _mb, lane, _tab)
+                _np_m1 = i32_M * fx.Int32(TOPK) - fx.Int32(1)
+
+                def _stid_at(row):  # token | slot<<24 for row of this block (LDS table)
+                    return llvm.load(T.i32, _gep3(_tab, row * fx.Int32(4)))
+
+                def _sweight_at(row, fused):  # topk_weights[token*TOPK + slot], clamped for pads
+                    _f = fx.Int32(fused)
+                    _pair = (_f & fx.Int32(0x00FFFFFF)) * fx.Int32(TOPK) + (_f >> fx.Int32(24))
+                    _pair = fx.Int32(arith.minsi(_raw(_pair), _raw(_np_m1)))
+                    return llvm.load(T.f32, _gep1(_sw_base, _pair * fx.Int32(4)), invariant=True)
+            else:
+                pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
+
+                def _stid_at(row):
+                    return llvm.load(T.i32, _gep1(_stids_base, (_mrow + row) * fx.Int32(4)), invariant=True)
+
+                def _sweight_at(row, fused):
+                    return llvm.load(T.f32, _gep1(_sw_base, (_mrow + row) * fx.Int32(4)), invariant=True)
+
             pre_packed, pre_weight = [], []
             for mr in range_constexpr(BM // 8):
-                _pos = _mrow + fx.Int32(mr * 8) + _mlane
-                pre_packed.append(llvm.load(T.i32, _gep1(_stids_base, _pos * fx.Int32(4)), invariant=True))
-                pre_weight.append(llvm.load(T.f32, _gep1(_sw_base, _pos * fx.Int32(4)), invariant=True))
+                _row = fx.Int32(mr * 8) + _mlane
+                pre_packed.append(_stid_at(_row))
+                pre_weight.append(_sweight_at(_row, pre_packed[-1]))
             if const_expr(pad_mask):
                 # token ids of the rows this thread / lane loads (same row maps as the body)
                 if const_expr(a_direct):
                     pre_dirtok = []
                     for mi in range_constexpr(BM // 16):
-                        _pos = _mrow + fx.Int32(mi * 16) + (tx_i32 % fx.Int32(16))
-                        pre_dirtok.append(llvm.load(T.i32, _gep1(_stids_base, _pos * fx.Int32(4)), invariant=True))
+                        pre_dirtok.append(fx.Int32(_stid_at(fx.Int32(mi * 16) + (tx_i32 % fx.Int32(16)))))
                 else:
                     _tkd = (TILE_K * 2) // 4
                     pre_rowtok = []
                     for i in range_constexpr((BM * TILE_K * 2) // (256 * 16)):
                         _rl = (tx_i32 * fx.Int32(4) + fx.Int32(i * 256 * 4)) // fx.Int32(_tkd)
-                        _pos = _mrow + _rl
-                        pre_rowtok.append(llvm.load(T.i32, _gep1(_stids_base, _pos * fx.Int32(4)), invariant=True))
-        total_m_blocks = cumsum0 // fx.Int32(BM)
+                        pre_rowtok.append(fx.Int32(_stid_at(_rl)))
+        if const_expr(pairs):
+            total_m_blocks = i32_M * fx.Int32(TOPK)
+        else:
+            total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_num_n_blocks)
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
@@ -799,7 +838,10 @@ def compile_gemm2_a16w4_port(
                 gpu.barrier()
                 _run_tile(_xcd_np(fx.Int32(iv)))
         else:
-            if tile_i32 < bound:
+            _go = tile_i32 < bound
+            if const_expr(pairs):
+                _go = _go & _owner
+            if _go:
                 if const_expr(hoist):
                     # tile == launch index: matches the prologue's preloads (the XCD
                     # round-robin remap would need `bound` first).

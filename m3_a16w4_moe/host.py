@@ -43,9 +43,6 @@ def a16w4_gemm1(
     x_bf16,
     w1_u8,
     w1_scale_u8,
-    sorted_expert_ids,
-    num_valid_ids,
-    sorted_token_ids,
     inter_sorted_bf16,
     n_tokens,
     NE,
@@ -53,6 +50,9 @@ def a16w4_gemm1(
     D_INTER,
     topk,
     tile_m,
+    sorted_expert_ids=None,
+    num_valid_ids=None,
+    sorted_token_ids=None,
     tile_n,
     tile_k,
     k_wave=1,
@@ -66,6 +66,9 @@ def a16w4_gemm1(
     a_direct=False,
     prefetch=1,
     scale_share=False,
+    pairs=False,
+    topk_ids=None,
+    zero_out=None,
     stream=None,
 ):
     """Stage 1: gate/up GEMM + activation -> bf16 ``[sorted_size, D_INTER]`` by sorted row."""
@@ -87,8 +90,20 @@ def a16w4_gemm1(
         a_direct=a_direct,
         prefetch=prefetch,
         scale_share=scale_share,
+        pairs=pairs,
     )
-    grid = gemm1_a16w4_grid(tile_m, INTER=D_INTER, TILE_N=tile_n, max_m_blocks=int(sorted_expert_ids.numel()))
+    if pairs:
+        # sort-free decode routing: one m-block per routing pair, the kernel finds its rows
+        assert int(n_tokens) <= tile_m, "pairs mode needs n_tokens <= tile_m"
+        assert topk_ids is not None and zero_out is not None
+        max_m_blocks = int(n_tokens) * int(topk)
+        eids_ptr, cumsum_ptr, mind_ptr = 0, 0, topk_ids.data_ptr()
+        zero_ptr, zero_dw = zero_out.data_ptr(), (zero_out.numel() * zero_out.element_size()) // 4
+    else:
+        max_m_blocks = int(sorted_expert_ids.numel())
+        eids_ptr, cumsum_ptr, mind_ptr = sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_token_ids.data_ptr()
+        zero_ptr, zero_dw = 0, 0
+    grid = gemm1_a16w4_grid(tile_m, INTER=D_INTER, TILE_N=tile_n, max_m_blocks=max_m_blocks)
     # f32 launch slots: situ_beta, situ_beta_rcp, situ_linbeta, situ_linbeta_rcp, swiglu_limit.
     # swigluoai reads alpha from the situ_beta slot and the clamp bound from swiglu_limit.
     _run_compiled(
@@ -96,9 +111,9 @@ def a16w4_gemm1(
         x_bf16.data_ptr(),
         w1_u8.data_ptr(),
         w1_scale_u8.data_ptr(),
-        sorted_expert_ids.data_ptr(),
-        num_valid_ids.data_ptr(),
-        sorted_token_ids.data_ptr(),
+        eids_ptr,
+        cumsum_ptr,
+        mind_ptr,
         int(n_tokens),
         int(grid),
         float(alpha),
@@ -107,6 +122,8 @@ def a16w4_gemm1(
         1.0,
         float(swiglu_limit),
         inter_sorted_bf16.data_ptr(),
+        int(zero_ptr),
+        int(zero_dw),
         torch.cuda.current_stream() if stream is None else stream,
     )
     return inter_sorted_bf16
@@ -117,10 +134,6 @@ def a16w4_gemm2(
     inter_sorted_bf16,
     w2_u8,
     w2_scale_u8,
-    sorted_expert_ids,
-    num_valid_ids,
-    sorted_token_ids,
-    sorted_weights,
     out_bf16,
     n_tokens,
     NE,
@@ -129,6 +142,10 @@ def a16w4_gemm2(
     tile_m,
     tile_n,
     tile_k,
+    sorted_expert_ids=None,
+    num_valid_ids=None,
+    sorted_token_ids=None,
+    sorted_weights=None,
     b_nt=0,
     xcd_swizzle=1,
     waves_per_eu=None,
@@ -138,6 +155,10 @@ def a16w4_gemm2(
     ksplit=1,
     pad_mask=False,
     hoist=None,
+    pairs=False,
+    topk=None,
+    topk_ids=None,
+    topk_weights=None,
     stream=None,
 ):
     """Stage 2: down GEMM, routing-weighted bf16 atomic add into ``out_bf16`` [n_tokens, D_HIDDEN]."""
@@ -158,18 +179,29 @@ def a16w4_gemm2(
         ksplit=ksplit,
         pad_mask=pad_mask,
         hoist=hoist,
+        pairs=pairs,
+        TOPK=topk if pairs else None,
     )
-    max_m_blocks = int(sorted_expert_ids.numel())
+    if pairs:
+        assert int(n_tokens) <= tile_m and topk_ids is not None and topk_weights is not None
+        assert topk_weights.dtype == torch.float32 and topk_weights.is_contiguous()
+        max_m_blocks = int(n_tokens) * int(topk)
+        eids_ptr, cumsum_ptr = 0, 0
+        stids_ptr, sw_ptr = topk_ids.data_ptr(), topk_weights.data_ptr()
+    else:
+        max_m_blocks = int(sorted_expert_ids.numel())
+        eids_ptr, cumsum_ptr = sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr()
+        stids_ptr, sw_ptr = sorted_token_ids.data_ptr(), sorted_weights.data_ptr()
     grid = gemm2_a16w4_grid(tile_m, N_OUT=D_HIDDEN, TILE_N=tile_n, max_m_blocks=max_m_blocks, persist=persist, ksplit=ksplit)
     _run_compiled(
         launch,
         inter_sorted_bf16.data_ptr(),
         w2_u8.data_ptr(),
         w2_scale_u8.data_ptr(),
-        sorted_expert_ids.data_ptr(),
-        num_valid_ids.data_ptr(),
-        sorted_token_ids.data_ptr(),
-        sorted_weights.data_ptr(),
+        eids_ptr,
+        cumsum_ptr,
+        stids_ptr,
+        sw_ptr,
         int(n_tokens),
         int(max_m_blocks),
         int(grid),

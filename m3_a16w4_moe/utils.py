@@ -11,7 +11,7 @@ import re
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, range_constexpr, rocdl
+from flydsl.expr import arith, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch
 
@@ -110,6 +110,37 @@ def _buffer_i32_scalar_read(tiles1, idx, atom):
     r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
     fx.copy(atom, fx.slice(tiles1, (None, idx)), r)
     return fx.Int32(fx.Vector(fx.memref_load_vec(r))[0])
+
+
+def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab_ptr3):
+    """Sort-free decode routing (n_tokens <= BM): build this block's sorted_token_ids table.
+
+    Routing pair q = token*TOPK + slot (row-major topk_ids). Block p owns expert
+    e = topk_ids[p] iff p is the FIRST pair with that expert; its rows are all pairs with
+    expert e, in pair order (<= n_tokens <= BM rows, so one m-block per expert). The
+    16-entry table at ``tab_ptr3`` (LDS) holds token | slot<<24 per row, token = n_tokens
+    for padding rows, i.e. exactly what moe_sorting would have written for this block.
+    Returns (expert id, owner) -- non-owner blocks (duplicate experts) must exit.
+    One 80 B load + ballot + 2 LDS stores instead of a separate sort kernel.
+    """
+    n_pairs = i32_ntok * fx.Int32(TOPK)
+    idx = fx.Int32(arith.minsi(_raw(lane), _raw(n_pairs - fx.Int32(1))))
+    v = fx.Int32(_global_i32_at(arg_topk, idx))
+    pv = (lane < n_pairs).select(v, fx.Int32(-1))
+    e = fx.Int32(rocdl.readlane(T.i32, _raw(pv), _raw(p_i32)))
+    is_match = pv == e
+    mask = rocdl.ballot(T.i64, _raw(is_match))
+    mask_lo = arith.trunci(T.i32, mask)
+    mask_hi = arith.trunci(T.i32, arith.shrui(mask, arith.constant(32, type=T.i64)))
+    rank = fx.Int32(rocdl.mbcnt_hi(T.i32, mask_hi, rocdl.mbcnt_lo(T.i32, mask_lo, _raw(fx.Int32(0)))))
+    owner = fx.Int32(rocdl.readlane(T.i32, _raw(rank), _raw(p_i32))) == fx.Int32(0)
+    fused = (lane // fx.Int32(TOPK)) | ((lane % fx.Int32(TOPK)) << fx.Int32(24))
+    slot = is_match.select(rank, fx.Int32(31))  # non-matching lanes park in slot 31
+    llvm.StoreOp(_raw(i32_ntok), _gep3(tab_ptr3, (lane % fx.Int32(32)) * fx.Int32(4)))
+    gpu.barrier()
+    llvm.StoreOp(_raw(fused), _gep3(tab_ptr3, slot * fx.Int32(4)))
+    gpu.barrier()
+    return e, owner
 
 
 def _lds_ptr3(base_i32, byte_off_i32):

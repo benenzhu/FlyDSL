@@ -18,7 +18,9 @@ from .utils import (  # noqa: F401
     _a16w4_swizzle_xor16,
     _buffer_i32_scalar_read,
     _e8m0_byte_to_f32,
+    _gep1,
     _gep3,
+    _global_base_ptr1,
     _global_i32_at,
     _global_i32_buffer_tiles,
     _global_i32_buffer_view,
@@ -29,6 +31,7 @@ from .utils import (  # noqa: F401
     _udiv,
     _umod,
     a16wmix_use_k16,
+    decode_pairs_table,
 )
 
 
@@ -134,6 +137,7 @@ def _gemm1_body_a16w4(
     pre_e=None,
     pre_arow=None,
     pre_ep=None,
+    pairs=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -263,7 +267,10 @@ def _gemm1_body_a16w4(
     # (clamped) stores land OOB. KEPT RAW: the output resource + masked buffer_store need a
     # dynamic (runtime cumsum0) num_records and per-store predication; the fx.copy layout
     # API does not express the masked scalar scatter this epilogue relies on.
-    _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+    if const_expr(pairs):
+        _cumsum0 = i32_ntok * fx.Int32(TOPK * BM)  # one BM block per routing pair, no sort buffers
+    else:
+        _cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
     out_rsrc = buffer_ops.create_buffer_resource_from_addr(
         _raw(fx.Int64(arg_out)),
         num_records_bytes=_raw(fx.Int64(_cumsum0) * fx.Int64(INTER * 2)),
@@ -842,8 +849,15 @@ def compile_gemm1_a16w4_port(
     a_direct=False,
     prefetch=1,
     scale_share=False,
+    pairs=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
+
+    ``pairs``: sort-free decode routing (n_tokens <= BM). arg_mind is topk_ids
+    [n_tokens, TOPK]; grid = n_tokens*TOPK*NUM_N_BLOCKS; each block derives its expert and
+    rows from the routing pairs (see decode_pairs_table), duplicates exit. The blocks of
+    pair 0 also zero ``arg_zero`` (the stage-2 output, accumulated with atomics).
+    Needs a_direct and xcd_swizzle == 0.
 
     ``w_dtype="mxfp4"`` (default): in-kernel mxfp4->bf16 upconvert, per-1x32 e8m0 scale.
     ``"int4"`` (a16wi4): packed signed int4 (SAME preshuffle byte layout as mxfp4) +
@@ -915,6 +929,12 @@ def compile_gemm1_a16w4_port(
     if scale_share:
         assert a_direct and TILE_K < 256 and (_K // k_wave) % 256 == 0, "scale_share needs a_direct, tile_k<256, klen%256==0"
     _ad_tag = ("_adirect" if a_direct else "") + (f"_pf{prefetch}" if prefetch > 1 else "") + ("_ss" if scale_share else "")
+    if pairs:
+        assert a_direct and xcd_swizzle == 0, "pairs needs a_direct and xcd_swizzle == 0"
+        _ad_tag += "_pairs"
+    _tab_off = lds_bytes  # pairs: 32-dword routing table after the A/reduce region
+    if pairs:
+        lds_bytes += 128
     name_suffix = (
         f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_ad_tag}"
@@ -939,13 +959,16 @@ def compile_gemm1_a16w4_port(
         f32_situ_linbeta_rcp: fx.Float32,
         f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
+        arg_zero: fx.Int64,
+        i32_zero_dw: fx.Int32,
     ):
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         tx_i32 = fx.Int32(gpu.thread_id("x"))
         bx_i32 = fx.Int32(gpu.block_id("x"))
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
-        cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+        if const_expr(not pairs):
+            cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         # Decode prologue (a_direct, no XCD swizzle so tile == bx): the expert id and the
         # token ids of this block only depend on bx, so issue them right here next to the
         # cumsum0 load instead of one after another behind the bound check. ATT showed the
@@ -955,22 +978,43 @@ def compile_gemm1_a16w4_port(
         pre_e = pre_arow = pre_ep = None
         if const_expr(a_direct and xcd_swizzle == 0):
             _mb = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-            pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
             _bxm = _mb * fx.Int32(BM)
+            if const_expr(pairs):
+                _tab = _lds_ptr3(fx.Int32(fx.ptrtoint(lds_raw_ptr)), fx.Int32(_tab_off))
+                pre_e, _owner = decode_pairs_table(arg_mind, i32_ntok, TOPK, _mb, lane, _tab)
+
+                def _mind_at(row):
+                    return fx.Int32(llvm.load(T.i32, _gep3(_tab, row * fx.Int32(4))))
+
+                # zero the stage-2 output (gemm2 accumulates with atomics): the
+                # NUM_N_BLOCKS blocks of pair 0 stride over it, one dword per thread.
+                if _mb == fx.Int32(0):
+                    _zb = _global_base_ptr1(arg_zero)
+                    for iv in range(bx_i32 * fx.Int32(256) + tx_i32, i32_zero_dw, NUM_N_BLOCKS * 256):
+                        llvm.StoreOp(_raw(fx.Int32(0)), _gep1(_zb, fx.Int32(iv) * fx.Int32(4)))
+            else:
+                pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
+
+                def _mind_at(row):
+                    return fx.Int32(_global_i32_at(arg_mind, _bxm + row))
+
             _l16 = lane % fx.Int32(16)
             _ld16 = lane // fx.Int32(16)
             pre_arow = [
-                fx.Int32(_global_i32_at(arg_mind, _bxm + fx.Int32(mi * 16) + _l16)) & fx.Int32(0x00FFFFFF)
+                _mind_at(fx.Int32(mi * 16) + _l16) & fx.Int32(0x00FFFFFF)
                 for mi in range_constexpr(BM // 16)
             ]
             pre_ep = [
                 [
-                    fx.Int32(_global_i32_at(arg_mind, _bxm + fx.Int32(mi * 16) + _ld16 * fx.Int32(4) + fx.Int32(ii)))
+                    _mind_at(fx.Int32(mi * 16) + _ld16 * fx.Int32(4) + fx.Int32(ii))
                     for ii in range_constexpr(4)
                 ]
                 for mi in range_constexpr(BM // 16)
             ]
-        total_m_blocks = cumsum0 // fx.Int32(BM)
+        if const_expr(pairs):
+            total_m_blocks = i32_ntok * fx.Int32(TOPK)
+        else:
+            total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
 
         # Bijective XCD round-robin over valid tiles [0, bound) to balance per-XCD/HBM
@@ -994,7 +1038,10 @@ def compile_gemm1_a16w4_port(
             n_block = wig // group_size_m
             return m_block * fx.Int32(NUM_N_BLOCKS) + n_block
 
-        if bx_i32 < bound:
+        _go = bx_i32 < bound
+        if const_expr(pairs):
+            _go = _go & _owner  # duplicate-expert blocks: the first pair's block has the rows
+        if _go:
             if const_expr(_SW > 0):
                 _tile = _xcd(bx_i32)
             else:
@@ -1036,6 +1083,7 @@ def compile_gemm1_a16w4_port(
                 pre_e=pre_e,
                 pre_arow=pre_arow,
                 pre_ep=pre_ep,
+                pairs=pairs,
             )
 
     @flyc.jit
@@ -1054,6 +1102,8 @@ def compile_gemm1_a16w4_port(
         f32_situ_linbeta_rcp: fx.Float32,
         f32_swiglu_limit: fx.Float32,
         arg_out: fx.Int64,
+        arg_zero: fx.Int64,
+        i32_zero_dw: fx.Int32,
         stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
@@ -1071,6 +1121,8 @@ def compile_gemm1_a16w4_port(
             f32_situ_linbeta_rcp,
             f32_swiglu_limit,
             arg_out,
+            arg_zero,
+            i32_zero_dw,
             **({"value_attrs": {"rocdl.waves_per_eu": waves_per_eu}} if waves_per_eu else {}),
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 

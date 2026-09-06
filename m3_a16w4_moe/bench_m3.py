@@ -44,7 +44,7 @@ p.add_argument("--g2-ksplit", type=int, default=1, help="gemm2 split-K across CT
 p.add_argument("--g2-pad-mask", type=int, default=0, help="gemm2: OOB-mask padding rows in the A loads")
 p.add_argument("--g2-hoist", type=int, default=-1, help="gemm2 prologue hoist: -1 = follow a_direct, 0/1 force")
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
-p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4"],
+p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs"],
                help="aiter: opus moe_sorting (production); mxfp4: aiter#3832 single-CTA sort + zero-init (BM=16)")
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
@@ -130,6 +130,23 @@ g2_kw = dict(
 
 def run(inp=None):
     x, topk_ids, topk_w = inputs[0] if inp is None else inp
+    if args.sort == "pairs":
+        # no sort kernel: gemm1/gemm2 derive expert + rows from the routing pairs
+        # (n_tokens <= BM) and gemm1 zeroes `out` for gemm2's atomics.
+        if args.stages < 2:
+            return torch.zeros((M, H), dtype=torch.bfloat16, device=dev)
+        out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+        a16w4_gemm1(
+            x_bf16=x, w1_u8=w1_k, w1_scale_u8=w1_sk, inter_sorted_bf16=inter_sorted,
+            n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, topk=K, pairs=True, topk_ids=topk_ids, zero_out=out, **g1_kw,
+        )
+        if args.stages < 3:
+            return out
+        a16w4_gemm2(
+            inter_sorted_bf16=inter_sorted, w2_u8=w2_k, w2_scale_u8=w2_sk, out_bf16=out,
+            n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, pairs=True, topk=K, topk_ids=topk_ids, topk_weights=topk_w, **g2_kw,
+        )
+        return out
     if args.sort == "mxfp4":
         # aiter#3832 moe_sort_quant with kSkipQuant: block 0 sorts (LDS counters), the other
         # CTAs zero `out`; same output contract as moe_sorting (token | slot<<24, pad = M).
