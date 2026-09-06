@@ -32,6 +32,7 @@ p.add_argument("--g1-xcd", type=int, default=0)
 p.add_argument("--g1-wpe", type=int, default=0, help="waves_per_eu attr (0 = unset)")
 p.add_argument("--g1-a-direct", type=int, default=0, help="1: A straight global->VGPR (no LDS/barrier)")
 p.add_argument("--g1-pf", type=int, default=1, help="K tiles in flight ahead of compute (a_direct only)")
+p.add_argument("--g1-ss", type=int, default=0, help="1: share W-scale dwords across tiles of one 256-K group")
 p.add_argument("--g2-tile-n", type=int, default=256)
 p.add_argument("--g2-tile-k", type=int, default=256)
 p.add_argument("--g2-b-nt", type=int, default=0)
@@ -40,6 +41,8 @@ p.add_argument("--g2-wpe", type=int, default=0)
 p.add_argument("--g2-a-direct", type=int, default=0)
 p.add_argument("--g2-pf", type=int, default=1)
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
+p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4"],
+               help="aiter: opus moe_sorting (production); mxfp4: aiter#3832 single-CTA sort + zero-init (BM=16)")
 p.add_argument("--reps", type=int, default=200)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--no-check", action="store_true")
@@ -49,7 +52,7 @@ args = p.parse_args()
 import torch  # noqa: E402
 import aiter  # noqa: E402
 from aiter import dtypes  # noqa: E402
-from aiter.fused_moe import moe_sorting  # noqa: E402
+from aiter.fused_moe import moe_sorting, _adaptive_moe_sort  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
@@ -98,7 +101,7 @@ g1_kw = dict(
     tile_m=BM, tile_n=args.g1_tile_n, tile_k=args.g1_tile_k, k_wave=args.k_wave,
     b_nt=args.g1_b_nt, xcd_swizzle=args.g1_xcd, waves_per_eu=args.g1_wpe or None,
     act="swigluoai", alpha=ALPHA, swiglu_limit=LIMIT, w_layout=args.w_layout, a_direct=bool(args.g1_a_direct),
-    prefetch=args.g1_pf,
+    prefetch=args.g1_pf, scale_share=bool(args.g1_ss),
 )
 g2_kw = dict(
     tile_m=BM, tile_n=args.g2_tile_n, tile_k=args.g2_tile_k,
@@ -108,9 +111,16 @@ g2_kw = dict(
 
 
 def run():
-    sorted_ids, sorted_w, sorted_eids, num_valid, out = moe_sorting(
-        topk_ids, topk_w, E, H, torch.bfloat16, block_size=BM
-    )
+    if args.sort == "mxfp4":
+        # aiter#3832 moe_sort_quant with kSkipQuant: block 0 sorts (LDS counters), the other
+        # CTAs zero `out`; same output contract as moe_sorting (token | slot<<24, pad = M).
+        sorted_ids, sorted_w, sorted_eids, num_valid, out = _adaptive_moe_sort(
+            topk_ids, topk_w, E, K, BM, H, atomic=True
+        )
+    else:
+        sorted_ids, sorted_w, sorted_eids, num_valid, out = moe_sorting(
+            topk_ids, topk_w, E, H, torch.bfloat16, block_size=BM
+        )
     a16w4_gemm1(
         x_bf16=x, w1_u8=w1_k, w1_scale_u8=w1_sk, sorted_expert_ids=sorted_eids,
         num_valid_ids=num_valid, sorted_token_ids=sorted_ids, inter_sorted_bf16=inter_sorted,
@@ -154,8 +164,8 @@ def cos(a, b):
     return float((a @ b) / (a.norm() * b.norm() + 1e-12))
 
 
-tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct} pf{args.g1_pf}"
-       f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} ad{args.g2_a_direct} pf{args.g2_pf} | {args.w_layout}")
+tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct} pf{args.g1_pf} ss{args.g1_ss}"
+       f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} ad{args.g2_a_direct} pf{args.g2_pf} | {args.w_layout} sort={args.sort}")
 t0 = time.time()
 out = run()
 torch.cuda.synchronize()

@@ -65,6 +65,7 @@ def a16w4_gemm1(
     w_layout="standard",
     a_direct=False,
     prefetch=1,
+    scale_share=False,
     stream=None,
 ):
     """Stage 1: gate/up GEMM + activation -> bf16 ``[sorted_size, D_INTER]`` by sorted row."""
@@ -85,6 +86,7 @@ def a16w4_gemm1(
         k_wave=k_wave,
         a_direct=a_direct,
         prefetch=prefetch,
+        scale_share=scale_share,
     )
     grid = gemm1_a16w4_grid(tile_m, INTER=D_INTER, TILE_N=tile_n, max_m_blocks=int(sorted_expert_ids.numel()))
     # f32 launch slots: situ_beta, situ_beta_rcp, situ_linbeta, situ_linbeta_rcp, swiglu_limit.

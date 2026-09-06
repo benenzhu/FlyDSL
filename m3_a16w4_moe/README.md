@@ -62,6 +62,21 @@ rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/benc
 | 09-06 | same | tn256 tk256 **xcd0** | **33.9 us** | gemm2 LDS path; kernel sum sort 6.1 + gemm1 15.3 + gemm2 8.6 |
 | 09-06 | same | tn256 tk256 xcd0 a_direct | 35.9 us | gemm2 a_direct is slower: no k_wave in gemm2, so all 4 waves re-read the whole A block (4x L2 traffic) |
 | 09-06 | same | tn256 tk768 / tk384 | 35.0 / 34.6 us | single/2-tile K does not help gemm2 |
+| 09-06 | same | **tn128** tk256 xcd0 | 33.55 us | 816 gemm2 WGs |
+| 09-06 | same, **sort = aiter#3832 single-CTA sort+zero** | tn256 xcd0 | 32.4 us | sort 2.9 us instead of 6.1 (`_adaptive_moe_sort`, `--sort mxfp4`) |
+| 09-06 | g1 bm16 **tn16** tk128 kw4 a_direct, sort mxfp4 | tn128 tk256 xcd0 | **31.6 us** | current best; kernel sum sort 2.9 + gemm1 15.5 + gemm2 8.5 = 26.9, rest is 3 launch gaps |
+
+Current best command:
+
+```bash
+PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --g1-tile-n 16 --g1-tile-k 128 --k-wave 4 \
+    --g1-a-direct 1 --g2-tile-n 128 --g2-xcd 0 --sort mxfp4
+```
+
+Sorting: `aiter.fused_moe._adaptive_moe_sort` (already in the image) launches aiter#3832's
+`sort_quant_kernel_impl<..., kSkipQuant=true>`: block 0 sorts with LDS counters, the other
+CTAs zero the output. Same contract as `moe_sorting` (token | slot<<24, padding token = M,
+`num_valid_ids[0]` = padded rows, `sorted_expert_ids` per BM block, zeroed `moe_buf`).
 
 Correctness gate: `cos vs swigluoai ref` >= 0.9999 (bf16-intermediate reference); 0.99999 measured.
 

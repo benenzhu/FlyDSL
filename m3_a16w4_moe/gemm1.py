@@ -130,6 +130,7 @@ def _gemm1_body_a16w4(
     use_k16=False,
     a_direct=False,
     prefetch=1,
+    scale_share=False,
     pre_e=None,
     pre_arow=None,
     pre_ep=None,
@@ -459,7 +460,14 @@ def _gemm1_body_a16w4(
             raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
         return raw
 
-    def load_b_scale(base_k, mni, n_pack):
+    # One packed scale dword per lane covers 256 K (8 k32 groups x 2 bytes, both N halves), so
+    # with TILE_K < 256 consecutive tiles hit the SAME dword. `_sc_cache` (trace-time dict,
+    # the loop is fully unrolled) keeps it across tiles keyed by (column slot, 256-K group);
+    # halves the scalar scale requests at tk128 (ATT: they were ~20% of issue stalls).
+    _sc_cache = {}
+    _SC_GROUP_TILES = max(1, 256 // TILE_K)
+
+    def load_b_scale(base_k, mni, n_pack, ckey=None):
         # aiter _get_scale_f32: adj_ku = base_k//32 + (ku//4)*4 + lane_div_16. Per-lane
         # scalar e8m0 load on buffer_ops (no layout form, dict-cached across ku).
         scales = []
@@ -470,13 +478,19 @@ def _gemm1_body_a16w4(
             k_pack_sub = (adj_ku // fx.Int32(4)) % fx.Int32(2)
             s_ku = adj_ku // fx.Int32(8)
             if _k0_blk not in cache:
-                idx = (
-                    mni * fx.Int32(sc_stride_n0)
-                    + s_ku * fx.Int32(sc_stride_k0)
-                    + lane_div_16 * fx.Int32(sc_stride_klane)
-                    + lane_mod_16
-                )
-                cache[_k0_blk] = _buffer_i32_scalar_read(sw_tiles, idx, sw_read_atom)
+                gkey = None if ckey is None else (ckey, ckey_group_of(base_k_tile_index, _k0_blk))
+                if gkey is not None and gkey in _sc_cache:
+                    cache[_k0_blk] = _sc_cache[gkey]
+                else:
+                    idx = (
+                        mni * fx.Int32(sc_stride_n0)
+                        + s_ku * fx.Int32(sc_stride_k0)
+                        + lane_div_16 * fx.Int32(sc_stride_klane)
+                        + lane_mod_16
+                    )
+                    cache[_k0_blk] = _buffer_i32_scalar_read(sw_tiles, idx, sw_read_atom)
+                    if gkey is not None:
+                        _sc_cache[gkey] = cache[_k0_blk]
             packed = cache[_k0_blk]
             byte_even = k_pack_sub * fx.Int32(2)
             byte_odd = byte_even + fx.Int32(1)
@@ -615,7 +629,16 @@ def _gemm1_body_a16w4(
         scale_n_up = [expert_off + col_g_list[ni] + inter_i32 for ni in range_constexpr(num_acc_n)]
 
     # ---- B tile load + compute helpers ----------------------------------------
-    def load_b_tile(base_k):
+    base_k_tile_index = [0]  # set by load_b_tile(kt=...) so load_b_scale can key its cache
+
+    def ckey_group_of(tile_idx_box, k0_blk):
+        # (k0 blocks are 128 K each; group = 256 K). Only meaningful when k_base is a
+        # multiple of 256 K, which holds for klen = K / k_wave here (asserted in the builder).
+        return (tile_idx_box[0] * TILE_K + k0_blk * 128) // 256
+
+    def load_b_tile(base_k, kt=None):
+        base_k_tile_index[0] = kt if kt is not None else -1 - len(_sc_cache)  # unique when unknown
+        _use_ck = kt is not None
         if const_expr(_is_bf16):
             # Raw bf16 W: no scale; the loaded fragments are the MMA operands.
             return (
@@ -628,8 +651,14 @@ def _gemm1_body_a16w4(
             g_sc = [load_b_scale_int4(base_k, scale_n_gate[ni]) for ni in range_constexpr(num_acc_n)]
             u_sc = [load_b_scale_int4(base_k, scale_n_up[ni]) for ni in range_constexpr(num_acc_n)]
         else:
-            g_sc = [load_b_scale(base_k, scale_mni_gate[ni], scale_np_gate[ni]) for ni in range_constexpr(num_acc_n)]
-            u_sc = [load_b_scale(base_k, scale_mni_up[ni], scale_np_up[ni]) for ni in range_constexpr(num_acc_n)]
+            g_sc = [
+                load_b_scale(base_k, scale_mni_gate[ni], scale_np_gate[ni], ckey=("g", ni) if _use_ck else None)
+                for ni in range_constexpr(num_acc_n)
+            ]
+            u_sc = [
+                load_b_scale(base_k, scale_mni_up[ni], scale_np_up[ni], ckey=("u", ni) if _use_ck else None)
+                for ni in range_constexpr(num_acc_n)
+            ]
         return (
             [load_b_raw(base_k, n_blk_gate[ni], n_intra_gate[ni]) for ni in range_constexpr(num_acc_n)],
             [load_b_raw(base_k, n_blk_up[ni], n_intra_up[ni]) for ni in range_constexpr(num_acc_n)],
@@ -682,11 +711,11 @@ def _gemm1_body_a16w4(
         ring = []
         for t in range_constexpr(min(prefetch, K_TILES_TOTAL)):
             kb = k_base + fx.Int32(t * TILE_K)
-            ring.append((load_a_direct(kb), load_b_tile(kb)))
+            ring.append((load_a_direct(kb), load_b_tile(kb, kt=t if scale_share else None)))
         for kt in range_constexpr(K_TILES_TOTAL):
             if const_expr(kt + prefetch < K_TILES_TOTAL):
                 kb = k_base + fx.Int32((kt + prefetch) * TILE_K)
-                ring.append((load_a_direct(kb), load_b_tile(kb)))
+                ring.append((load_a_direct(kb), load_b_tile(kb, kt=(kt + prefetch) if scale_share else None)))
             a_cur, b_cur = ring.pop(0)
             compute_tile(b_cur, a_cur)
     elif const_expr(not _PIPE):
@@ -812,6 +841,7 @@ def compile_gemm1_a16w4_port(
     k_wave=1,
     a_direct=False,
     prefetch=1,
+    scale_share=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -882,7 +912,9 @@ def compile_gemm1_a16w4_port(
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     assert prefetch >= 1 and (prefetch == 1 or a_direct), "prefetch>1 needs a_direct"
-    _ad_tag = ("_adirect" if a_direct else "") + (f"_pf{prefetch}" if prefetch > 1 else "")
+    if scale_share:
+        assert a_direct and TILE_K < 256 and (_K // k_wave) % 256 == 0, "scale_share needs a_direct, tile_k<256, klen%256==0"
+    _ad_tag = ("_adirect" if a_direct else "") + (f"_pf{prefetch}" if prefetch > 1 else "") + ("_ss" if scale_share else "")
     name_suffix = (
         f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_ad_tag}"
@@ -1000,6 +1032,7 @@ def compile_gemm1_a16w4_port(
                 use_k16=_use_k16,
                 a_direct=a_direct,
                 prefetch=prefetch,
+                scale_share=scale_share,
                 pre_e=pre_e,
                 pre_arow=pre_arow,
                 pre_ep=pre_ep,
