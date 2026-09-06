@@ -69,14 +69,23 @@ rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/benc
 | 09-06 | same, `--stages 1/2/3` | same | 8.75 / 23.35 / 31.62 us | one call per graph: the sort-only graph costs 8.75 us for a 2.9 us kernel, so ~5.5 us of the 31.6 is the per-graph launch cost, not our kernels |
 | 09-06 | same, **`--graph-copies 10`** | same | **26.28 us/call** | 10 calls per graph amortise the launch cost: sort 3.25, +gemm1 14.94, +gemm2 8.09. CK-tile measured the same way: **39.94 us** -> 34% faster |
 
-The per-graph launch cost is invisible in production (vLLM captures the whole model forward
-in one graph), so `--graph-copies 10` is the number to compare: **26.3 us vs 39.9 us CK-tile**.
+**Measurement rule from here on (09-06):** every graph captures **100 calls with different
+tokens and routing** (`--graph-copies 100`, the default now). One-call graphs hide 5.5 us of
+launch cost, and identical calls keep one 35 MB expert set in the 256 MB infinity cache, so
+the weights stop coming from HBM. All rows above are one-call / same-input numbers.
+
+| date | gemm1 tiles | gemm2 tiles | 100 inputs/graph | note |
+|---|---|---|---|---|
+| 09-06 | CK-tile production path (`bench_moe_m4.py --variant a16w4`) | | **42.44 us** | baseline measured the same way |
+| 09-06 | bm16 tn16 tk128 kw4 a_direct ss, sort mxfp4 | tn128 tk256 xcd0 | **32.36 us** | -24%; stages: sort 2.67, +gemm1 18.66, +gemm2 11.03. W from HBM: gemm1 ~85 MB -> 4.6 TB/s, gemm2 ~43 MB -> 3.9 TB/s (17 distinct experts per call) |
+
+Compare only numbers measured with 100 different inputs per graph: **32.4 us vs 42.4 us CK-tile**.
 
 Current best command:
 
 ```bash
 PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --g1-tile-n 16 --g1-tile-k 128 --k-wave 4 \
-    --g1-a-direct 1 --g2-tile-n 128 --g2-xcd 0 --sort mxfp4 --graph-copies 10
+    --g1-a-direct 1 --g2-tile-n 128 --g2-xcd 0 --sort mxfp4
 ```
 
 Sorting: `aiter.fused_moe._adaptive_moe_sort` (already in the image) launches aiter#3832's

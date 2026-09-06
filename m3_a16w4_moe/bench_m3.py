@@ -43,12 +43,13 @@ p.add_argument("--g2-pf", type=int, default=1)
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
 p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4"],
                help="aiter: opus moe_sorting (production); mxfp4: aiter#3832 single-CTA sort + zero-init (BM=16)")
-p.add_argument("--reps", type=int, default=200)
+p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--no-check", action="store_true")
 p.add_argument("--loop", type=int, default=0, help="run N eager iterations and exit (for rocprofv3)")
-p.add_argument("--graph-copies", type=int, default=1,
-               help="capture N back-to-back calls in one graph and report per-call time (amortises the per-graph launch cost, closer to vLLM's full-model graph)")
+p.add_argument("--graph-copies", type=int, default=100,
+               help="calls captured per graph, each with its OWN x / routing (different experts -> weights come "
+                    "from HBM like real decode, and the per-graph launch cost is amortised as in vLLM's model graph)")
 p.add_argument("--stages", type=int, default=3, help="1: sort only, 2: sort+gemm1, 3: full chain (timing breakdown; skips the check)")
 args = p.parse_args()
 
@@ -89,12 +90,21 @@ w2_k = shuffle_weight(w2_q, layout=(16, 16)).view(torch.uint8).contiguous()
 w2_sk = fp4_utils.e8m0_shuffle(w2_s.view(-1, I // 32)).view(torch.uint8).contiguous()
 
 # ---- routing like production: 4 distinct routed experts + the shared expert (id E-1) ----
-x = torch.randn((M, H), dtype=torch.bfloat16, device=dev)
-routed = torch.stack([torch.randperm(E - 1, device=dev)[: K - 1] for _ in range(M)])
-topk_ids = torch.cat([routed, torch.full((M, 1), E - 1, device=dev)], dim=1).to(torch.int32)
-w_r = torch.rand((M, K - 1), device=dev)
-w_r = w_r / w_r.sum(dim=1, keepdim=True) * 2.0  # renormalised, routed_scaling_factor 2.0
-topk_w = torch.cat([w_r, torch.ones((M, 1), device=dev)], dim=1).to(torch.float32)
+# One input set per captured call: different tokens AND different routing per call, so a
+# graph replay touches ~copies x 5 experts (913 MB of W for 129 experts) instead of re-reading
+# one 35 MB expert set out of the 256 MB infinity cache.
+def make_input():
+    x = torch.randn((M, H), dtype=torch.bfloat16, device=dev)
+    routed = torch.stack([torch.randperm(E - 1, device=dev)[: K - 1] for _ in range(M)])
+    topk_ids = torch.cat([routed, torch.full((M, 1), E - 1, device=dev)], dim=1).to(torch.int32)
+    w_r = torch.rand((M, K - 1), device=dev)
+    w_r = w_r / w_r.sum(dim=1, keepdim=True) * 2.0  # renormalised, routed_scaling_factor 2.0
+    topk_w = torch.cat([w_r, torch.ones((M, 1), device=dev)], dim=1).to(torch.float32)
+    return x, topk_ids, topk_w
+
+
+inputs = [make_input() for _ in range(max(1, args.graph_copies))]
+x, topk_ids, topk_w = inputs[0]  # call 0 == the old single-input bench (same seed stream)
 
 # sorted rows upper bound (aiter pads every expert to a BM multiple)
 max_sorted = M * K + E * BM - K
@@ -113,7 +123,8 @@ g2_kw = dict(
 )
 
 
-def run():
+def run(inp=None):
+    x, topk_ids, topk_w = inputs[0] if inp is None else inp
     if args.sort == "mxfp4":
         # aiter#3832 moe_sort_quant with kSkipQuant: block 0 sorts (LDS counters), the other
         # CTAs zero `out`; same output contract as moe_sorting (token | slot<<24, pad = M).
@@ -148,7 +159,8 @@ def deq(q, s, n_cols):
     return (v.view(q.shape[0], -1, 32) * sc.unsqueeze(-1)).view(q.shape[0], n_cols)
 
 
-def reference():
+def reference(inp=None):
+    x, topk_ids, topk_w = inputs[0] if inp is None else inp
     out = torch.zeros((M, H), dtype=torch.float32, device=dev)
     xf = x.float()
     for t in range(M):
@@ -201,12 +213,15 @@ with torch.cuda.stream(s):
 torch.cuda.current_stream().wait_stream(s)
 g = torch.cuda.CUDAGraph()
 with torch.cuda.graph(g):
-    for _ in range(args.graph_copies):
-        out_g = run()
+    outs_g = [run(inp) for inp in inputs]
 g.replay()
 torch.cuda.synchronize()
 if not args.no_check:
-    print(f"[a16w4-flydsl] graph replay cos vs eager {cos(out_g, out):.5f}")
+    # call 0 against the eager run (same input); the last call against its own reference
+    msg = f"[a16w4-flydsl] graph replay cos vs eager {cos(outs_g[0], out):.5f}"
+    if len(inputs) > 1:
+        msg += f" | last call cos vs ref {cos(outs_g[-1], reference(inputs[-1])):.5f}"
+    print(msg)
 meds = []
 for r in range(args.rounds):
     for _ in range(20):
