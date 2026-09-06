@@ -190,6 +190,36 @@ def _xlane_max4(x):
     return _maxf(_as_f32(a), _as_f32(b))
 
 
+def _maxf_nn(a, b):
+    """v_max_f32 with nnan. Without the flag LLVM canonicalizes both inputs first
+    (``v_max x, x, x``, maxnum must quiet sNaNs): 2 extra VALU per max in the epilogue."""
+    fm = _ir.Attribute.parse("#arith.fastmath<nnan>")
+    return fx.Float32(_arith.MaxNumFOp(fx.as_ir_value(a), fx.as_ir_value(b), fastmath=fm).result)
+
+
+def _xlane_max4_pair(x, y):
+    """4-lane max (lanes L, L^16, L^32, L^48) of two values at once, both broadcast to
+    every lane, in 3 permlane swaps (2 x 2 done separately, plus 2 copies):
+    swap32(x, y) -> [x_lo|y_lo], [x_hi|y_hi]; max -> m = [X2 | Y2];
+    swap16(m, m) + max -> M = [X4 X4 | Y4 Y4]; swap32(M, M) -> [X4|X4], [Y4|Y4]."""
+    a, b = _permlane32_swap(_bits(x), _bits(y))
+    m = _bits(_maxf_nn(_as_f32(a), _as_f32(b)))
+    a, b = _permlane16_swap(m, m)
+    big = _bits(_maxf_nn(_as_f32(a), _as_f32(b)))
+    a, b = _permlane32_swap(big, big)
+    return _as_f32(a), _as_f32(b)
+
+
+def _undef_i32():
+    """cvt destination whose other half is overwritten anyway: no v_mov 0 for it"""
+    return _llvm.mlir_undef(_T.i32)
+
+
+def _lds_store_i16(v_i32, addr_i32):
+    h = _arith.TruncIOp(_ir.IntegerType.get_signless(16), fx.as_ir_value(v_i32)).result
+    _llvm.StoreOp(h, _lds_ptr(addr_i32), alignment=2)
+
+
 def _pin_vec4(v):
     """Route an accumulator through a side-effecting no-op asm (tied VGPR operand): its
     consumers cannot be scheduled before the asm, and the asm keeps its place among the
@@ -570,35 +600,49 @@ def compile_moe_gemm2(
                 chunk = hb * 8 + tj * 2 + g4 // 2  # (hb*64 + tj*16 + g4*4) cols * 2 B / 16
                 _lds_store_vec(_v2i32(_bf16x2(v[0], v[1]), _bf16x2(v[2], v[3])), _stg_addr(row, chunk, g4 % 2), 2)
 
-            def _stage_fp8(cq, hb, ti, p):
-                """one 16-row x 32-col group (tiles 2p, 2p+1): amax over the row's 4 lanes,
-                e8m0, 8 fp8 per lane after a permlane16 swap, 8 B + 1 scale byte staged"""
-                cv = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p)]))
-                cw = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p + 1)]))
-                v = [fx.Float32(cv[k]) for k in range_constexpr(4)] + [fx.Float32(cw[k]) for k in range_constexpr(4)]
-                amax = _fabs(v[0])
-                for k in range_constexpr(1, 8):
-                    amax = _maxf(amax, _fabs(v[k]))
-                amax = _xlane_max4(amax)
-                e8 = _e8m0_fp8(amax)
-                sf = _as_f32(e8 << 23)
-                da = _cvt_pk_fp8(fx.Int32(0), v[0], v[1], sf, False)
-                da = _cvt_pk_fp8(da, v[2], v[3], sf, True)
-                db = _cvt_pk_fp8(fx.Int32(0), v[4], v[5], sf, False)
-                db = _cvt_pk_fp8(db, v[6], v[7], sf, True)
-                da, db = _permlane16_swap(da, db)
-                # lane group g now holds tile (2p + g%2), cols (g//2)*8 .. +8
+            def _stage_fp8_pair(cq, hb, ti):
+                """the two 16-row x 32-col groups of (ti, hb) -- tiles (0, 1) and (2, 3) --
+                at once. The fp8 epilogue is VALU-issue bound (1 wave / SIMD; the ATT
+                showed ~35 sequential instructions per group between two MFMAs), so: one
+                amax butterfly serves both groups (3 swaps, not 4), nnan maxes (no
+                canonicalizing self-max), undef cvt destinations (no v_mov 0), the two
+                e8m0 bytes of a row go out as one 16-bit LDS write. Per group: amax over
+                the row's 4 lanes, e8m0, 8 fp8 per lane after a permlane16 swap."""
+                v = []
+                for p in range_constexpr(2):
+                    cv = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p)]))
+                    cw = Vec(_pin_vec4(cq[mfma.idx(ti, 2 * p + 1)]))
+                    v.append(
+                        [fx.Float32(cv[k]) for k in range_constexpr(4)] + [fx.Float32(cw[k]) for k in range_constexpr(4)]
+                    )
+                am = []
+                for p in range_constexpr(2):
+                    a = _maxf_nn(_fabs(v[p][0]), _fabs(v[p][1]))
+                    for k in range_constexpr(2, 8):
+                        a = _maxf_nn(a, _fabs(v[p][k]))
+                    am.append(a)
+                amax = _xlane_max4_pair(am[0], am[1])
                 row = ti * 16 + r16
-                chunk = hb * 4 + 2 * p + g4 % 2
-                _lds_store_vec(_v2i32(da, db), _stg_addr(row, chunk, g4 // 2), 2)
-                _lds_store_i8(e8, stg_sc_base + row * fx.Int32(4) + (hb * 2 + p))
+                e8s = []
+                for p in range_constexpr(2):
+                    e8 = _e8m0_fp8(amax[p])
+                    sf = _as_f32(e8 << 23)
+                    da = _cvt_pk_fp8(_undef_i32(), v[p][0], v[p][1], sf, False)
+                    da = _cvt_pk_fp8(da, v[p][2], v[p][3], sf, True)
+                    db = _cvt_pk_fp8(_undef_i32(), v[p][4], v[p][5], sf, False)
+                    db = _cvt_pk_fp8(db, v[p][6], v[p][7], sf, True)
+                    da, db = _permlane16_swap(da, db)
+                    # lane group g now holds tile (2p + g%2), cols (g//2)*8 .. +8
+                    chunk = hb * 4 + 2 * p + g4 % 2
+                    _lds_store_vec(_v2i32(da, db), _stg_addr(row, chunk, g4 // 2), 2)
+                    e8s.append(e8)
+                _lds_store_i16(e8s[0] | (e8s[1] << 8), stg_sc_base + row * fx.Int32(4) + hb * 2)
 
             def _stage_thunks(cq, h, hb):
                 ts = []
                 for ti in range_constexpr(N_TILES_A):
                     if const_expr(FP8):
-                        for p in range_constexpr(NB // 2):
-                            ts.append(lambda ti=ti, p=p: _stage_fp8(cq, hb, ti, p))
+                        ts.append(lambda ti=ti: _stage_fp8_pair(cq, hb, ti))
                     else:
                         for tj in range_constexpr(NB):
                             ts.append(lambda ti=ti, tj=tj: _stage_bf16(cq, h, hb, ti, tj))
