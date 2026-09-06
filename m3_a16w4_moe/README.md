@@ -104,6 +104,25 @@ the weights stop coming from HBM. All rows above are one-call / same-input numbe
 | 09-06 | pairs, gemm1 nt1 / nt3 / nt4 | same | 26.84 / 26.64 / 26.84 | cache-policy bits are all within 0.2 of nt2 |
 | 09-06 | pairs, gemm1 nt2 pf2 | ks1 / tn128 / g2 nt1 / g2 nt3 | 28.19 / 27.07 / 26.68 / 26.68 | with tn256 the split-K is worth 1.5 us again |
 | 09-06 | pairs, gemm1 nt2 pf2 | tn256 **a_direct** pf2 / pf3, tn128 a_direct pf3 | 27.39 / 27.37 / 28.32 | sentinel fix verified (cos 0.99999); LDS path still wins in gemm2 |
+| 09-06 | best + `--g2-ss 1` (share scale dwords, 8 -> 2 gathers/wave) | | 26.47 | correct but flat: the gathers were where waves waited, not why |
+| 09-06 | gemm1 only, A loads removed from the K loop (timing experiment, wrong results) | | 17.26 -> 16.07 | the padding-row A loads are worth 1.2 us; a real fix needs A through LDS with one load per tile |
+| 09-06 | gemm2 tn512 ks3 / tn512 ks1 / tn256 tk384 ks2 / tn512 tk384 ks2 / tn256 tk128 ks6 / wpe6 | | 26.94 / 26.97 / 26.67 / 27.67 / 26.75 / 27.43 | nothing beats tn256 tk256 ks3 |
+
+### Token counts (MTP=3 fixed, so M = 4 x concurrency; best config, 100 inputs/graph)
+
+| M | CK-tile production | ours, 2 kernels | vs CK-tile | note |
+|---|---|---|---|---|
+| 4 | 42.44 us | **26.48 us** | -37.6% | ~16 distinct experts, 114 MB of W -> 4.3 TB/s end to end |
+| 8 | 60.18 us | **44.31 us** | -26.4% | |
+| 12 | 74.75 us | **56.78 us** | -24.0% | last M with a one-pass (64-lane) pair scan |
+| 16 | 89.42 us | **69.09 us** | -22.7% | 80 pairs -> two-pass scan; sorted path (`--sort mxfp4`) gives 73.18 |
+
+All cos >= 0.99998. At M=16 ~52 distinct experts stream 366 MB; 69 us is 5.3 TB/s, i.e. 95%
+of what a plain `torch.sum` reaches on this card (5.5-5.7 TB/s on 1-2 GB), so the larger M
+are at the memory roofline. M=4 is at 77%: the ~6 us of fixed cost (prologue chains,
+kernel boundary, tail) is where the remaining M=4 headroom is.
+
+Torch streaming-read roofline measured 09-06: 256 MB 4.96, 1 GB 5.51, 2 GB 5.71 TB/s.
 
 Compare only numbers measured with 100 different inputs per graph: **26.5 us vs 42.4 us CK-tile**.
 
@@ -116,7 +135,7 @@ PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --k-wave 4 --sor
 ```
 
 Sort-free routing (`--sort pairs`, `pairs=True` in host.py): valid whenever n_tokens <= BM,
-i.e. decode. Routing pair q = token*topk + slot. Block p (of n_tokens*topk per n-block) loads
+i.e. decode (M=16 = conc 4 x MTP 3+1 is the design maximum). Routing pair q = token*topk + slot. Block p (of n_tokens*topk per n-block) loads
 the <= 64 pair expert ids into one wave, `ballot(pv == topk_ids[p])` gives the rows of its
 expert; block p owns the expert iff no earlier pair has it (mbcnt rank at lane p == 0),
 otherwise it exits. Matching lanes write `token | slot<<24` to a 16-entry LDS table at
@@ -124,6 +143,10 @@ their rank; padding rows hold token = n_tokens, so the rest of both kernels is u
 (`decode_pairs_table` in utils.py). gemm2 reads the intermediate at rows p*BM + row and
 the routing weight at topk_weights[token*topk + slot]; gemm1's pair-0 blocks zero the
 gemm2 output. Costs one 80 B load + 2 LDS stores per block instead of a 2.7 us kernel.
+The scan handles 64 pairs per wave pass; M*topk > 64 (M=16 -> 80) runs two passes with the
+rank carried over (`max_pairs`, picked per M on the host, is part of the JIT key so M<=12
+keeps the one-pass kernel). The shared expert is always the block with M rows, which is
+what pins BM = 16 as the token limit.
 
 Sorted path: `aiter.fused_moe._adaptive_moe_sort` (already in the image) launches aiter#3832's
 `sort_quant_kernel_impl<..., kSkipQuant=true>`: block 0 sorts with LDS counters, the other

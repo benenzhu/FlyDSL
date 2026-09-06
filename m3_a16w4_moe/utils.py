@@ -112,34 +112,59 @@ def _buffer_i32_scalar_read(tiles1, idx, atom):
     return fx.Int32(fx.Vector(fx.memref_load_vec(r))[0])
 
 
-def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab_ptr3):
+def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab_ptr3, max_pairs=64):
     """Sort-free decode routing (n_tokens <= BM): build this block's sorted_token_ids table.
 
     Routing pair q = token*TOPK + slot (row-major topk_ids). Block p owns expert
     e = topk_ids[p] iff p is the FIRST pair with that expert; its rows are all pairs with
-    expert e, in pair order (<= n_tokens <= BM rows, so one m-block per expert). The
-    16-entry table at ``tab_ptr3`` (LDS) holds token | slot<<24 per row, token = n_tokens
-    for padding rows, i.e. exactly what moe_sorting would have written for this block.
-    Returns (expert id, owner) -- non-owner blocks (duplicate experts) must exit.
-    One 80 B load + ballot + 2 LDS stores instead of a separate sort kernel.
+    expert e, in pair order (<= n_tokens <= BM rows, so one m-block per expert; the shared
+    expert is the block with n_tokens rows). The 32-entry table at ``tab_ptr3`` (LDS)
+    holds token | slot<<24 per row, token = n_tokens for padding rows, i.e. exactly what
+    moe_sorting would have written for this block. Returns (expert id, owner); non-owner
+    blocks (duplicate experts) must exit. Pairs are scanned 64 per wave pass; ``max_pairs``
+    (BM*TOPK, 80 at BM=16 / topk 5) sets the number of passes. One 80-320 B load +
+    ballots + LDS stores per block instead of a separate sort kernel.
     """
+    n_chunks = (int(max_pairs) + 63) // 64
     n_pairs = i32_ntok * fx.Int32(TOPK)
-    idx = fx.Int32(arith.minsi(_raw(lane), _raw(n_pairs - fx.Int32(1))))
-    v = fx.Int32(_global_i32_at(arg_topk, idx))
-    pv = (lane < n_pairs).select(v, fx.Int32(-1))
-    e = fx.Int32(rocdl.readlane(T.i32, _raw(pv), _raw(p_i32)))
-    is_match = pv == e
-    mask = rocdl.ballot(T.i64, _raw(is_match))
-    mask_lo = arith.trunci(T.i32, mask)
-    mask_hi = arith.trunci(T.i32, arith.shrui(mask, arith.constant(32, type=T.i64)))
-    rank = fx.Int32(rocdl.mbcnt_hi(T.i32, mask_hi, rocdl.mbcnt_lo(T.i32, mask_lo, _raw(fx.Int32(0)))))
-    owner = fx.Int32(rocdl.readlane(T.i32, _raw(rank), _raw(p_i32))) == fx.Int32(0)
-    fused = (lane // fx.Int32(TOPK)) | ((lane % fx.Int32(TOPK)) << fx.Int32(24))
-    slot = is_match.select(rank, fx.Int32(31))  # non-matching lanes park in slot 31
+    last = n_pairs - fx.Int32(1)
+    p_lane = p_i32 % fx.Int32(64)
+    p_chunk = p_i32 // fx.Int32(64)
+    qs, pvs = [], []
+    for c in range_constexpr(n_chunks):
+        q = lane + fx.Int32(c * 64)
+        idx = fx.Int32(arith.minsi(_raw(q), _raw(last)))
+        v = fx.Int32(_global_i32_at(arg_topk, idx))
+        qs.append(q)
+        pvs.append((q < n_pairs).select(v, fx.Int32(-1)))
+    # my expert = value of pair p (uniform)
+    e = fx.Int32(rocdl.readlane(T.i32, _raw(pvs[0]), _raw(p_lane)))
+    for c in range_constexpr(1, n_chunks):
+        e_c = fx.Int32(rocdl.readlane(T.i32, _raw(pvs[c]), _raw(p_lane)))
+        e = (p_chunk == fx.Int32(c)).select(e_c, e)
+    # padding sentinel in every slot first (slots 0..31), then the rows
     llvm.StoreOp(_raw(i32_ntok), _gep3(tab_ptr3, (lane % fx.Int32(32)) * fx.Int32(4)))
     gpu.barrier()
-    llvm.StoreOp(_raw(fused), _gep3(tab_ptr3, slot * fx.Int32(4)))
+    base = fx.Int32(0)
+    rank_p = fx.Int32(0)
+    for c in range_constexpr(n_chunks):
+        is_match = pvs[c] == e
+        mask = rocdl.ballot(T.i64, _raw(is_match))
+        mask_lo = arith.trunci(T.i32, mask)
+        mask_hi = arith.trunci(T.i32, arith.shrui(mask, arith.constant(32, type=T.i64)))
+        below = fx.Int32(rocdl.mbcnt_hi(T.i32, mask_hi, rocdl.mbcnt_lo(T.i32, mask_lo, _raw(fx.Int32(0)))))
+        rank = base + below  # row of pair q among this expert's pairs (global pair order)
+        fused = (qs[c] // fx.Int32(TOPK)) | ((qs[c] % fx.Int32(TOPK)) << fx.Int32(24))
+        slot = is_match.select(rank, fx.Int32(31))  # non-matching lanes park in slot 31
+        llvm.StoreOp(_raw(fused), _gep3(tab_ptr3, slot * fx.Int32(4)))
+        r_p = fx.Int32(rocdl.readlane(T.i32, _raw(rank), _raw(p_lane)))
+        rank_p = (p_chunk == fx.Int32(c)).select(r_p, rank_p)
+        if c + 1 < n_chunks:
+            # matches in this chunk = rank at lane 63 + lane 63's own match bit
+            tot = rank + is_match.select(fx.Int32(1), fx.Int32(0))
+            base = fx.Int32(rocdl.readlane(T.i32, _raw(tot), _raw(fx.Int32(63))))
     gpu.barrier()
+    owner = rank_p == fx.Int32(0)
     return e, owner
 
 

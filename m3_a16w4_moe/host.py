@@ -38,6 +38,12 @@ def get_gemm2(**kw):
     return compile_gemm2_a16w4_port(**kw)
 
 
+def _pairs_cap(n_tokens, topk, tile_m):
+    """Routing pairs the pairs-mode table scans (64 per wave pass): one pass up to M*topk
+    <= 64 (M <= 12 at topk 5), else the full BM*topk (80 -> two passes, M = 16)."""
+    return 64 if int(n_tokens) * int(topk) <= 64 else int(tile_m) * int(topk)
+
+
 def a16w4_gemm1(
     *,
     x_bf16,
@@ -91,6 +97,7 @@ def a16w4_gemm1(
         prefetch=prefetch,
         scale_share=scale_share,
         pairs=pairs,
+        max_pairs=_pairs_cap(n_tokens, topk, tile_m) if pairs else None,
     )
     if pairs:
         # sort-free decode routing: one m-block per routing pair, the kernel finds its rows
@@ -159,6 +166,7 @@ def a16w4_gemm2(
     topk=None,
     topk_ids=None,
     topk_weights=None,
+    scale_share=False,
     stream=None,
 ):
     """Stage 2: down GEMM, routing-weighted bf16 atomic add into ``out_bf16`` [n_tokens, D_HIDDEN]."""
@@ -181,6 +189,8 @@ def a16w4_gemm2(
         hoist=hoist,
         pairs=pairs,
         TOPK=topk if pairs else None,
+        scale_share=scale_share,
+        max_pairs=_pairs_cap(n_tokens, topk, tile_m) if pairs else None,
     )
     if pairs:
         assert int(n_tokens) <= tile_m and topk_ids is not None and topk_weights is not None

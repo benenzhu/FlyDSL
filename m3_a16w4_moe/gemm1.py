@@ -850,6 +850,7 @@ def compile_gemm1_a16w4_port(
     prefetch=1,
     scale_share=False,
     pairs=False,
+    max_pairs=None,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -931,7 +932,10 @@ def compile_gemm1_a16w4_port(
     _ad_tag = ("_adirect" if a_direct else "") + (f"_pf{prefetch}" if prefetch > 1 else "") + ("_ss" if scale_share else "")
     if pairs:
         assert a_direct and xcd_swizzle == 0, "pairs needs a_direct and xcd_swizzle == 0"
-        _ad_tag += "_pairs"
+        # routing pairs scanned per block: 64 per wave pass; M*TOPK <= 64 keeps one pass
+        max_pairs = int(max_pairs or BM * TOPK)
+        assert max_pairs <= BM * TOPK
+        _ad_tag += f"_pairs{max_pairs}"
     _tab_off = lds_bytes  # pairs: 32-dword routing table after the A/reduce region
     if pairs:
         lds_bytes += 128
@@ -981,7 +985,7 @@ def compile_gemm1_a16w4_port(
             _bxm = _mb * fx.Int32(BM)
             if const_expr(pairs):
                 _tab = _lds_ptr3(fx.Int32(fx.ptrtoint(lds_raw_ptr)), fx.Int32(_tab_off))
-                pre_e, _owner = decode_pairs_table(arg_mind, i32_ntok, TOPK, _mb, lane, _tab)
+                pre_e, _owner = decode_pairs_table(arg_mind, i32_ntok, TOPK, _mb, lane, _tab, max_pairs=max_pairs)
 
                 def _mind_at(row):
                     return fx.Int32(llvm.load(T.i32, _gep3(_tab, row * fx.Int32(4))))

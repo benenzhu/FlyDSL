@@ -154,6 +154,7 @@ def _gemm2_body_a16w4(
     pad_mask=False,
     pre_rowtok=None,
     pre_dirtok=None,
+    scale_share=False,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -411,8 +412,17 @@ def _gemm2_body_a16w4(
             raw.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
         return raw
 
-    def load_b_scale(base_k, mni, n_pack):
-        # Per-lane scalar e8m0 gather (dict-cached across ku).
+    # One scale dword per lane covers a 32-col block x 256 K (2 bytes per 128-K half, both
+    # 16-col halves), so the two 128-K halves of a 256-K tile and the two 16-col n-tiles of
+    # a 32-col block all read the SAME dword. `_sc_cache` (trace-time dict keyed by the
+    # python-constant (32-col block, 256-K group)) issues it once: 8 -> 2 gathers per wave
+    # at tn256/tk256 (ATT: these gathers were the top VMEM issue stall).
+    _sc_cache = {}
+    _share_ok = scale_share and (TILE_K * K_TILES) % 256 == 0 and (_n_per_wave % 32 == 0)
+
+    def load_b_scale(base_k, mni, n_pack, ckey=None):
+        # Per-lane scalar e8m0 gather (dict-cached across ku; shared across tiles/n-tiles
+        # when ckey = (n32 block, tile index) is given).
         scales = []
         cache = {}
         for ku in range_constexpr(k_unroll):
@@ -421,13 +431,21 @@ def _gemm2_body_a16w4(
             k_pack_sub = (adj_ku // fx.Int32(4)) % fx.Int32(2)
             s_ku = adj_ku // fx.Int32(8)
             if _k0_blk not in cache:
-                idx = (
-                    mni * fx.Int32(sc_stride_n0)
-                    + s_ku * fx.Int32(sc_stride_k0)
-                    + lane_div_16 * fx.Int32(sc_stride_klane)
-                    + lane_mod_16
-                )
-                cache[_k0_blk] = _buffer_i32_scalar_read(sw_tiles, idx, sw_read_atom)
+                gkey = None
+                if ckey is not None:
+                    gkey = (ckey[0], (ckey[1] * TILE_K + _k0_blk * 128) // 256)
+                if gkey is not None and gkey in _sc_cache:
+                    cache[_k0_blk] = _sc_cache[gkey]
+                else:
+                    idx = (
+                        mni * fx.Int32(sc_stride_n0)
+                        + s_ku * fx.Int32(sc_stride_k0)
+                        + lane_div_16 * fx.Int32(sc_stride_klane)
+                        + lane_mod_16
+                    )
+                    cache[_k0_blk] = _buffer_i32_scalar_read(sw_tiles, idx, sw_read_atom)
+                    if gkey is not None:
+                        _sc_cache[gkey] = cache[_k0_blk]
             packed = cache[_k0_blk]
             byte_even = k_pack_sub * fx.Int32(2)
             byte_odd = byte_even + fx.Int32(1)
@@ -517,14 +535,18 @@ def _gemm2_body_a16w4(
         else:
             fx.gemm(mma_atom, acc, _bf16_frag(a8), _bf16_frag(b8), acc)
 
-    def load_b_tile(base_k):
+    def load_b_tile(base_k, kt=None):
         if const_expr(_is_bf16):
             return [load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)], None
         b_raw = [load_b_raw(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
         if const_expr(_is_int4):
             b_sc = [load_b_scale_int4(base_k, scale_n_list[ni]) for ni in range_constexpr(num_acc_n)]
         else:
-            b_sc = [load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni]) for ni in range_constexpr(num_acc_n)]
+            b_sc = [
+                load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni],
+                             ckey=((ni // 2, kt) if (_share_ok and kt is not None) else None))
+                for ni in range_constexpr(num_acc_n)
+            ]
         return b_raw, b_sc
 
     if const_expr(a_direct):
@@ -533,11 +555,11 @@ def _gemm2_body_a16w4(
         ring = []
         for t in range_constexpr(min(prefetch, K_TILES)):
             kb = k_off + fx.Int32(t * TILE_K)
-            ring.append((load_a_direct(kb), load_b_tile(kb)))
+            ring.append((load_a_direct(kb), load_b_tile(kb, kt=t)))
         for kt in range_constexpr(K_TILES):
             if const_expr(kt + prefetch < K_TILES):
                 kb = k_off + fx.Int32((kt + prefetch) * TILE_K)
-                ring.append((load_a_direct(kb), load_b_tile(kb)))
+                ring.append((load_a_direct(kb), load_b_tile(kb, kt=kt + prefetch)))
             a_frags, (b_raw, b_sc) = ring.pop(0)
             for ni in range_constexpr(num_acc_n):
                 for ku in range_constexpr(k_unroll):
@@ -549,7 +571,7 @@ def _gemm2_body_a16w4(
         for kt in range_constexpr(K_TILES):
             base_k = k_off + fx.Int32(kt * TILE_K)
             dma_a_tile_to_lds(base_k)
-            b_raw, b_sc = load_b_tile(base_k)
+            b_raw, b_sc = load_b_tile(base_k, kt=kt)
             gpu.barrier()
             for ni in range_constexpr(num_acc_n):
                 for ku in range_constexpr(k_unroll):
@@ -617,6 +639,8 @@ def compile_gemm2_a16w4_port(
     hoist=None,
     pairs=False,
     TOPK=None,
+    scale_share=False,
+    max_pairs=None,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -653,6 +677,8 @@ def compile_gemm2_a16w4_port(
     _tab_off = _lds_bytes  # pairs: 32-dword routing table after the A / acc regions
     if pairs:
         assert TOPK, "pairs needs TOPK"
+        max_pairs = int(max_pairs or BM * TOPK)
+        assert max_pairs <= BM * TOPK
         if hoist is None:
             hoist = True
         assert hoist, "pairs needs the hoisted prologue"
@@ -682,7 +708,9 @@ def compile_gemm2_a16w4_port(
     if hoist and not a_direct:
         _name += "_hoist"
     if pairs:
-        _name += "_pairs"
+        _name += f"_pairs{max_pairs}"
+    if scale_share:
+        _name += "_ss"
 
     @fx.struct
     class SharedStorage:
@@ -726,7 +754,7 @@ def compile_gemm2_a16w4_port(
             _sw_base = _global_base_ptr1(arg_sweights)
             if const_expr(pairs):
                 _tab = _lds_ptr3(fx.Int32(fx.ptrtoint(lds_raw_ptr)), fx.Int32(_tab_off))
-                pre_e, _owner = decode_pairs_table(arg_stids, i32_M, TOPK, _mb, lane, _tab)
+                pre_e, _owner = decode_pairs_table(arg_stids, i32_M, TOPK, _mb, lane, _tab, max_pairs=max_pairs)
                 _np_m1 = i32_M * fx.Int32(TOPK) - fx.Int32(1)
 
                 def _stid_at(row):  # token | slot<<24 for row of this block (LDS table)
@@ -824,6 +852,7 @@ def compile_gemm2_a16w4_port(
                 pad_mask=pad_mask,
                 pre_rowtok=pre_rowtok,
                 pre_dirtok=pre_dirtok,
+                scale_share=scale_share,
             )
 
         if const_expr(persist):

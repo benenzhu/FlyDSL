@@ -42,6 +42,7 @@ p.add_argument("--g2-a-direct", type=int, default=0)
 p.add_argument("--g2-pf", type=int, default=1)
 p.add_argument("--g2-ksplit", type=int, default=1, help="gemm2 split-K across CTAs (atomics sum the partials)")
 p.add_argument("--g2-pad-mask", type=int, default=0, help="gemm2: OOB-mask padding rows in the A loads")
+p.add_argument("--g2-ss", type=int, default=0, help="gemm2: share scale dwords across 128-K halves / 16-col halves")
 p.add_argument("--g2-hoist", type=int, default=-1, help="gemm2 prologue hoist: -1 = follow a_direct, 0/1 force")
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
 p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs"],
@@ -124,7 +125,7 @@ g2_kw = dict(
     b_nt=args.g2_b_nt, xcd_swizzle=args.g2_xcd, waves_per_eu=args.g2_wpe or None,
     a_direct=bool(args.g2_a_direct), prefetch=args.g2_pf,
     ksplit=args.g2_ksplit, pad_mask=bool(args.g2_pad_mask),
-    hoist=None if args.g2_hoist < 0 else bool(args.g2_hoist),
+    hoist=None if args.g2_hoist < 0 else bool(args.g2_hoist), scale_share=bool(args.g2_ss),
 )
 
 
@@ -206,7 +207,7 @@ def cos(a, b):
 
 
 tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct} pf{args.g1_pf} ss{args.g1_ss}"
-       f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} ad{args.g2_a_direct} pf{args.g2_pf} ks{args.g2_ksplit} pm{args.g2_pad_mask} ho{args.g2_hoist} | {args.w_layout} sort={args.sort}")
+       f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} ad{args.g2_a_direct} pf{args.g2_pf} ks{args.g2_ksplit} pm{args.g2_pad_mask} ho{args.g2_hoist} ss{args.g2_ss} | {args.w_layout} sort={args.sort}")
 t0 = time.time()
 out = run()
 torch.cuda.synchronize()
