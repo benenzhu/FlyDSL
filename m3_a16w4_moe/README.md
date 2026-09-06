@@ -123,6 +123,11 @@ are at the memory roofline. M=4 is at 77%: the ~6 us of fixed cost (prologue cha
 kernel boundary, tail) is where the remaining M=4 headroom is.
 
 Torch streaming-read roofline measured 09-06: 256 MB 4.96, 1 GB 5.51, 2 GB 5.71 TB/s.
+Our own kernels go higher: the sorted path (`--sort mxfp4`, pairs mode stops at M=16) at
+M=32 does ~617 MB in 104.68 us = 5.9 TB/s and at M=64 ~842 MB in 138.50 us = 6.1 TB/s
+(CK-tile: 123.17 / 156.23 us). So the practical read roofline is at least 6.1 TB/s and
+M=16 (5.6 TB/s) still has ~8% to find. (A 1-2 GB `copy_` only reaches 4.8 TB/s read+write,
+so copies are not a useful roofline here.)
 
 Compare only numbers measured with 100 different inputs per graph: **26.5 us vs 42.4 us CK-tile**.
 
