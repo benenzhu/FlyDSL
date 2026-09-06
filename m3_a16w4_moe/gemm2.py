@@ -148,6 +148,11 @@ def _gemm2_body_a16w4(
     pre_e=None,
     pre_packed=None,
     pre_weight=None,
+    ksplit=1,
+    k_split_idx=None,
+    pad_mask=False,
+    pre_rowtok=None,
+    pre_dirtok=None,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -162,6 +167,14 @@ def _gemm2_body_a16w4(
     K = INTER
     K_HALF = K // 2
     K_TILES_TOTAL = K // TILE_K
+    # Split-K across CTAs (ksplit > 1): this CTA covers K tiles [k_split_idx*K_TILES, +K_TILES);
+    # the bf16 atomic epilogue sums the partials (same idea as CK-tile's split-K 3 at M=4).
+    assert K_TILES_TOTAL % ksplit == 0, f"K tiles {K_TILES_TOTAL} not divisible by ksplit {ksplit}"
+    K_TILES = K_TILES_TOTAL // ksplit
+    if const_expr(ksplit > 1):
+        k_off = k_split_idx * fx.Int32(K_TILES * TILE_K)
+    else:
+        k_off = fx.Int32(0)
     m_repeat = BM // 16
     k_unroll = KH_TILE_BYTES // 64
     _k0_count = TILE_K // 128
@@ -259,8 +272,20 @@ def _gemm2_body_a16w4(
         sorted_row = m_row + row_local
         x_row_base_div4.append(sorted_row * fx.Int32(c_k_div4))
 
-    x_buf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFFFFF))
+    # pad_mask: padding rows (sorted token id >= n_tokens) are pointed past num_records so the
+    # buffer unit returns zeros without an L2 request. At M=4 only 1-2 of the 16 rows of an
+    # m-block are real, so this removes ~15/16 of the A traffic (20 MB per call at 816 CTAs).
+    _A_OOB_DW = 0x3FFFF000  # dword index; *4 = 0xFFFFC000 bytes, + col stays < 2^32
+    x_buf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFC000 if pad_mask else 0xFFFFFFFF))
     x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(4, 1))
+    if const_expr(pad_mask):
+        x_row_valid = []
+        for i in range_constexpr(num_x_loads):
+            if pre_rowtok is not None:
+                _tok = pre_rowtok[i]
+            else:
+                _tok = fx.Int32(_global_i32_at(arg_stids, m_row + x_row_local[i]))
+            x_row_valid.append((_tok & fx.Int32(0x00FFFFFF)) < i32_M)
     # gfx950 (K=32): BufferCopyLDS128b direct-to-LDS async copy. gfx942 (use_k16): CDNA3
     # direct-to-LDS is 4 B/lane only (the 16 B form fails LLVM ISA lowering), so stage via
     # VGPRs like the legacy kernel: buffer_load 16 B gmem->regs then ds_write 16 B regs->
@@ -287,6 +312,8 @@ def _gemm2_body_a16w4(
             # source col instead, and lds_load_a applies the SAME swizzle on read.
             col_sw = _a16w4_swizzle_xor16(x_row_local[i], col_bytes, fx.Int32(k_blocks16), enable=True)
             row_k_dw = x_row_base_div4[i] + base_k_div4
+            if const_expr(pad_mask):
+                row_k_dw = x_row_valid[i].select(row_k_dw, fx.Int32(_A_OOB_DW))
             global_byte = row_k_dw * fx.Int32(4) + col_sw
             lds_byte = x_row_local[i] * fx.Int32(KH_TILE_BYTES) + col_bytes
             if const_expr(use_k16):
@@ -323,6 +350,14 @@ def _gemm2_body_a16w4(
     # of its lane group). No LDS, no barrier, no LDS-DMA-forced vmcnt(0) (see gemm1).
     a_dir_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)
     a_row_bytes = [(m_row + fx.Int32(mi * 16) + lane_mod_16) * fx.Int32(K * 2) for mi in range_constexpr(m_repeat)]
+    if const_expr(pad_mask and a_direct):
+        for mi in range_constexpr(m_repeat):
+            if pre_dirtok is not None:
+                _tok = pre_dirtok[mi]
+            else:
+                _tok = fx.Int32(_global_i32_at(arg_stids, m_row + fx.Int32(mi * 16) + lane_mod_16))
+            _ok = (_tok & fx.Int32(0x00FFFFFF)) < i32_M
+            a_row_bytes[mi] = _ok.select(a_row_bytes[mi], fx.Int32(0xFFFFC000 - 0x4000))
 
     def load_a_direct(base_k):
         base_k_bytes = base_k * fx.Int32(elem_bytes)
@@ -495,12 +530,12 @@ def _gemm2_body_a16w4(
         # Barrier-free software pipeline: `prefetch` tiles of A/W in flight ahead of the
         # MFMAs (fully unrolled; the ring is Python bookkeeping over SSA values).
         ring = []
-        for t in range_constexpr(min(prefetch, K_TILES_TOTAL)):
-            kb = fx.Int32(t * TILE_K)
+        for t in range_constexpr(min(prefetch, K_TILES)):
+            kb = k_off + fx.Int32(t * TILE_K)
             ring.append((load_a_direct(kb), load_b_tile(kb)))
-        for kt in range_constexpr(K_TILES_TOTAL):
-            if const_expr(kt + prefetch < K_TILES_TOTAL):
-                kb = fx.Int32((kt + prefetch) * TILE_K)
+        for kt in range_constexpr(K_TILES):
+            if const_expr(kt + prefetch < K_TILES):
+                kb = k_off + fx.Int32((kt + prefetch) * TILE_K)
                 ring.append((load_a_direct(kb), load_b_tile(kb)))
             a_frags, (b_raw, b_sc) = ring.pop(0)
             for ni in range_constexpr(num_acc_n):
@@ -510,8 +545,8 @@ def _gemm2_body_a16w4(
                     for mi in range_constexpr(m_repeat):
                         _mma(accm[mi][ni], a_frags[mi][ku], bb)
     else:
-        for kt in range_constexpr(K_TILES_TOTAL):
-            base_k = fx.Int32(kt * TILE_K)
+        for kt in range_constexpr(K_TILES):
+            base_k = k_off + fx.Int32(kt * TILE_K)
             dma_a_tile_to_lds(base_k)
             b_raw, b_sc = load_b_tile(base_k)
             gpu.barrier()
@@ -548,7 +583,7 @@ def _gemm2_body_a16w4(
     )
 
 
-def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
+def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False, ksplit=1):
     """Flattened launch grid for a16w4 gemm2.
 
     Non-persistent (default): one CTA per (m-block x n-block) tile over padded
@@ -558,7 +593,7 @@ def gemm2_a16w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, persist=False):
     total_work = int(max_m_blocks) * (N_OUT // TILE_N)
     if persist and total_work > NUM_CU * 4:
         return min(total_work, NUM_CU)
-    return total_work
+    return total_work * ksplit
 
 
 def compile_gemm2_a16w4_port(
@@ -576,8 +611,16 @@ def compile_gemm2_a16w4_port(
     persist=False,
     a_direct=False,
     prefetch=1,
+    ksplit=1,
+    pad_mask=False,
+    hoist=None,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
+
+    ``ksplit``: split-K across CTAs (grid x ksplit; partials summed by the atomic epilogue).
+    ``pad_mask``: padding rows are OOB-masked in the A loads (zero fill, no L2 traffic).
+    ``hoist`` (default = a_direct): issue expert id / token ids / weights in the kernel
+    prologue together with cumsum0; needs the identity tile mapping (xcd_swizzle <= 0).
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction). Output
     bf16 [tokens, model_dim] via atomic (routing-weighted) scatter.
@@ -612,8 +655,18 @@ def compile_gemm2_a16w4_port(
     if persist:
         _name += "_persist"
     assert prefetch >= 1 and (prefetch == 1 or a_direct), "prefetch>1 needs a_direct"
+    assert ksplit >= 1 and (ksplit == 1 or not persist), "ksplit needs the non-persistent grid"
+    if hoist is None:
+        hoist = a_direct
+    assert not hoist or (xcd_swizzle <= 0 and not persist), "hoist needs xcd_swizzle<=0 and not persist"
     if a_direct:
         _name += "_adirect" + (f"_pf{prefetch}" if prefetch > 1 else "")
+    if ksplit > 1:
+        _name += f"_ks{ksplit}"
+    if pad_mask:
+        _name += "_pm"
+    if hoist and not a_direct:
+        _name += "_hoist"
 
     @fx.struct
     class SharedStorage:
@@ -638,12 +691,18 @@ def compile_gemm2_a16w4_port(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
-        # a_direct prologue (tile == bx when xcd_swizzle == 0): issue the expert id and the
-        # epilogue's token ids / routing weights together with cumsum0 instead of behind the
-        # bound check and after the K loop (each is an exposed memory round trip at M=4).
-        pre_e = pre_packed = pre_weight = None
-        if const_expr(a_direct and xcd_swizzle <= 0 and not persist):
-            _mb = bx_i32 // fx.Int32(_num_n_blocks)
+        if const_expr(ksplit > 1):
+            tile_i32 = bx_i32 // fx.Int32(ksplit)
+            ks_i32 = bx_i32 % fx.Int32(ksplit)
+        else:
+            tile_i32 = bx_i32
+            ks_i32 = None
+        # Hoisted prologue (tile == launch index when xcd_swizzle == 0): issue the expert id
+        # and the epilogue's token ids / routing weights together with cumsum0 instead of
+        # behind the bound check and after the K loop (each is an exposed round trip at M=4).
+        pre_e = pre_packed = pre_weight = pre_rowtok = pre_dirtok = None
+        if const_expr(hoist):
+            _mb = tile_i32 // fx.Int32(_num_n_blocks)
             pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
             _mrow = _mb * fx.Int32(BM)
             _mlane = tx_i32 // fx.Int32(32)
@@ -654,6 +713,20 @@ def compile_gemm2_a16w4_port(
                 _pos = _mrow + fx.Int32(mr * 8) + _mlane
                 pre_packed.append(llvm.load(T.i32, _gep1(_stids_base, _pos * fx.Int32(4)), invariant=True))
                 pre_weight.append(llvm.load(T.f32, _gep1(_sw_base, _pos * fx.Int32(4)), invariant=True))
+            if const_expr(pad_mask):
+                # token ids of the rows this thread / lane loads (same row maps as the body)
+                if const_expr(a_direct):
+                    pre_dirtok = []
+                    for mi in range_constexpr(BM // 16):
+                        _pos = _mrow + fx.Int32(mi * 16) + (tx_i32 % fx.Int32(16))
+                        pre_dirtok.append(llvm.load(T.i32, _gep1(_stids_base, _pos * fx.Int32(4)), invariant=True))
+                else:
+                    _tkd = (TILE_K * 2) // 4
+                    pre_rowtok = []
+                    for i in range_constexpr((BM * TILE_K * 2) // (256 * 16)):
+                        _rl = (tx_i32 * fx.Int32(4) + fx.Int32(i * 256 * 4)) // fx.Int32(_tkd)
+                        _pos = _mrow + _rl
+                        pre_rowtok.append(llvm.load(T.i32, _gep1(_stids_base, _pos * fx.Int32(4)), invariant=True))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_num_n_blocks)
 
@@ -707,6 +780,11 @@ def compile_gemm2_a16w4_port(
                 pre_e=pre_e,
                 pre_packed=pre_packed,
                 pre_weight=pre_weight,
+                ksplit=ksplit,
+                k_split_idx=ks_i32,
+                pad_mask=pad_mask,
+                pre_rowtok=pre_rowtok,
+                pre_dirtok=pre_dirtok,
             )
 
         if const_expr(persist):
@@ -721,13 +799,13 @@ def compile_gemm2_a16w4_port(
                 gpu.barrier()
                 _run_tile(_xcd_np(fx.Int32(iv)))
         else:
-            if bx_i32 < bound:
-                if const_expr(a_direct and _SW <= 0):
-                    # tile == bx: matches the prologue's expert-id / token-id preloads
-                    # (the XCD round-robin remap would need `bound` first).
-                    _run_tile(bx_i32)
+            if tile_i32 < bound:
+                if const_expr(hoist):
+                    # tile == launch index: matches the prologue's preloads (the XCD
+                    # round-robin remap would need `bound` first).
+                    _run_tile(tile_i32)
                 else:
-                    _run_tile(_xcd_np(bx_i32))
+                    _run_tile(_xcd_np(tile_i32))
 
     @flyc.jit
     def launch_gemm2(

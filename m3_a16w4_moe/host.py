@@ -135,6 +135,9 @@ def a16w4_gemm2(
     persist=False,
     a_direct=False,
     prefetch=1,
+    ksplit=1,
+    pad_mask=False,
+    hoist=None,
     stream=None,
 ):
     """Stage 2: down GEMM, routing-weighted bf16 atomic add into ``out_bf16`` [n_tokens, D_HIDDEN]."""
@@ -152,9 +155,12 @@ def a16w4_gemm2(
         persist=persist,
         a_direct=a_direct,
         prefetch=prefetch,
+        ksplit=ksplit,
+        pad_mask=pad_mask,
+        hoist=hoist,
     )
     max_m_blocks = int(sorted_expert_ids.numel())
-    grid = gemm2_a16w4_grid(tile_m, N_OUT=D_HIDDEN, TILE_N=tile_n, max_m_blocks=max_m_blocks, persist=persist)
+    grid = gemm2_a16w4_grid(tile_m, N_OUT=D_HIDDEN, TILE_N=tile_n, max_m_blocks=max_m_blocks, persist=persist, ksplit=ksplit)
     _run_compiled(
         launch,
         inter_sorted_bf16.data_ptr(),

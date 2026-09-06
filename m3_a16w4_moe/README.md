@@ -84,14 +84,23 @@ the weights stop coming from HBM. All rows above are one-call / same-input numbe
 | 09-06 | gemm1 tn16 tk128 pf1 + `--g1-ss 1` | same | 32.28 | vs 32.68 without: sharing the 256-K scale dword is now worth 0.4 us |
 | 09-06 | gemm1 tn16 tk128 pf1 | tn128 **xcd1** / **tn256** / **tn64** / **tk768** / **tk384** | 32.67 / 32.95 / 33.60 / 32.64 / 33.13 | gemm2 tile shape is flat around tn128 tk256 |
 | 09-06 | gemm1 tn16 tk128 pf1 | tn128 xcd0 **a_direct** pf1 / pf3 | 37.10 / 37.04 | gemm2 a_direct still loses (4x A traffic without a K split) |
+| 09-06 | gemm1 tn32 tk128 kw4 a_direct pf3 ss | tn128 tk256 xcd0 | 31.83 | new gemm2 options below measured against this |
+| 09-06 | same | + `--g2-pad-mask 1` | 31.66 | padding rows OOB-masked in the A LDS-DMA (zero fill, no L2 traffic) |
+| 09-06 | same | + `--g2-hoist 1` | 31.85 | prologue hoist alone (identity tile map) is flat |
+| 09-06 | same | + pad-mask + hoist | 31.13 | together -0.7: the row token ids come with cumsum0, so the mask costs no extra round trip |
+| 09-06 | same | + `--g2-ksplit 3` | 31.50 | split-K over CTAs (2448 WGs, one K tile each; atomics sum the partials, cos 0.99998) |
+| 09-06 | same | + ksplit 3 + pad-mask + hoist | **30.93** | |
+| 09-06 | same | tn256 / tk128 ks3 / tk128 ks6 (+pm +hoist) | 31.12 / 31.48 / 32.17 | |
+| 09-06 | gemm1 **pf2** | tn128 tk256 xcd0 ks3 pm hoist | **30.71 us** | current best, -27.6% vs CK-tile 42.44 |
 
-Compare only numbers measured with 100 different inputs per graph: **32.4 us vs 42.4 us CK-tile**.
+Compare only numbers measured with 100 different inputs per graph: **30.7 us vs 42.4 us CK-tile**.
 
 Current best command:
 
 ```bash
-PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --g1-tile-n 16 --g1-tile-k 128 --k-wave 4 \
-    --g1-a-direct 1 --g2-tile-n 128 --g2-xcd 0 --sort mxfp4
+PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --k-wave 4 --sort mxfp4 \
+    --g1-tile-n 32 --g1-tile-k 128 --g1-a-direct 1 --g1-pf 2 --g1-ss 1 \
+    --g2-tile-n 128 --g2-tile-k 256 --g2-xcd 0 --g2-ksplit 3 --g2-pad-mask 1 --g2-hoist 1
 ```
 
 Sorting: `aiter.fused_moe._adaptive_moe_sort` (already in the image) launches aiter#3832's
