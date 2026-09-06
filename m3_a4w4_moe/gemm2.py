@@ -47,6 +47,8 @@ Layouts (bytes):
   OUT_sc    [n_tokens*topk, H/32]         e8m0 (fp8 mode; any buffer in bf16 mode)
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
@@ -283,6 +285,10 @@ class _BScaleGather:
             "buffer_load_dword $4, $2, $3 offen lds"
         )
         _asm_void([m0, self.voff[0], self.rsrc, soff, self.voff[1]], asm, "s,v,s,s,v", "~{scc}")
+
+
+_NO_STORE = os.environ.get("M3_G2_NO_STORE", "0") == "1"  # timing experiments only: no output stores
+_STORE_CPOL = int(os.environ.get("M3_G2_STORE_CPOL", "0"), 0)  # experiment: cache-policy bits of the output stores
 
 
 def compile_moe_gemm2(
@@ -688,9 +694,11 @@ def compile_moe_gemm2(
                         row = lane_id // CH + ROWS_PER_ST * k
                         chunk = lane_id % CH
                         data = _lds_load_vec(_stg_addr(row, chunk, 0), 4)
-                        _buffer_ops.buffer_store(
-                            data, out_rsrc, out_off[h][k] + col_wave + chunk * 16, mask=mask, offset_is_bytes=True
-                        )
+                        if const_expr(not _NO_STORE):
+                            _buffer_ops.buffer_store(
+                                data, out_rsrc, out_off[h][k] + col_wave + chunk * 16, mask=mask, offset_is_bytes=True,
+                                cache_modifier=_STORE_CPOL,
+                            )
 
                     ts.append(_st)
                 if const_expr(FP8):
@@ -698,7 +706,10 @@ def compile_moe_gemm2(
                     def _st_sc():
                         scv = _lds_load_i32(stg_sc_base + (lane_id % 32) * 4)
                         sc_col = (chunk_n0 + _pn(nt)) * fx.Int32(BN // 32) + wave_j * 4
-                        _buffer_ops.buffer_store(scv, osc_rsrc, sc_off[h] + sc_col, mask=mask, offset_is_bytes=True)
+                        if const_expr(not _NO_STORE):
+                            _buffer_ops.buffer_store(
+                                scv, osc_rsrc, sc_off[h] + sc_col, mask=mask, offset_is_bytes=True, cache_modifier=_STORE_CPOL
+                            )
 
                     ts.append(_st_sc)
                 return ts

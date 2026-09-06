@@ -57,6 +57,8 @@ stream)`` -- the argument list of ``gemm2.py`` with the grid size replaced by th
 number of persistent CTAs (256 = one per CU; must be a multiple of 8).
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
@@ -73,6 +75,7 @@ from m3_a4w4_moe.gemm1 import (
     _Buf,
     _N_WAVES,
     _as_f32,
+    _asm_void,
     _bits,
     _divmod_nonneg,
     _g2s_thunks,
@@ -209,14 +212,15 @@ def _make_vec4(vals):
 def _derive_vmcnt(NB, NG, ST, NID, NA_DIR, NA_DMA, NT, K_ITERS=3):
     """vmcnt allowances from the per-wave VMEM issue order (loads and stores retire in
     order). Prologue: g(0) g(1) g(2) | A slice 0 direct (NA_DIR) | A slice 2 fragments
-    0..2 | ids (NID) | A slice 1 DMA (NA_DMA) | scales DMA (1) | B(0) B(1) B(2). Step s =
-    (tile, kb): top wait | P1 b0(s+3) x NB | seg2 wait | P3 b1(s+3) x NB, g(s+3) x NG |
-    P4 ST stores for kb 2, and for kb 0 unless this is the item's tile 0. Boundary
-    (last tile L of an item, tile 0 of the next): (L,0) top: slice-0 DMA (NA_DMA) +
-    scales DMA (1); (L,2) P3 before b1: slice-1 DMA; (L,2) after P4: slice-2 fragments
-    0..2; tail: ST stores, ids (NID); (0,0) P1 before b0: fragments 3..5; P3 before b1:
-    fragments 6..7. Consumers: slice 0 + scales read at (L,2) top, slice 1 at (0,1)
-    top, slice 2 needed at (0,2), ids pinned at (0,2) top ('PIN'). Contexts: F = first
+    0..2 | A slice 1 DMA (NA_DMA) | scales DMA (1) | B(0) B(1) B(2). Step s = (tile, kb):
+    top wait | P1 b0(s+3) x NB | seg2 wait | P3 b1(s+3) x NB, g(s+3) x NG | P4 ST stores
+    for kb 0 and 2 (kb 0 of an item's tile 0 flushes the previous item's last rows).
+    Boundary (last tile L of an item, tile 0 of the next): (L,0) top: slice-0 DMA
+    (NA_DMA) + scales DMA (1); (L,2) P3 before b1: slice-1 DMA; (L,2) after P4: slice-2
+    fragments 0..2; (0,0) P1 before b0: fragments 3..5; P3 before b1: fragments 6..7;
+    (0,0) after P4's stores: the item's row ids (NID). Consumers: slice 0 + scales read
+    at (L,2) top, slice 1 at (0,1) top, slice 2 needed at (0,2), ids pinned at (0,2) top
+    ('PIN'). Contexts: F = first
     tile of the CTA, N = first tile of a later item, L = last tile of an item, S =
     steady. 'WA' / 'WB0' = prologue waits after the A loads / after B(0). Allowances
     are capped at 63 (stricter is still correct)."""
@@ -231,7 +235,6 @@ def _derive_vmcnt(NB, NG, ST, NID, NA_DIR, NA_DMA, NT, K_ITERS=3):
     n_frag = NA_DIR // 3  # fragments per K-slice
     seq += g(0) + g(1) + g(2)
     seq += [("A0", 0, i) for i in range(n_frag)] + [("A2", 0, i) for i in range(3)]
-    seq += [("id", 0, i) for i in range(NID)]
     seq += [("ADMA1", 0, i) for i in range(NA_DMA)] + [("SDMA", 0, 0)]
     seq += B(0) + B(1) + B(2)
     seq += [("W", "WA", 0), ("W", "WB0", 0)]
@@ -261,12 +264,12 @@ def _derive_vmcnt(NB, NG, ST, NID, NA_DIR, NA_DMA, NT, K_ITERS=3):
                 if t == 0 and kb == 0:
                     seq += [("A2", j, i) for i in range(6, 8)]
                 seq += [("b1", s + 3, i) for i in range(NB)] + g(s + 3)
-                if kb == 2 or (kb == 0 and t > 0):
+                if kb in (0, 2):
                     seq += [("st", s, i) for i in range(ST)]
+                if t == 0 and kb == 0:
+                    seq += [("id", j, i) for i in range(NID)]  # after the previous item's last flush
                 if t == NT - 1 and kb == 2:
                     seq += [("A2", j + 1, i) for i in range(3)]
-        seq += [("st", "tail", j, i) for i in range(ST)]
-        seq += [("id", j + 1, i) for i in range(NID)]
 
     def idx_last(pred, before):
         c = [i for i, y in enumerate(seq[:before]) if y[0] != "W" and pred(y)]
@@ -278,12 +281,10 @@ def _derive_vmcnt(NB, NG, ST, NID, NA_DIR, NA_DMA, NT, K_ITERS=3):
             continue
         kind = x[1]
         if kind == "WA":
-            tpos = idx_last(lambda y: y[0] in ("A0", "A2", "id", "ADMA1", "SDMA"), idx)
+            tpos = idx_last(lambda y: y[0] in ("A0", "A2", "ADMA1", "SDMA"), idx)
         elif kind == "WB0":
             tpos = idx_last(lambda y: y[0] == "b1" and y[1] == 0, idx)
         elif kind == "PIN":
-            if x[2] == 0:
-                continue
             tpos = idx_last(lambda y: y[0] == "id" and y[1] == x[2], idx)
         elif kind in ("RD0", "RD1", "USE2"):
             j = x[2]
@@ -362,6 +363,7 @@ def compile_moe_gemm2_persist(
     a_lds_size = LDS_BLOCK_M * BLOCK_K_BYTES  # 8 KB: one A half of one K-slice
     A_LDS_BYTES = 2 * a_lds_size  # 16 KB: one K-slice of the next item
     AS_LDS_BYTES = 4 * 1024  # 3 KB of A scales (+1 KB spill)
+    JUNK_LDS_BYTES = _N_WAVES * 1024  # landing zone of the L2 touch-prefetch DMAs
     STG_ROW = WAVE_COLS * OUT_ELEM  # 128 (fp8) / 256 (bf16) B per staged row
     CH = STG_ROW // 16
     STG_DATA = 32 * STG_ROW
@@ -370,7 +372,7 @@ def compile_moe_gemm2_persist(
     STG_LDS_BYTES = _N_WAVES * STG_WAVE
     ROWS_PER_ST = 64 // CH
     N_ST = 32 // ROWS_PER_ST
-    assert LDS_TILES_BYTES + SC_LDS_BYTES + A_LDS_BYTES + AS_LDS_BYTES + STG_LDS_BYTES <= 160 * 1024
+    assert LDS_TILES_BYTES + SC_LDS_BYTES + A_LDS_BYTES + AS_LDS_BYTES + JUNK_LDS_BYTES + STG_LDS_BYTES <= 160 * 1024
     assert N_ST % 4 == 0, "row ids come as dwordx4 per 4 consecutive flush rows"
 
     NB = N_TILES_B
@@ -396,6 +398,7 @@ def compile_moe_gemm2_persist(
         scale_lds: fx.Array[fx.Int8, SC_LDS_BYTES, 16]
         a_lds: fx.Array[fx.Int8, A_LDS_BYTES, 16]
         as_lds: fx.Array[fx.Int8, AS_LDS_BYTES, 16]
+        junk_lds: fx.Array[fx.Int8, JUNK_LDS_BYTES, 16]
         stage_lds: fx.Array[fx.Int8, STG_LDS_BYTES, 16]
 
     @flyc.kernel
@@ -419,6 +422,7 @@ def compile_moe_gemm2_persist(
         _sc_ptr = lds.scale_lds.ptr
         _a_ptr = lds.a_lds.ptr
         _as_ptr = lds.as_lds.ptr
+        _junk_ptr = lds.junk_lds.ptr
         _stg_ptr = lds.stage_lds.ptr
 
         def b_buf(s, half):
@@ -469,6 +473,20 @@ def compile_moe_gemm2_persist(
             return [tile_i, chunk * fx.Int32(NT), expert, nt_rot]
 
         _D_TILE, _D_N0, _D_EXP, _D_ROT = 0, 1, 2, 3
+
+        # experiment: stagger CTA starts by slot phase (M3_G2P_STAGGER=<phases>,<sleeps>)
+        _STG = os.environ.get("M3_G2P_STAGGER", "0,0").split(",")
+        STAGGER_PHASES, STAGGER_SLEEPS = int(_STG[0]), int(_STG[1])
+        # experiment: skip the next item's A / scale / id loads (timing only, output wrong)
+        _NOA = os.environ.get("M3_G2P_NOALOAD", "0")
+        NOALOAD = _NOA == "1"  # skip A / scales / ids
+        NOALOAD_A = _NOA in ("1", "2")  # skip A / scales (ids still loaded)
+        NOSTORE = os.environ.get("M3_G2P_NOSTORE", "0") == "1"  # timing only: no output stores
+        TOUCH = os.environ.get("M3_G2P_TOUCH", "0") == "1"  # L2 touch-prefetch of the next item's A / scales / ids
+        if const_expr(STAGGER_PHASES > 1):
+            n_sleep = _divmod_nonneg(slot, STAGGER_PHASES)[1] * fx.Int32(STAGGER_SLEEPS)
+            for _ in range(0, n_sleep):
+                _asm_void([], "s_sleep 127", "")
 
         if n_items > fx.Int32(0):
             ids_rsrc = _buffer_ops.create_buffer_resource(
@@ -527,6 +545,28 @@ def compile_moe_gemm2_persist(
             as_g2s = G2SLoaderAsm(as_rsrc, [wave_id * 1024 + lane_id * 16], 1, wave_id)
             as_g2s.set_wave_base(_as_ptr)
             as_base_i32 = fx.Int32(fx.ptrtoint(_as_ptr))
+            # L2 touch-prefetch: lane L pulls one 128-B line; wave w covers lines
+            # w*128 .. w*128+127 of the A tile (2 instructions), every wave the scales / ids
+            _touch_a = [
+                G2SLoaderAsm(a_rsrc, [lane_id * 128 + wave_id * 16384 + i * 8192], 1, wave_id) for i in range(2)
+            ]
+            _touch_sa = G2SLoaderAsm(as_rsrc, [lane_id * 128], 1, wave_id)
+            _touch_ids = G2SLoaderAsm(ids_rsrc, [lane_id * 128], 1, wave_id)
+            _touch_w = G2SLoaderAsm(sw_rsrc, [lane_id * 128], 1, wave_id)
+            for ld in _touch_a + [_touch_sa, _touch_ids, _touch_w]:
+                ld.set_wave_base(_junk_ptr)
+            _junk = _Buf(_junk_ptr, 0)
+
+            def _touch_thunks(d):
+                """4-5 junk DMAs that bring item ``d``'s A tile, scales and row ids into L2"""
+                a_soff = d[_D_TILE] * fx.Int32(BM * K_BYTES)
+                sa_soff = (d[_D_TILE] * fx.Int32(BM // 32)) * fx.Int32(SC_BLOCKS_PER_G * 256)
+                id_soff = d[_D_TILE] * fx.Int32(BM * 4)
+                ts = [lambda i=i: _touch_a[i].load_one(_junk, a_soff, 0) for i in range(2)]
+                ts.append(lambda: _touch_sa.load_one(_junk, sa_soff, 0))
+                ts.append(lambda: _touch_ids.load_one(_junk, id_soff, 0))
+                ts += [lambda: _touch_w.load_one(_junk, id_soff, 0)] if not FP8 else []
+                return ts
             sc_base_i32 = fx.Int32(fx.ptrtoint(_sc_ptr))
             bsg = _BScaleGather(bs_rsrc, lane_id, wave_id, sc_base_i32)
             a_s2r = S2RLoaderFp4(wave_i, N_TILES_A)
@@ -642,18 +682,32 @@ def compile_moe_gemm2_persist(
                             cur["off"][h][4 * q + e] = _orow(sid) * fx.Int32(OUT_ROW_BYTES)
                 n = 2 * N_IDV
                 cur["sc_off"] = [_orow(raw[n + h]) * fx.Int32(OUT_SC_COLS) for h in range(2)] if FP8 else None
-                cur["w"] = (
-                    [[_as_f32(raw[n + h * N_TILES_A + ti]) for ti in range(N_TILES_A)] for h in range(2)] if not FP8 else None
+                cur["wbits"] = (
+                    [[raw[n + h * N_TILES_A + ti] for ti in range(N_TILES_A)] for h in range(2)] if not FP8 else None
                 )
 
             def _bound_rows_flat():
-                """the registers the next item's raw ids are loaded into (order of _load_ids)"""
+                """the registers the next item's raw ids are loaded into (order of _load_ids);
+                also the loop-carried form of the epilogue values"""
                 vals = [_make_vec4(cur["off"][h][4 * q : 4 * q + 4]) for h in range(2) for q in range(N_IDV)]
                 if FP8:
                     vals += [cur["sc_off"][h] for h in range(2)]
                 else:
-                    vals += [_bits(cur["w"][h][ti]) for h in range(2) for ti in range(N_TILES_A)]
+                    vals += [cur["wbits"][h][ti] for h in range(2) for ti in range(N_TILES_A)]
                 return vals
+
+            def _set_rows(vals):
+                """inverse of _bound_rows_flat (loop-carried values -> cur)"""
+                cur["off"] = [
+                    [v for q in range(N_IDV) for v in _vec4_elems(vals[h * N_IDV + q])] for h in range(2)
+                ]
+                n = 2 * N_IDV
+                cur["sc_off"] = [fx.Int32(vals[n + h]) for h in range(2)] if FP8 else None
+                cur["wbits"] = (
+                    [[fx.Int32(vals[n + h * N_TILES_A + ti]) for ti in range(N_TILES_A)] for h in range(2)]
+                    if not FP8
+                    else None
+                )
 
             # ---- epilogue (as gemm2.py; the offsets come from ``cur`` filled per item) ----
             stg_base = fx.Int32(fx.ptrtoint(_stg_ptr)) + wave_id * fx.Int32(STG_WAVE)
@@ -665,7 +719,7 @@ def compile_moe_gemm2_persist(
 
             def _stage_bf16(cq, h, hb, ti, tj):
                 cv = Vec(_pin_vec4(cq[mfma.idx(ti, tj)]))
-                w = cur["w"][h][ti]
+                w = _as_f32(cur["wbits"][h][ti])
                 v = [fx.Float32(cv[k]) * w for k in range_constexpr(4)]
                 row = ti * 16 + r16
                 chunk = hb * 8 + tj * 2 + g4 // 2
@@ -720,9 +774,10 @@ def compile_moe_gemm2_persist(
                         row = (lane_id // CH) * N_ST + k
                         chunk = lane_id % CH
                         data = _lds_load_vec(_stg_addr(row, chunk, 0), 4)
-                        _buffer_ops.buffer_store(
-                            data, out_rsrc, cur["off"][h][k] + col_wave + chunk * 16, mask=mask, offset_is_bytes=True
-                        )
+                        if const_expr(not NOSTORE):
+                            _buffer_ops.buffer_store(
+                                data, out_rsrc, cur["off"][h][k] + col_wave + chunk * 16, mask=mask, offset_is_bytes=True
+                            )
 
                     ts.append(_st)
                 if const_expr(FP8):
@@ -730,7 +785,8 @@ def compile_moe_gemm2_persist(
                     def _st_sc():
                         scv = _lds_load_i32(stg_sc_base + (lane_id % 32) * 4)
                         sc_col = (d[_D_N0] + _pn(d, nt)) * fx.Int32(BN // 32) + wave_j * 4
-                        _buffer_ops.buffer_store(scv, osc_rsrc, cur["sc_off"][h] + sc_col, mask=mask, offset_is_bytes=True)
+                        if const_expr(not NOSTORE):
+                            _buffer_ops.buffer_store(scv, osc_rsrc, cur["sc_off"][h] + sc_col, mask=mask, offset_is_bytes=True)
 
                     ts.append(_st_sc)
                 return ts
@@ -791,7 +847,12 @@ def compile_moe_gemm2_persist(
                 _wait("seg2", kb, ctx)
                 _b0n = [None] * NB
                 _b1n = [None] * NB
-                il = list(hooks.get("p3", [])) + _g2s_thunks(b1_g2s, b_buf(kb, 1), b_off3, NB) + [lambda: _gather(d_nt, nt_next, kb)]
+                il = (
+                    list(hooks.get("p3", []))
+                    + _g2s_thunks(b1_g2s, b_buf(kb, 1), b_off3, NB)
+                    + [lambda: _gather(d_nt, nt_next, kb)]
+                    + list(hooks.get("p3post", []))
+                )
                 mfma.call(a1f, b0f, c10, [st["saA"][1][kb]], sbC0, interleave=il, zero_acc=zero, late=_late(3))
                 il = _s2r_thunks(b_s2r, bn0, _b0n, NB, True) + _s2r_thunks(b_s2r, bn1, _b1n, NB, True)
                 mfma.call(a1f, b1f, c11, [st["saA"][1][kb]], sbC1, interleave=il, zero_acc=zero, late=_late(4))
@@ -821,19 +882,18 @@ def compile_moe_gemm2_persist(
                 c11 = list(s_[o : o + N_ACCUMS])
                 return b0f, b1f, sc, c11
 
-            def _n_tile(d, d_nt, nt, nt_next, ctx, b0f, b1f, sc, c11_prev, nt_prev, st, hooks_by_kb=None):
-                """as gemm2.py; ``c11_prev`` None = the item's tile 0 (nothing pending)"""
+            def _n_tile(d, d_nt, nt, nt_next, ctx, b0f, b1f, sc, c11_prev, nt_prev, st, hooks_by_kb=None, d_prev=None, mask_prev=None):
+                """as gemm2.py: the previous tile's c11 is staged in kb 0 P1 and its rows
+                flushed in kb 0 P4 (``d_prev`` / ``mask_prev`` when that tile belonged to
+                the previous item -- or to nothing, for the CTA's first tile)"""
                 accs = tuple([None] * N_ACCUMS for _ in range(4))
                 hooks_by_kb = hooks_by_kb or {}
+                dp = d_prev if d_prev is not None else d
                 epi_by_kb = {
-                    0: (
-                        {
-                            1: lambda a: _stage_thunks(c11_prev, 1, 1),
-                            4: lambda a: _flush_thunks(d, 1, nt_prev, None),
-                        }
-                        if c11_prev is not None
-                        else {}
-                    ),
+                    0: {
+                        1: lambda a: _stage_thunks(c11_prev, 1, 1),
+                        4: lambda a: _flush_thunks(dp, 1, nt_prev, mask_prev),
+                    },
                     1: {},
                     2: {
                         2: lambda a: _stage_thunks(a[0], 0, 0),
@@ -877,13 +937,16 @@ def compile_moe_gemm2_persist(
             aF0 = [_empty_slice() for _ in range(K_ITERS)]
             _load_a_frags(d0, 0, aF0[0], list(range(len(_FRAGS))))  # slice 0: direct (all 8)
             _load_a_frags(d0, 2, aF0[2], [0, 1, 2])  # slice 2: fragments 0..2 (3..7 in tile 0)
-            ids0 = _load_ids(d0, None)
             for t in _a_dma_thunks(d0, 1) + _sa_dma_thunk(d0):  # slice 1 + scales into LDS
                 t()
             for kb in range_constexpr(K_ITERS):
                 _load_b(d0, n0, kb)
-            wait_barrier(VM["WA"])  # A loads, ids, slice-1 / scale DMAs landed (B(0..2) may fly)
-            ids0p = _wait_pin_any(ids0, VM["WA"])
+            wait_barrier(VM["WA"])  # A loads, slice-1 / scale DMAs landed (B(0..2) may fly)
+            # the epilogue values (row offsets / weights) an item's tile 0 replaces with the
+            # next ids: undefined before the first item (its tile-0 flush is masked)
+            cur["off"] = [[_undef_i32() for _ in range(N_ST)] for _ in range(2)]
+            cur["sc_off"] = [_undef_i32() for _ in range(2)] if FP8 else None
+            cur["wbits"] = [[_undef_i32() for _ in range(N_TILES_A)] for _ in range(2)] if not FP8 else None
             saA0 = [[None] * K_ITERS for _ in range(2)]
             for kb in range_constexpr(2):
                 r = _read_sa(kb)
@@ -910,8 +973,9 @@ def compile_moe_gemm2_persist(
                 + [_R(v) for v in d1]
                 + _flat_a(aF0)
                 + _flat_sa(saA0)
-                + [_R(v) for v in ids0p]
-                + _flat_state(b0f, b1f, (_sc0[:2], _sc0[2:]), [zero_v4] * N_ACCUMS)[: 4 * NB + 4]
+                + _flat_state(b0f, b1f, (_sc0[:2], _sc0[2:]), [zero_v4] * N_ACCUMS)
+                + [_R(v) for v in d0]  # "previous item" of item 0 (its flush is masked)
+                + [_R(v) for v in _bound_rows_flat()]
             )
             N_D = 4
             for j, ist in range(0, n_items, init=item_init):
@@ -924,15 +988,15 @@ def compile_moe_gemm2_persist(
                 o += NA
                 st["saA"] = _unflat_sa(ist[o : o + NSA])
                 o += NSA
-                st["ids_raw"] = _unflat_ids(ist[o : o + NID])
+                b0f, b1f, sc, c11_prev = _unflat_state(ist[o : o + 4 * NB + 4 + N_ACCUMS])
+                o += 4 * NB + 4 + N_ACCUMS
+                d_prev = [fx.Int32(v) for v in ist[o : o + N_D]]
+                o += N_D
+                _set_rows(ist[o : o + NID])
                 o += NID
-                b0f = _unflat_b(ist[o : o + 2 * NB])
-                o += 2 * NB
-                b1f = _unflat_b(ist[o : o + 2 * NB])
-                o += 2 * NB
-                sc = (list(ist[o : o + 2]), list(ist[o + 2 : o + 4]))
                 j_i = fx.Int32(j)
                 first_item = j_i == fx.Int32(0)
+                mask_prev = fx.as_ir_value(j_i > fx.Int32(0))  # item 0: nothing to flush
                 # the descriptor of item j+2, used by the next iteration's last tile; its
                 # scalar loads hide behind this item's tiles and tail
                 dnn = _pin_sgprs(_desc(j_i + fx.Int32(2)))
@@ -948,25 +1012,51 @@ def compile_moe_gemm2_persist(
                 def _pin():
                     _bind_rows(_wait_pin_any(st["ids_raw"], VM["PIN"]))
 
+                def _ld_ids():
+                    # right after the previous item's last rows went out: their offsets die
+                    # here and this item's raw ids take their registers
+                    st["ids_raw"] = _load_ids(d, _bound_rows_flat()) if not NOALOAD else _bound_rows_flat()
+
                 hooks0 = {
                     0: {
                         "top": [_rd_sa2],
                         "p1": [lambda f=f: _load_a_frags(d, 2, st["aF"][2], [f]) for f in range(3, 6)],
                         "p3": [lambda f=f: _load_a_frags(d, 2, st["aF"][2], [f]) for f in range(6, 8)],
+                        "p4": [_ld_ids],
                     },
                     1: {"top": [_rd_slice1]},
                     2: {"top": [_pin]},
                 }
+                if const_expr(NOALOAD_A):
+                    hooks0 = {0: {"top": [_rd_sa2], "p4": [_ld_ids]}, 1: {"top": [_rd_slice1]}, 2: {"top": [_pin]}}
                 b0f, b1f, sc, c11p = _n_tile(
-                    d, d, fx.Int32(0), fx.Int32(1), first_item, b0f, b1f, sc, None, None, st, hooks0
+                    d, d, fx.Int32(0), fx.Int32(1), first_item, b0f, b1f, sc, c11_prev, fx.Int32(NT - 1), st, hooks0,
+                    d_prev=d_prev, mask_prev=mask_prev,
                 )
                 inner_init = _flat_state(b0f, b1f, sc, c11p)
+                touch = _touch_thunks(dn)
                 for np_, state in range(0, NT // 2 - 1, init=inner_init):
                     b0f, b1f, sc, c11p = _unflat_state(state)
-                    nt_e = fx.Int32(np_) * fx.Int32(2) + fx.Int32(1)
+                    np_i = fx.Int32(np_)
+                    nt_e = np_i * fx.Int32(2) + fx.Int32(1)
                     nt_o = nt_e + fx.Int32(1)
-                    b0f, b1f, sc, c11e = _n_tile(d, d, nt_e, nt_o, "S", b0f, b1f, sc, c11p, nt_e - fx.Int32(1), st)
-                    b0f, b1f, sc, c11o = _n_tile(d, d, nt_o, nt_o + fx.Int32(1), "S", b0f, b1f, sc, c11e, nt_e, st)
+                    is_last_pair = np_i == fx.Int32(NT // 2 - 2)
+
+                    def _guarded(t):
+                        def _run():
+                            if is_last_pair:
+                                t()
+
+                        return _run
+
+                    hooks_e = {kb: {"p3post": [_guarded(touch[kb])]} for kb in range(K_ITERS)} if TOUCH else None
+                    hooks_o = (
+                        {kb: {"p3post": [_guarded(touch[K_ITERS + kb])]} for kb in range(K_ITERS) if K_ITERS + kb < len(touch)}
+                        if TOUCH
+                        else None
+                    )
+                    b0f, b1f, sc, c11e = _n_tile(d, d, nt_e, nt_o, "S", b0f, b1f, sc, c11p, nt_e - fx.Int32(1), st, hooks_e)
+                    b0f, b1f, sc, c11o = _n_tile(d, d, nt_o, nt_o + fx.Int32(1), "S", b0f, b1f, sc, c11e, nt_e, st, hooks_o)
                     state = yield _flat_state(b0f, b1f, sc, c11o)
                 # last tile (peeled): streams the next item's A / scales in, prefetches its
                 # n-tile 0, then the tail flushes what this tile leaves behind
@@ -987,23 +1077,29 @@ def compile_moe_gemm2_persist(
                         "p4": [lambda: _load_a_frags(dn, 2, st["aF"][2], [0, 1, 2])],
                     },
                 }
+                if const_expr(NOALOAD_A):
+                    hooksL = {2: {"top": [_rd_slice0_sa01]}}
                 b0f, b1f, sc, c11o = _n_tile(d, dn, nt_l, fx.Int32(0), "L", b0f, b1f, sc, c11p, nt_l - fx.Int32(1), st, hooksL)
-                for t in _stage_thunks(c11o, 1, 1) + _flush_thunks(d, 1, nt_l, None):
-                    t()
-                # row ids of the next item, on top of this item's epilogue values
-                ids_next = _load_ids(dn, _bound_rows_flat())
+                # the last tile's c11 / row half 1 go out in the next item's tile 0 (kb 0)
                 ist = yield (
                     [_R(v) for v in dn]
                     + [_R(v) for v in dnn]
                     + _flat_a(st["aF"])
                     + _flat_sa(st["saA"])
-                    + [_R(v) for v in ids_next]
-                    + _flat_b(b0f)
-                    + _flat_b(b1f)
-                    + [_R(v) for v in sc[0]]
-                    + [_R(v) for v in sc[1]]
+                    + _flat_state(b0f, b1f, sc, c11o)
+                    + [_R(v) for v in d]
+                    + [_R(v) for v in _bound_rows_flat()]
                 )
 
+            # the CTA's last rows: nothing left to hide them behind
+            o = 2 * N_D + NA + NSA
+            _, _, _, c11_last = _unflat_state(ist[o : o + 4 * NB + 4 + N_ACCUMS])
+            o += 4 * NB + 4 + N_ACCUMS
+            d_last = [fx.Int32(v) for v in ist[o : o + N_D]]
+            o += N_D
+            _set_rows(ist[o : o + NID])
+            for t in _stage_thunks(c11_last, 1, 1) + _flush_thunks(d_last, 1, fx.Int32(NT - 1), None):
+                t()
             # never retire with DMA in flight (the CU reuses the LDS)
             wait_barrier(0)
 
