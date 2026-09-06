@@ -834,6 +834,14 @@ def compile_moe_gemm1(
             # which hurts when B comes from HBM (expert switch) not L2.
             _MAIN_VMCNT = 2 * N_TILES_A + 2 * N_TILES_B + 1
             _SEG2_VMCNT = 2 * N_TILES_A + N_TILES_B + 1
+            # Step 0 follows the prologue, whose issue order differs from a step's:
+            # [.. a_cur1 (NA) | a_next0 (NA), b_next0 (NB), b_next1 (NB), a_next1 (NA)].
+            # Its A half 1 (a_cur1) is complete once only the 4 next batches fly;
+            # its SEG2 (a_next0 / b_next0 / b_next1) once only a_next1 + this step's
+            # a0 + b0 fly. One count too loose here let the last DMA of a_cur1
+            # (rows 96..127) land after the reads: run-to-run differences in a few rows.
+            _STEP0_VMCNT = 2 * N_TILES_A + 2 * N_TILES_B
+            _STEP0_SEG2_VMCNT = 2 * N_TILES_A + N_TILES_B
 
             def _read_scale_thunks(kc_idx, holder):
                 s = _slot(kc_idx)
@@ -848,7 +856,9 @@ def compile_moe_gemm1(
                     lambda: _r(3, b_scale_ld, 1),
                 ]
 
-            def _one_step(kc, a0f, b0f, b1f_in, sc, accs, bufs, zero_acc=False):
+            def _one_step(kc, a0f, b0f, b1f_in, sc, accs, bufs, zero_acc=False, top_vmcnt=None, seg2_vmcnt=None):
+                top_vmcnt = _MAIN_VMCNT if top_vmcnt is None else top_vmcnt
+                seg2_vmcnt = _SEG2_VMCNT if seg2_vmcnt is None else seg2_vmcnt
                 ac0, ac1, an0, an1, bc0, bc1, bn0, bn1 = bufs
                 saR0, saR1, sbC0, sbC1 = sc
                 c00f, c01f, c10f, c11f = accs
@@ -870,7 +880,7 @@ def compile_moe_gemm1(
                 _gk = _min(kc_i + fx.Int32(3), fx.Int32(K_ITERS - 1))
                 _sc_gather = _gather_scale_thunks(_gk, _slot(_gk))
 
-                wait_barrier(_MAIN_VMCNT)
+                wait_barrier(top_vmcnt)
                 il = (
                     _riffle(_g2s_thunks(a0_g2s, ac0, a0_off, N_TILES_A), _s2r_thunks(a_s2r, ac1, _a1, N_TILES_A, False))
                     + _rd_scn[:2]
@@ -881,7 +891,7 @@ def compile_moe_gemm1(
                 c01f = mfma.call(a0f, b1f_in, c01f, saR0, sbC1, interleave=il, zero_acc=zero_acc)
                 a1f = _a1
 
-                wait_barrier(_SEG2_VMCNT)
+                wait_barrier(seg2_vmcnt)
                 il = (
                     _riffle(_g2s_thunks(b_g2s, bc1, b1_off, N_TILES_B), _s2r_thunks(a_s2r, an0, _a0n, N_TILES_A, False))
                     + _sc_gather
@@ -931,7 +941,10 @@ def compile_moe_gemm1(
                 return (saR0, saR1, sbC0, sbC1)
 
             _accs0 = ([None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS, [None] * N_ACCUMS)
-            a0f, b0f, b1f, sc, accs, _ = _one_step(0, a0_frag, b0_frag, b1_frag, sc0, _accs0, bufs0, zero_acc=True)
+            a0f, b0f, b1f, sc, accs, _ = _one_step(
+                0, a0_frag, b0_frag, b1_frag, sc0, _accs0, bufs0, zero_acc=True,
+                top_vmcnt=_STEP0_VMCNT, seg2_vmcnt=_STEP0_SEG2_VMCNT,
+            )
             a0f, b0f, b1f, sc, accs, _ = _one_step(1, a0f, b0f, b1f, sc, accs, _swap_bufs(bufs0))
 
             init_state = (

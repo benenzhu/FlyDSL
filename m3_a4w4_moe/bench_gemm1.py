@@ -227,6 +227,13 @@ else:
 print(f"[gemm1:{args.kernel}] compile {time.time() - t0:.1f}s", flush=True)
 call(c0)
 torch.cuda.synchronize()
+_q1, _s1 = c0.out_q.clone(), c0.out_s.clone()
+call(c0)
+torch.cuda.synchronize()
+_nv = int(c0.num_valid[0].item())
+_dq = (c0.out_q != _q1)[:_nv]
+_ds = c0.out_s != _s1
+print(f"[gemm1] determinism: run 2 vs run 1 fp4 bytes differing {int(_dq.sum())} (rows {int(_dq.any(dim=1).sum())} of {_nv}), scale bytes differing {int(_ds.sum())}", flush=True)
 
 # ---- correctness on sampled valid rows ----
 if args.check_rows > 0 and not args.fake_dense:

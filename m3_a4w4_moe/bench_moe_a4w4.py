@@ -274,6 +274,76 @@ torch.cuda.synchronize()
 if not args.no_prod:
     y_prod = c0.prod().clone()
     torch.cuda.synchronize()
+# determinism: the same inputs again must give the same bits (a race shows up here)
+for rep in range(2):
+    y2 = c0.mine().clone()
+    torch.cuda.synchronize()
+    d = (y2.view(torch.int16) != y_mine.view(torch.int16)).any(dim=1)
+    print(f"[moe] determinism: mine run {rep + 2} vs run 1: rows differing {int(d.sum())}/{M}", flush=True)
+if not args.no_prod:
+    y2 = c0.prod().clone()
+    torch.cuda.synchronize()
+    d = (y2.view(torch.int16) != y_prod.view(torch.int16)).any(dim=1)
+    print(f"[moe] determinism: prod run 2 vs run 1: rows differing {int(d.sum())}/{M}", flush=True)
+
+
+def _stage_determinism():
+    """which stage is racy: sort twice (row order may legitimately differ), then with the
+    sort buffers frozen run quant -> tile_map -> gemm1 -> gemm2 -> reduce twice and
+    compare every intermediate bitwise"""
+    b = c0.bufs
+    c0.stage_sort()
+    torch.cuda.synchronize()
+    s1 = b.sorted_ids.clone()
+    c0.stage_sort()
+    torch.cuda.synchronize()
+    print(f"[moe] determinism: sort run 2 vs run 1: sorted_ids entries differing {int((b.sorted_ids != s1).sum())}/{s1.numel()}", flush=True)
+
+    def _run():
+        c0.stage_quant()
+        c0.stage_tile_map()
+        c0.stage_gemm1()
+        c0.stage_gemm2()
+        c0.stage_reduce()
+        torch.cuda.synchronize()
+        return {
+            "a_q": u8(c0.a_q).clone(), "a_s": u8(c0.a_s).clone(), "tile_map": c0.tile_map.clone(),
+            "h_q": c0.h_q.clone(), "h_s": c0.h_s.clone(), "out": c0.out.view(torch.int16).clone(), "y": c0.y.view(torch.int16).clone(),
+        }
+
+    r1, r2 = _run(), _run()
+    nv = int(b.num_valid_ids[0].item())
+    sid = b.sorted_ids[:nv]
+    tok, slot = (sid & 0xFFFFFF).long(), (sid >> 24).long()
+    vrows = torch.nonzero(tok < M).flatten()  # valid sorted rows
+    orow = (tok * K + slot)[tok < M]  # their token-major output rows
+    rows_alloc = c0.num_m_blocks * BM
+
+    def _unsh(flat, rows, cols):
+        t = flat.reshape(rows // 32, cols // 8, 4, 16, 2, 2)
+        return t.permute(0, 5, 3, 1, 4, 2).reshape(rows, cols)
+
+    views = {
+        "a_q": lambda r: r["a_q"],
+        "a_s (valid rows)": lambda r: _unsh(r["a_s"], r["a_s"].numel() // (H // 32), H // 32)[vrows],
+        "tile_map": lambda r: r["tile_map"],
+        "h_q (valid rows)": lambda r: r["h_q"].view(rows_alloc, -1)[vrows],
+        "h_s (valid rows)": lambda r: _unsh(r["h_s"], rows_alloc, I // 32)[vrows],
+        "out (valid rows)": lambda r: r["out"].view(M * K, H)[orow],
+        "y": lambda r: r["y"],
+    }
+    for k, f in views.items():
+        v1, v2 = f(r1), f(r2)
+        diff = v1 != v2
+        n = int(diff.sum())
+        msg = f"[moe] determinism (sort frozen): {k:18s} elements differing {n}/{v1.numel()}"
+        if n and v1.dim() == 2:
+            rows = torch.nonzero(diff.any(dim=1)).flatten()
+            msg += f"; rows {int(rows.numel())}, first {rows[:6].tolist()}"
+        print(msg, flush=True)
+
+
+_stage_determinism()
 
 
 def _cos(a, b):

@@ -235,3 +235,33 @@ print(
     f"Even rule matches MY scales {float((e_even == mine_s.int()).float().mean()):.4%}",
     flush=True,
 )
+
+# ---- the outlier blocks (|exponent diff| >= 2): who is off, mine or production? ----
+_dequant = lambda q, s, n: (fp4_utils.mxfp4_to_f32(q.reshape(-1)).view(q.shape[0], -1, 32) * fp4_utils.e8m0_to_f32(s.reshape(-1)).view(q.shape[0], -1, 1)).view(q.shape[0], n)  # noqa: E731
+bad = torch.nonzero(d.abs() >= 2)
+if bad.numel() > 0:
+    from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA
+
+    xq, xs = per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2)
+    xq, xs = u8(xq).view(M, H // 2), u8(xs).view(M, H // 32)
+    tok_all = tok[real]
+    slot_all = slot[real]
+    for r, blk in bad[:8].tolist():
+        t, sl = int(tok_all[r]), int(slot_all[r])
+        e = int(topk_ids[t, sl])
+        xd = _dequant(xq[t : t + 1], xs[t : t + 1], H).view(H)
+        w13d = _dequant(w13_q[e], w13_s[e * 2 * I : (e + 1) * 2 * I], H)
+        hh = xd @ w13d.T
+        g = hh[:I].clamp(max=SWIGLU_LIMIT)
+        uu = hh[I:].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+        h_ref = (g * torch.sigmoid(SWIGLU_ALPHA * g) * (uu + 1.0))[blk * 32 : (blk + 1) * 32]
+        p_bf16 = a2[orow[r], blk * 32 : (blk + 1) * 32].float()
+        m_val = _dequant(h_q[my_rows[r] : my_rows[r] + 1], h_s_unsh[my_rows[r] : my_rows[r] + 1], I).view(I)[blk * 32 : (blk + 1) * 32]
+        p_val = _dequant(q_prod[orow[r] : orow[r] + 1], prod_s[r : r + 1], I).view(I)[blk * 32 : (blk + 1) * 32]
+        print(
+            f"[g1] outlier tok {t} slot {sl} expert {e} block {blk}: e8m0 mine {int(mine_s[r, blk])} prod {int(prod_s[r, blk])}; "
+            f"amax ref {float(h_ref.abs().max()):.4g} prod-bf16 {float(p_bf16.abs().max()):.4g}; "
+            f"max|mine - ref| {float((m_val - h_ref).abs().max()):.4g}, max|prod - ref| {float((p_val - h_ref).abs().max()):.4g}, "
+            f"max|prod-bf16 - ref| {float((p_bf16 - h_ref).abs().max()):.4g}",
+            flush=True,
+        )

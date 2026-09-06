@@ -196,6 +196,11 @@ fn2 = flyc.compile(launch2, *c0.args())
 print(f"[gemm2] compile {time.time() - t0:.1f}s", flush=True)
 fn2(*c0.args())
 torch.cuda.synchronize()
+_o1 = c0.out.clone()
+fn2(*c0.args())
+torch.cuda.synchronize()
+_d = (c0.out.view(torch.int16) if args.out == "bf16" else c0.out) != (_o1.view(torch.int16) if args.out == "bf16" else _o1)
+print(f"[gemm2] determinism: run 2 vs run 1 elements differing {int(_d.sum())}/{_d.numel()}, rows {int(_d.any(dim=1).sum())}", flush=True)
 
 if args.check_rows > 0:
     sid = c0.sorted_ids[:nv]
