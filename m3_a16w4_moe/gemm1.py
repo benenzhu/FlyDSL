@@ -129,6 +129,10 @@ def _gemm1_body_a16w4(
     k_wave=1,
     use_k16=False,
     a_direct=False,
+    prefetch=1,
+    pre_e=None,
+    pre_arow=None,
+    pre_ep=None,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -220,7 +224,10 @@ def _gemm1_body_a16w4(
     # ---- grid decode: m-block (expert block) x n-block (inter tile) -----------
     n_block_idx = bx_i32 % fx.Int32(NUM_N_BLOCKS)
     m_block_idx = bx_i32 // fx.Int32(NUM_N_BLOCKS)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    if pre_e is not None:
+        e = pre_e  # issued in the kernel prologue together with the other indirections
+    else:
+        e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     bx_m = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
@@ -374,10 +381,29 @@ def _gemm1_body_a16w4(
         a_dir_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)  # A rows are L2-hot
         a_row_base_bytes = []
         for mi in range_constexpr(m_repeat):
-            sorted_row = bx_m + fx.Int32(mi * 16) + lane_mod_16
-            fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
-            t_i32 = fused & fx.Int32(0x00FFFFFF)
+            if pre_arow is not None:
+                t_i32 = pre_arow[mi]
+            else:
+                sorted_row = bx_m + fx.Int32(mi * 16) + lane_mod_16
+                fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+                t_i32 = fused & fx.Int32(0x00FFFFFF)
             a_row_base_bytes.append(t_i32 * fx.Int32(c_k_div4 * 4))
+
+    # Epilogue row -> token ids, issued up front so their latency hides under the K loop
+    # (the LDS path loads them after the last MFMA and eats a full memory round trip).
+    if const_expr(a_direct):
+        if pre_ep is not None:
+            ep_fused = pre_ep
+        else:
+            ep_fused = [
+                [
+                    fx.Int32(
+                        _global_i32_at(arg_mind, bx_m + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii))
+                    )
+                    for ii in range_constexpr(4)
+                ]
+                for mi in range_constexpr(m_repeat)
+            ]
 
     def load_a_direct(base_k):
         base_k_bytes = base_k * fx.Int32(elem_bytes)
@@ -649,19 +675,20 @@ def _gemm1_body_a16w4(
         k_base = fx.Int32(0)
 
     if const_expr(a_direct):
-        # No LDS in the K loop: A and W for tile kt+1 are issued before tile kt's MFMAs
-        # and nothing forces the wave to drain them early. Barrier-free (k_wave reduce
-        # below has its own barriers).
-        a_cur = load_a_direct(k_base)
-        b_cur = load_b_tile(k_base)
+        # No LDS in the K loop: A and W for the next `prefetch` tiles are in flight while
+        # tile kt runs its MFMAs, and nothing forces the wave to drain them early.
+        # Barrier-free (the k_wave reduce below has its own barriers). Fully unrolled, so
+        # the ring is plain Python bookkeeping over SSA values.
+        ring = []
+        for t in range_constexpr(min(prefetch, K_TILES_TOTAL)):
+            kb = k_base + fx.Int32(t * TILE_K)
+            ring.append((load_a_direct(kb), load_b_tile(kb)))
         for kt in range_constexpr(K_TILES_TOTAL):
-            if const_expr(kt + 1 < K_TILES_TOTAL):
-                a_nxt = load_a_direct(k_base + fx.Int32((kt + 1) * TILE_K))
-                b_nxt = load_b_tile(k_base + fx.Int32((kt + 1) * TILE_K))
+            if const_expr(kt + prefetch < K_TILES_TOTAL):
+                kb = k_base + fx.Int32((kt + prefetch) * TILE_K)
+                ring.append((load_a_direct(kb), load_b_tile(kb)))
+            a_cur, b_cur = ring.pop(0)
             compute_tile(b_cur, a_cur)
-            if const_expr(kt + 1 < K_TILES_TOTAL):
-                a_cur = a_nxt
-                b_cur = b_nxt
     elif const_expr(not _PIPE):
         dma_x_tile_to_lds(k_base, slot=0)
         b0 = load_b_tile(k_base)
@@ -730,7 +757,10 @@ def _gemm1_body_a16w4(
         for ii in range_constexpr(4):
             row_in_tile = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
             sorted_row = bx_m + row_in_tile
-            fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+            if const_expr(a_direct):
+                fused = ep_fused[mi][ii]
+            else:
+                fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
             token = fused & fx.Int32(0x00FFFFFF)
             valid = token < i32_ntok
             if const_expr(k_wave > 1):
@@ -781,6 +811,7 @@ def compile_gemm1_a16w4_port(
     w_layout="standard",
     k_wave=1,
     a_direct=False,
+    prefetch=1,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -850,7 +881,8 @@ def compile_gemm1_a16w4_port(
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    _ad_tag = "_adirect" if a_direct else ""
+    assert prefetch >= 1 and (prefetch == 1 or a_direct), "prefetch>1 needs a_direct"
+    _ad_tag = ("_adirect" if a_direct else "") + (f"_pf{prefetch}" if prefetch > 1 else "")
     name_suffix = (
         f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
         f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_ad_tag}"
@@ -882,6 +914,30 @@ def compile_gemm1_a16w4_port(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+        # Decode prologue (a_direct, no XCD swizzle so tile == bx): the expert id and the
+        # token ids of this block only depend on bx, so issue them right here next to the
+        # cumsum0 load instead of one after another behind the bound check. ATT showed the
+        # serialized chain kernarg -> cumsum0 -> eids -> token ids -> first W load costing
+        # ~25% of the kernel at M=4 (one or two workgroups per CU, nothing hides it).
+        # Addresses stay inside the padded buffers even for bx >= bound.
+        pre_e = pre_arow = pre_ep = None
+        if const_expr(a_direct and xcd_swizzle == 0):
+            _mb = bx_i32 // fx.Int32(NUM_N_BLOCKS)
+            pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
+            _bxm = _mb * fx.Int32(BM)
+            _l16 = lane % fx.Int32(16)
+            _ld16 = lane // fx.Int32(16)
+            pre_arow = [
+                fx.Int32(_global_i32_at(arg_mind, _bxm + fx.Int32(mi * 16) + _l16)) & fx.Int32(0x00FFFFFF)
+                for mi in range_constexpr(BM // 16)
+            ]
+            pre_ep = [
+                [
+                    fx.Int32(_global_i32_at(arg_mind, _bxm + fx.Int32(mi * 16) + _ld16 * fx.Int32(4) + fx.Int32(ii)))
+                    for ii in range_constexpr(4)
+                ]
+                for mi in range_constexpr(BM // 16)
+            ]
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(NUM_N_BLOCKS)
 
@@ -943,6 +999,10 @@ def compile_gemm1_a16w4_port(
                 k_wave=k_wave,
                 use_k16=_use_k16,
                 a_direct=a_direct,
+                prefetch=prefetch,
+                pre_e=pre_e,
+                pre_arow=pre_arow,
+                pre_ep=pre_ep,
             )
 
     @flyc.jit

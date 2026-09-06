@@ -31,6 +31,7 @@ p.add_argument("--g1-b-nt", type=int, default=0)
 p.add_argument("--g1-xcd", type=int, default=0)
 p.add_argument("--g1-wpe", type=int, default=0, help="waves_per_eu attr (0 = unset)")
 p.add_argument("--g1-a-direct", type=int, default=0, help="1: A straight global->VGPR (no LDS/barrier)")
+p.add_argument("--g1-pf", type=int, default=1, help="K tiles in flight ahead of compute (a_direct only)")
 p.add_argument("--g2-tile-n", type=int, default=256)
 p.add_argument("--g2-tile-k", type=int, default=256)
 p.add_argument("--g2-b-nt", type=int, default=0)
@@ -95,6 +96,7 @@ g1_kw = dict(
     tile_m=BM, tile_n=args.g1_tile_n, tile_k=args.g1_tile_k, k_wave=args.k_wave,
     b_nt=args.g1_b_nt, xcd_swizzle=args.g1_xcd, waves_per_eu=args.g1_wpe or None,
     act="swigluoai", alpha=ALPHA, swiglu_limit=LIMIT, w_layout=args.w_layout, a_direct=bool(args.g1_a_direct),
+    prefetch=args.g1_pf,
 )
 g2_kw = dict(
     tile_m=BM, tile_n=args.g2_tile_n, tile_k=args.g2_tile_k,
@@ -149,7 +151,7 @@ def cos(a, b):
     return float((a @ b) / (a.norm() * b.norm() + 1e-12))
 
 
-tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct}"
+tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct} pf{args.g1_pf}"
        f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} | {args.w_layout}")
 t0 = time.time()
 out = run()
