@@ -33,6 +33,13 @@ p.add_argument("--check-rows", type=int, default=256, help="sampled sorted rows 
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--no-xcd", action="store_true", help="plain block order instead of the XCD-aware remap")
 p.add_argument("--dump-ir", action="store_true")
+p.add_argument("--fake-dense", choices=["rows", "gather"], default=None,
+               help="after the real prologue, overwrite routing: 'rows' = expert 0 everywhere + contiguous token "
+                    "rows (pure kernel overhead vs the dense kernel); 'gather' = expert 0 everywhere but the real "
+                    "gathered rows (isolates the A gather from expert switching); disables the check")
+p.add_argument("--wgm", type=int, default=4, help="m-tiles per XCD group in the block remap")
+p.add_argument("--order", choices=["expert", "xcd"], default="expert",
+               help="block order: expert = host tile_map, n-slab-major per expert (default); xcd = dense-style WGM groups")
 args = p.parse_args()
 
 import flydsl.compiler as flyc  # noqa: E402
@@ -96,13 +103,44 @@ def prologue(x, topk_ids, topk_w):
     return sorted_ids, sorted_w, sorted_eids, num_valid, a_q, a_s
 
 
+def build_tile_map(sorted_eids, num_valid, num_m_blocks):
+    """int32 table, one entry per launched block: m_tile << 3 | n_tile, or -1.
+    Order: expert by expert (experts appear in sorted order), inside an expert
+    n-slab-major (all its m-tiles for n=0, then n=1, ...). Pure device ops, no
+    host sync (num_valid stays on the GPU)."""
+    nb = num_m_blocks
+    dev = sorted_eids.device
+    NB_N = I // 128
+    m_idx = torch.arange(nb, device=dev)
+    valid_m = (m_idx * BM) < num_valid[0]
+    e_m = torch.where(valid_m, sorted_eids[:nb].long(), torch.full_like(m_idx, E))  # dummy expert E
+    hist = torch.zeros(E + 1, dtype=torch.long, device=dev).scatter_add_(0, e_m, torch.ones_like(e_m))
+    starts = torch.cumsum(hist, 0) - hist
+    rank = m_idx - starts[e_m]
+    cnt = hist[e_m]
+    grid = (nb * NB_N + 7) // 8 * 8
+    n = torch.arange(NB_N, device=dev)
+    idx = (NB_N * starts[e_m])[:, None] + n[None, :] * cnt[:, None] + rank[:, None]
+    idx = torch.where(valid_m[:, None], idx, torch.full_like(idx, grid))  # invalid -> spare slot
+    val = (m_idx[:, None] << 3) | n[None, :]
+    tm = torch.full((grid + 1,), -1, dtype=torch.long, device=dev)
+    tm.scatter_(0, idx.reshape(-1), val.reshape(-1))
+    return tm[:grid].to(torch.int32).contiguous(), grid
+
+
 class Case:
     def __init__(self):
         self.x, self.topk_ids, self.topk_w = make_input()
         self.sorted_ids, self.sorted_w, self.sorted_eids, self.num_valid, self.a_q, self.a_s = prologue(
             self.x, self.topk_ids, self.topk_w
         )
+        if args.fake_dense == "rows":
+            n_rows = self.sorted_ids.shape[0]
+            self.sorted_ids = (torch.arange(n_rows, device=dev, dtype=torch.int32) % M).contiguous()
+        if args.fake_dense:
+            self.sorted_eids = torch.zeros_like(self.sorted_eids)
         self.num_m_blocks = int(self.sorted_eids.shape[0])
+        self.tile_map, self.grid = build_tile_map(self.sorted_eids, self.num_valid, self.num_m_blocks)
         rows = self.num_m_blocks * BM
         self.out_q = torch.empty((rows, I // 2), dtype=torch.uint8, device=dev)
         self.out_s = torch.empty((rows * (I // 32),), dtype=torch.uint8, device=dev)
@@ -121,6 +159,8 @@ class Case:
             M,
             self.num_m_blocks,
             int(u8(self.a_s).numel()),
+            self.tile_map,
+            self.grid,
             torch.cuda.current_stream(),
         )
 
@@ -137,14 +177,15 @@ print(
 )
 
 t0 = time.time()
-launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd)
+launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
+                           tile_map=args.order == "expert")
 fn = flyc.compile(launch, *c0.args())
 print(f"[gemm1] compile {time.time() - t0:.1f}s", flush=True)
 fn(*c0.args())
 torch.cuda.synchronize()
 
 # ---- correctness on sampled valid rows ----
-if args.check_rows > 0:
+if args.check_rows > 0 and not args.fake_dense:
     xq_ref, xs_ref = per_1x32_f4_quant(c0.x, quant_dtype=dtypes.fp4x2)
     xq_ref = u8(xq_ref).view(M, H // 2)
     xs_ref = u8(xs_ref).view(M, H // 32)

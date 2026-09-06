@@ -258,11 +258,10 @@ def _divmod_nonneg(a, b):
     return divmod(a, b)
 
 
-def _xcd_swizzle(num_pid_m, num_pid_n):
+def _xcd_swizzle(num_pid_m, num_pid_n, WGM=4):
     """Block id -> (m-tile, n-tile). Groups of WGM m-tiles x all n-tiles land on
     one XCD, so the m-tiles of one expert (same W13 slab) share that XCD's L2."""
     NUM_XCDS = 8
-    WGM = 4
     NUM_CUS = 32 * NUM_XCDS
     SWIZZLE_THRESHOLD = 4 * NUM_CUS
 
@@ -550,9 +549,21 @@ def compile_moe_gemm1(
     E: int,
     BLOCK_M: int = 128,
     use_xcd_remap: bool = True,
+    xcd_wgm: int = 4,
+    tile_map: bool = True,
 ):
     """Grouped fp4 gemm1 for one (H, I, E, BLOCK_M). ``BLOCK_M`` must equal the
-    ``moe_sorting`` block size the sorted inputs were built with (128 or 256)."""
+    ``moe_sorting`` block size the sorted inputs were built with (128 or 256).
+
+    ``tile_map=True``: block order comes from a host-built int32 table
+    ``tile_map[remapped block] = m_tile << 3 | n_tile`` (-1 = nothing to do),
+    laid out expert by expert and n-slab-major inside an expert, so the 32 CUs
+    of one XCD chew through one expert with the same 768 KB gate/up slab of
+    W13 in L2 (see ``build_tile_map`` in bench_gemm1.py). The hardware deals
+    consecutive block ids round-robin over the 8 XCDs, so block id b is first
+    remapped to ``(b % 8) * (grid / 8) + b // 8`` = a contiguous chunk of the
+    table per XCD. ``tile_map=False``: the dense kernel's WGM-group XCD swizzle
+    over (m-tile, n-tile) with the expert read per m-tile."""
     K = H
     BLOCK_K = 256
     BLOCK_K_BYTES = BLOCK_K // 2
@@ -605,6 +616,8 @@ def compile_moe_gemm1(
         n_tokens: fx.Int32,
         num_m_blocks: fx.Int32,
         a_scale_bytes: fx.Int32,
+        tile_map_t: fx.Tensor,
+        grid_size: fx.Int32,
     ):
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         _base_ptr = lds.all_lds.ptr
@@ -621,19 +634,28 @@ def compile_moe_gemm1(
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
 
-        if const_expr(use_xcd_remap):
-            tile_i, tile_j = _xcd_swizzle(num_m_blocks, N_BLOCKS_N)
-        else:
-            tile_i, tile_j = divmod(fx.block_idx.x, N_BLOCKS_N)
-
-        # ---- routing: this m-tile's expert and whether it holds any row ----
         ids_rsrc = _buffer_ops.create_buffer_resource(sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BLOCK_M * 4))
         eid_rsrc = _buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4)
-        nv_rsrc = _buffer_ops.create_buffer_resource(num_valid_ids, max_size=False, num_records_bytes=4)
-        num_valid = fx.Int32(_buffer_ops.buffer_load(nv_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32))
+        if const_expr(tile_map):
+            # contiguous chunk of the table per XCD (grid_size % 8 == 0)
+            intra_xcd, xcd = _divmod_nonneg(fx.block_idx.x, 8)
+            remapped = xcd * (grid_size // 8) + intra_xcd
+            tm_rsrc = _buffer_ops.create_buffer_resource(tile_map_t, max_size=False, num_records_bytes=grid_size * 4)
+            entry = fx.Int32(_buffer_ops.buffer_load(tm_rsrc, remapped, vec_width=1, dtype=fx.Int32))
+            tile_i = entry >> 3
+            tile_j = entry & 7
+            block_valid = entry >= 0
+        else:
+            if const_expr(use_xcd_remap):
+                tile_i, tile_j = _xcd_swizzle(num_m_blocks, N_BLOCKS_N, xcd_wgm)
+            else:
+                tile_i, tile_j = divmod(fx.block_idx.x, N_BLOCKS_N)
+            nv_rsrc = _buffer_ops.create_buffer_resource(num_valid_ids, max_size=False, num_records_bytes=4)
+            num_valid = fx.Int32(_buffer_ops.buffer_load(nv_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Int32))
+            block_valid = (tile_i * BLOCK_M) < num_valid
+        # ---- routing: this m-tile's expert ----
         expert = fx.Int32(_buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32))
         m_base = tile_i * BLOCK_M
-        block_valid = m_base < num_valid
 
         if block_valid:
             wave_i = wave_id // 2
@@ -747,13 +769,16 @@ def compile_moe_gemm1(
             sc0_sbC0, sc0_sbC1 = b_scale_ld.read(_slot(0))
             sc0 = (sc0_saR0, sc0_saR1, sc0_sbC0, sc0_sbC1)
 
-            # Per step: 2*NA A-loads + 2*NB B-loads + 1 scale gather, all for
-            # K-step kc+2. Loop-top wait: everything from the previous step may
-            # still fly (minus one, like the dense kernel's 16 for NA=NB=4).
-            # SEG2 wait: the previous step's gather + last A batch, plus this
-            # step's first two batches may fly (dense kernel: 12).
-            _MAIN_VMCNT = 2 * N_TILES_A + 2 * N_TILES_B
-            _SEG2_VMCNT = 2 * N_TILES_A + N_TILES_B
+            # Per step, in issue order: a0 (NA), b0 (NB), [SEG2], b1 (NB),
+            # scale gather (1), a1 (NA) -> P = 2NA+2NB+1 loads, all for K-step
+            # kc+2 (the gather for kc+3). Loop-top wait of step kc+1: step kc-1
+            # must be complete, all P loads of step kc may fly. SEG2 wait of
+            # step kc: needs a0/b0/b1 of step kc-1 -> its gather + a1 (NA+1)
+            # plus this step's a0 + b0 (NA+NB) may fly. Exact counts: waiting
+            # for one load too many stalls on a fetch issued only a step ago,
+            # which hurts when B comes from HBM (expert switch) not L2.
+            _MAIN_VMCNT = 2 * N_TILES_A + 2 * N_TILES_B + 1
+            _SEG2_VMCNT = 2 * N_TILES_A + N_TILES_B + 1
 
             def _read_scale_thunks(kc_idx, holder):
                 s = _slot(kc_idx)
@@ -1028,9 +1053,14 @@ def compile_moe_gemm1(
         n_tokens: fx.Int32,
         num_m_blocks: fx.Int32,
         a_scale_bytes: fx.Int32,
+        tile_map_t: fx.Tensor,
+        grid_size: fx.Int32,
         stream: fx.Stream,
     ):
-        grid_x = num_m_blocks * N_BLOCKS_N
+        if const_expr(tile_map):
+            grid_x = grid_size
+        else:
+            grid_x = num_m_blocks * N_BLOCKS_N
         kernel_gemm1(
             A,
             W13,
@@ -1044,6 +1074,8 @@ def compile_moe_gemm1(
             n_tokens,
             num_m_blocks,
             a_scale_bytes,
+            tile_map_t,
+            grid_size,
             value_attrs={"rocdl.waves_per_eu": 1, "rocdl.flat_work_group_size": "256,256"},
         ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
 
