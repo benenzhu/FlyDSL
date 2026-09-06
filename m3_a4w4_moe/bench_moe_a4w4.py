@@ -30,8 +30,10 @@ p.add_argument("--inter", type=int, default=768)
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--n-split", type=int, default=2)
-p.add_argument("--bm", type=int, choices=[128, 256], default=128,
-               help="sort block size: gemm1 tile rows (256 = fewer W13 bytes per FLOP, more padding); gemm2 stays 128-row tiles")
+p.add_argument("--bm", type=int, choices=[0, 128, 256], default=0,
+               help="sort block size = gemm1 tile rows (256 = half the W13 bytes per FLOP, 2x the padding; gemm2 stays "
+                    "128-row tiles and skips all-padding tiles). 0 = auto: 256 from 16384 tokens up (chain 16384: 1059 vs "
+                    "1090 us, 32768: 1929 vs 2020; 8192: 637 vs 614, 4096: 428 vs 402 -> 128 there)")
 p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
@@ -65,7 +67,7 @@ from aiter.utility import fp4_utils  # noqa: E402
 torch.manual_seed(args.seed)
 dev = "cuda"
 M, H, I, E, K = args.tokens, args.hidden, args.inter, args.experts, args.topk
-BM = args.bm
+BM = args.bm if args.bm else (256 if args.tokens >= 16384 else 128)
 fp4 = torch.float4_e2m1fn_x2
 
 
