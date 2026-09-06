@@ -56,6 +56,8 @@ def _atomic_bf16_epilog(
     BM,
     N_OUT,
     BN,
+    pre_packed=None,
+    pre_weight=None,
 ):
     _kMChunks = kmchunks_for(BM)
     M_REPS = BM // 8
@@ -77,10 +79,14 @@ def _atomic_bf16_epilog(
 
     packed = []
     weight = []
-    for mr in range_constexpr(M_REPS):
-        sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
-        packed.append(llvm.load(T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True))
-        weight.append(llvm.load(T.f32, _gep1(sweights_base, sorted_pos * fx.Int32(4)), invariant=True))
+    if pre_packed is not None:
+        packed = pre_packed  # issued in the kernel prologue (a_direct); no post-loop round trip
+        weight = pre_weight
+    else:
+        for mr in range_constexpr(M_REPS):
+            sorted_pos = m_row + fx.Int32(mr * 8) + m_lane
+            packed.append(llvm.load(T.i32, _gep1(stids_base, sorted_pos * fx.Int32(4)), invariant=True))
+            weight.append(llvm.load(T.f32, _gep1(sweights_base, sorted_pos * fx.Int32(4)), invariant=True))
 
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
@@ -137,6 +143,11 @@ def _gemm2_body_a16w4(
     b_cache_mod=2,
     w_dtype="mxfp4",
     use_k16=False,
+    a_direct=False,
+    prefetch=1,
+    pre_e=None,
+    pre_packed=None,
+    pre_weight=None,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
@@ -195,7 +206,10 @@ def _gemm2_body_a16w4(
 
     m_block_idx = bx_i32 // fx.Int32(_num_n_blocks)
     n_block_idx = bx_i32 % fx.Int32(_num_n_blocks)
-    e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
+    if pre_e is not None:
+        e = pre_e
+    else:
+        e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     m_row = m_block_idx * fx.Int32(BM)  # first sorted row of this m-block
     by_n = n_block_idx * fx.Int32(TILE_N)
     expert_off = e * fx.Int32(N_OUT)
@@ -303,6 +317,25 @@ def _gemm2_body_a16w4(
         r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         fx.copy_atom_call(a_copy_atom, fx.slice(s_x_i32x4_tiles, (None, byte_off // fx.Int32(16))), r)
         return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)
+
+    # ---- A direct global->VGPR (a_direct): the stage-1 intermediate is already by sorted
+    # row, so each lane's MFMA fragment is 16 contiguous bytes at (m_row + lane%16, K slice
+    # of its lane group). No LDS, no barrier, no LDS-DMA-forced vmcnt(0) (see gemm1).
+    a_dir_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)
+    a_row_bytes = [(m_row + fx.Int32(mi * 16) + lane_mod_16) * fx.Int32(K * 2) for mi in range_constexpr(m_repeat)]
+
+    def load_a_direct(base_k):
+        base_k_bytes = base_k * fx.Int32(elem_bytes)
+        frags = []
+        for mi in range_constexpr(m_repeat):
+            row = []
+            for ku in range_constexpr(k_unroll):
+                gbyte = a_row_bytes[mi] + base_k_bytes + _a_col_bytes_for_ku(ku)
+                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy(a_dir_atom, fx.slice(x_dma_tiles4, (None, gbyte // fx.Int32(16))), r)
+                row.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))
+            frags.append(row)
+        return frags
 
     def load_b_raw(base_k, n_blk, n_intra):
         raw = []
@@ -448,29 +481,48 @@ def _gemm2_body_a16w4(
         else:
             fx.gemm(mma_atom, acc, _bf16_frag(a8), _bf16_frag(b8), acc)
 
-    for kt in range_constexpr(K_TILES_TOTAL):
-        base_k = fx.Int32(kt * TILE_K)
-        dma_a_tile_to_lds(base_k)
+    def load_b_tile(base_k):
         if const_expr(_is_bf16):
-            b_raw = [load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
-            b_sc = None
+            return [load_b_raw_bf16(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)], None
+        b_raw = [load_b_raw(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
+        if const_expr(_is_int4):
+            b_sc = [load_b_scale_int4(base_k, scale_n_list[ni]) for ni in range_constexpr(num_acc_n)]
         else:
-            b_raw = [load_b_raw(base_k, n_blk_list[ni], n_intra_list[ni]) for ni in range_constexpr(num_acc_n)]
-            if const_expr(_is_int4):
-                b_sc = [load_b_scale_int4(base_k, scale_n_list[ni]) for ni in range_constexpr(num_acc_n)]
-            else:
-                b_sc = [
-                    load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni]) for ni in range_constexpr(num_acc_n)
-                ]
-        gpu.barrier()
-        for ni in range_constexpr(num_acc_n):
-            for ku in range_constexpr(k_unroll):
-                _bsc = None if const_expr(_is_bf16) else b_sc[ni][ku]
-                bb = upconvert_b(b_raw[ni], ku, _bsc)
-                for mi in range_constexpr(m_repeat):
-                    a8 = lds_load_a(mi, ku)
-                    _mma(accm[mi][ni], a8, bb)
-        gpu.barrier()
+            b_sc = [load_b_scale(base_k, scale_mni_list[ni], scale_np_list[ni]) for ni in range_constexpr(num_acc_n)]
+        return b_raw, b_sc
+
+    if const_expr(a_direct):
+        # Barrier-free software pipeline: `prefetch` tiles of A/W in flight ahead of the
+        # MFMAs (fully unrolled; the ring is Python bookkeeping over SSA values).
+        ring = []
+        for t in range_constexpr(min(prefetch, K_TILES_TOTAL)):
+            kb = fx.Int32(t * TILE_K)
+            ring.append((load_a_direct(kb), load_b_tile(kb)))
+        for kt in range_constexpr(K_TILES_TOTAL):
+            if const_expr(kt + prefetch < K_TILES_TOTAL):
+                kb = fx.Int32((kt + prefetch) * TILE_K)
+                ring.append((load_a_direct(kb), load_b_tile(kb)))
+            a_frags, (b_raw, b_sc) = ring.pop(0)
+            for ni in range_constexpr(num_acc_n):
+                for ku in range_constexpr(k_unroll):
+                    _bsc = None if const_expr(_is_bf16) else b_sc[ni][ku]
+                    bb = upconvert_b(b_raw[ni], ku, _bsc)
+                    for mi in range_constexpr(m_repeat):
+                        _mma(accm[mi][ni], a_frags[mi][ku], bb)
+    else:
+        for kt in range_constexpr(K_TILES_TOTAL):
+            base_k = fx.Int32(kt * TILE_K)
+            dma_a_tile_to_lds(base_k)
+            b_raw, b_sc = load_b_tile(base_k)
+            gpu.barrier()
+            for ni in range_constexpr(num_acc_n):
+                for ku in range_constexpr(k_unroll):
+                    _bsc = None if const_expr(_is_bf16) else b_sc[ni][ku]
+                    bb = upconvert_b(b_raw[ni], ku, _bsc)
+                    for mi in range_constexpr(m_repeat):
+                        a8 = lds_load_a(mi, ku)
+                        _mma(accm[mi][ni], a8, bb)
+            gpu.barrier()
 
     # ---- epilogue: atomic bf16 scatter (routing-weighted). K-loop done, so the A-LDS
     # region (offset 0) is reused for the epilog's f32 acc staging.
@@ -491,6 +543,8 @@ def _gemm2_body_a16w4(
         BM,
         N_OUT,
         TILE_N,
+        pre_packed=pre_packed,
+        pre_weight=pre_weight,
     )
 
 
@@ -520,6 +574,8 @@ def compile_gemm2_a16w4_port(
     waves_per_eu=None,
     w_dtype="mxfp4",
     persist=False,
+    a_direct=False,
+    prefetch=1,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
 
@@ -555,6 +611,9 @@ def compile_gemm2_a16w4_port(
         _name += f"_w{waves_per_eu}"
     if persist:
         _name += "_persist"
+    assert prefetch >= 1 and (prefetch == 1 or a_direct), "prefetch>1 needs a_direct"
+    if a_direct:
+        _name += "_adirect" + (f"_pf{prefetch}" if prefetch > 1 else "")
 
     @fx.struct
     class SharedStorage:
@@ -579,6 +638,22 @@ def compile_gemm2_a16w4_port(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
+        # a_direct prologue (tile == bx when xcd_swizzle == 0): issue the expert id and the
+        # epilogue's token ids / routing weights together with cumsum0 instead of behind the
+        # bound check and after the K loop (each is an exposed memory round trip at M=4).
+        pre_e = pre_packed = pre_weight = None
+        if const_expr(a_direct and xcd_swizzle <= 0 and not persist):
+            _mb = bx_i32 // fx.Int32(_num_n_blocks)
+            pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
+            _mrow = _mb * fx.Int32(BM)
+            _mlane = tx_i32 // fx.Int32(32)
+            _stids_base = _global_base_ptr1(arg_stids)
+            _sw_base = _global_base_ptr1(arg_sweights)
+            pre_packed, pre_weight = [], []
+            for mr in range_constexpr(BM // 8):
+                _pos = _mrow + fx.Int32(mr * 8) + _mlane
+                pre_packed.append(llvm.load(T.i32, _gep1(_stids_base, _pos * fx.Int32(4)), invariant=True))
+                pre_weight.append(llvm.load(T.f32, _gep1(_sw_base, _pos * fx.Int32(4)), invariant=True))
         total_m_blocks = cumsum0 // fx.Int32(BM)
         bound = total_m_blocks * fx.Int32(_num_n_blocks)
 
@@ -627,6 +702,11 @@ def compile_gemm2_a16w4_port(
                 b_cache_mod=b_cache_mod,
                 w_dtype=w_dtype,
                 use_k16=_use_k16,
+                a_direct=a_direct,
+                prefetch=prefetch,
+                pre_e=pre_e,
+                pre_packed=pre_packed,
+                pre_weight=pre_weight,
             )
 
         if const_expr(persist):
@@ -642,7 +722,12 @@ def compile_gemm2_a16w4_port(
                 _run_tile(_xcd_np(fx.Int32(iv)))
         else:
             if bx_i32 < bound:
-                _run_tile(_xcd_np(bx_i32))
+                if const_expr(a_direct and _SW <= 0):
+                    # tile == bx: matches the prologue's expert-id / token-id preloads
+                    # (the XCD round-robin remap would need `bound` first).
+                    _run_tile(bx_i32)
+                else:
+                    _run_tile(_xcd_np(bx_i32))
 
     @flyc.jit
     def launch_gemm2(

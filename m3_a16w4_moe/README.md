@@ -57,6 +57,11 @@ rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/benc
 | 09-05 | bm16 tn16 tk128 kw4 | tn256 tk256 | 36.9 us | 816 WGs, no further gain |
 | 09-06 | bm16 tn32 tk128 kw4 **a_direct** | tn256 tk256 | **34.6 us** | A straight to VGPR, no LDS/barrier in the K loop |
 | 09-06 | bm16 tn64 tk128 kw4 a_direct | tn256 tk256 | 35.5 us | was 40.9 with the LDS A path |
+| 09-06 | bm16 tn32 tk128 kw4 a_direct pf2/3/4 | tn256 tk256 | 35.0 / 34.7 / 35.0 us | deeper W prefetch is flat: per-wave depth is not the limiter now |
+| 09-06 | bm16 tn32 tk128 kw4 a_direct + hoisted prologue | tn256 tk256 xcd1 | 34.15 us | gemm1 15.3 us (rocprof) |
+| 09-06 | same | tn256 tk256 **xcd0** | **33.9 us** | gemm2 LDS path; kernel sum sort 6.1 + gemm1 15.3 + gemm2 8.6 |
+| 09-06 | same | tn256 tk256 xcd0 a_direct | 35.9 us | gemm2 a_direct is slower: no k_wave in gemm2, so all 4 waves re-read the whole A block (4x L2 traffic) |
+| 09-06 | same | tn256 tk768 / tk384 | 35.0 / 34.6 us | single/2-tile K does not help gemm2 |
 
 Correctness gate: `cos vs swigluoai ref` >= 0.9999 (bf16-intermediate reference); 0.99999 measured.
 
