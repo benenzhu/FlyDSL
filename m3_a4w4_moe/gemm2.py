@@ -220,6 +220,34 @@ def _lds_store_i16(v_i32, addr_i32):
     _llvm.StoreOp(h, _lds_ptr(addr_i32), alignment=2)
 
 
+def _ld_dword_asm(rsrc, voff_bytes):
+    """buffer_load_dword whose completion we account for ourselves: LLVM sees no load,
+    so it adds no vmcnt wait (which would drain the whole DMA stream). The result must
+    go through ``_wait_pin`` before any use; it stays live until then, so LLVM cannot
+    reuse the register while the load is in flight."""
+    return fx.Int32(
+        _llvm.inline_asm(
+            _T.i32,
+            [fx.as_ir_value(voff_bytes), fx.as_ir_value(rsrc), _uniform_i32(fx.Int32(0))],
+            "buffer_load_dword $0, $1, $2, $3 offen",
+            "=v,v,s,s",
+            has_side_effects=True,
+        )
+    )
+
+
+def _wait_pin(vals, vmcnt):
+    """``s_waitcnt vmcnt(n)`` with every value tied through it: uses of the returned
+    values cannot be scheduled before the wait."""
+    n = len(vals)
+    ty = _ir.Type.parse("!llvm.struct<(" + ", ".join(["i32"] * n) + ")>")
+    cons = ",".join(["=v"] * n + [str(i) for i in range(n)])
+    res = _llvm.inline_asm(
+        ty, [fx.as_ir_value(v) for v in vals], f"s_waitcnt vmcnt({vmcnt})", cons, has_side_effects=True
+    )
+    return [fx.Int32(_llvm.extractvalue(_T.i32, res, [i])) for i in range(n)]
+
+
 def _pin_vec4(v):
     """Route an accumulator through a side-effecting no-op asm (tied VGPR operand): its
     consumers cannot be scheduled before the asm, and the asm keeps its place among the
@@ -495,6 +523,27 @@ def compile_moe_gemm2(
                 b0_g2s.load(b_buf(kb, 0), _b_soff(nt, kb))
                 b1_g2s.load(b_buf(kb, 1), _b_soff(nt, kb))
 
+            # ---- row ids / routing weights of the rows this lane touches: issued ahead of
+            #      the DMA stream (the ATT showed them issued last, throttled behind 33 DMAs
+            #      and then waited on for ~2k cycles), pinned behind the "B(0) landed" wait
+            #      below, which in-order retirement makes sufficient ----
+            def _wave_row(h, r):
+                return h * LDS_BLOCK_M + wave_i * 32 + r
+
+            _id_rows = [_wave_row(h, lane_id // CH + ROWS_PER_ST * k) for h in range(2) for k in range(N_ST)] + (
+                [_wave_row(h, lane_id % 32) for h in range(2)] if FP8 else []
+            )
+            _raw_ids = [_ld_dword_asm(ids_rsrc, (m_base + r) * fx.Int32(4)) for r in _id_rows]
+            _raw_w = (
+                [
+                    _ld_dword_asm(sw_rsrc, (m_base + _wave_row(h, ti * 16 + r16)) * fx.Int32(4))
+                    for h in range(2)
+                    for ti in range(N_TILES_A)
+                ]
+                if not FP8
+                else []
+            )
+
             # ---- prologue: A (12) + A scales (1), g(0), B(0), B(1), g(1) ----
             for kb in range_constexpr(K_ITERS):
                 a0_g2s.load(a_buf(kb, 0), fx.Int32(kb * BLOCK_K_BYTES))
@@ -547,41 +596,22 @@ def compile_moe_gemm2(
                 OUT_scale, max_size=False, num_records_bytes=n_tokens * (topk * OUT_SC_COLS)
             )
 
-            def _orow(local_row):
-                srow = m_base + local_row
-                sid = fx.Int32(_buffer_ops.buffer_load(ids_rsrc, srow, vec_width=1, dtype=fx.Int32))
+            _pinned = _wait_pin(_raw_ids + _raw_w, 2 * NB + NG + NG + 2 * NB)
+            _pid, _pw = _pinned[: len(_raw_ids)], _pinned[len(_raw_ids) :]
+
+            def _orow(sid):
                 tok = sid & fx.Int32(0x00FFFFFF)  # padded rows: tok == n_tokens -> OOB -> dropped
                 slot = (sid >> 24) & fx.Int32(0xFF)
                 return tok * fx.Int32(topk) + slot
 
-            def _wave_row(h, r):
-                return h * LDS_BLOCK_M + wave_i * 32 + r
-
             # data flush: lane L handles staged rows L//CH + ROWS_PER_ST*k, 16 B at chunk L%CH
-            out_off = [
-                [_orow(_wave_row(h, lane_id // CH + ROWS_PER_ST * k)) * fx.Int32(OUT_ROW_BYTES) for k in range(N_ST)]
-                for h in range(2)
-            ]
+            out_off = [[_orow(_pid[h * N_ST + k]) * fx.Int32(OUT_ROW_BYTES) for k in range(N_ST)] for h in range(2)]
             # (plain conditional expressions: the DSL rewriter drops non-IR values assigned
             #  inside an ``if`` block)
             # fp8: scale flush, lane L handles staged row L%32 (lanes 32.. repeat rows 0..31)
-            sc_off = [_orow(_wave_row(h, lane_id % 32)) * fx.Int32(OUT_SC_COLS) for h in range(2)] if FP8 else None
+            sc_off = [_orow(_pid[2 * N_ST + h]) * fx.Int32(OUT_SC_COLS) for h in range(2)] if FP8 else None
             # bf16: routing weight of the lane's accumulator rows (ti*16 + r16)
-            wA = (
-                [
-                    [
-                        fx.Float32(
-                            _buffer_ops.buffer_load(
-                                sw_rsrc, m_base + _wave_row(h, ti * 16 + r16), vec_width=1, dtype=fx.Float32
-                            )
-                        )
-                        for ti in range(N_TILES_A)
-                    ]
-                    for h in range(2)
-                ]
-                if not FP8
-                else None
-            )
+            wA = [[_as_f32(_pw[h * N_TILES_A + ti]) for ti in range(N_TILES_A)] for h in range(2)] if not FP8 else None
 
             stg_base = fx.Int32(fx.ptrtoint(_stg_ptr)) + wave_id * fx.Int32(STG_WAVE)
             stg_sc_base = stg_base + fx.Int32(STG_DATA)
