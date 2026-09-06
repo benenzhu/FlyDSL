@@ -28,6 +28,8 @@ p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--n-split", type=int, default=2, help="CTAs per m-tile (1, 2, 4, 6, 12)")
 p.add_argument("--out", choices=["bf16", "fp8"], default="bf16", help="gemm2 output mode")
+p.add_argument("--kernel", choices=["flat", "persist"], default="flat", help="one CTA per work item / persistent CTAs")
+p.add_argument("--n-ctas", type=int, default=256, help="persistent CTAs (multiple of 8)")
 p.add_argument("--copies", type=int, default=8)
 p.add_argument("--reps", type=int, default=20)
 p.add_argument("--rounds", type=int, default=5)
@@ -40,6 +42,7 @@ args = p.parse_args()
 import flydsl.compiler as flyc  # noqa: E402
 from m3_a4w4_moe.gemm1 import compile_moe_gemm1  # noqa: E402
 from m3_a4w4_moe.gemm2 import compile_moe_gemm2, gemm2_grid  # noqa: E402
+from m3_a4w4_moe.gemm2_persist import compile_moe_gemm2_persist, gemm2_persist_grid  # noqa: E402
 
 import aiter  # noqa: E402,F401
 from aiter import dtypes  # noqa: E402
@@ -158,7 +161,7 @@ class Case:
         else:
             self.out = torch.full((M * K, H), float("nan"), dtype=torch.bfloat16, device=dev)
         self.out_s = torch.zeros((M * K, H // 32), dtype=torch.uint8, device=dev)
-        self.grid2 = gemm2_grid(self.num_m_blocks, args.n_split)
+        self.grid2 = gemm2_grid(self.num_m_blocks, args.n_split) if args.kernel == "flat" else gemm2_persist_grid(args.n_ctas)
 
     def args(self):
         return (
@@ -191,7 +194,8 @@ print(
 )
 
 t0 = time.time()
-launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out)
+_compile2 = compile_moe_gemm2 if args.kernel == "flat" else compile_moe_gemm2_persist
+launch2 = _compile2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out)
 fn2 = flyc.compile(launch2, *c0.args())
 print(f"[gemm2] compile {time.time() - t0:.1f}s", flush=True)
 fn2(*c0.args())
