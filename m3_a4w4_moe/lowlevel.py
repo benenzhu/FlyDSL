@@ -17,7 +17,7 @@ from flydsl._mlir.dialects import llvm, memref
 from flydsl.expr import arith
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
-from kernels.common import buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops  # the copy shipped in the vLLM image
 
 
 def ptr_arg(t: torch.Tensor):

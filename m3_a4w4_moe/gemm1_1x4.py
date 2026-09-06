@@ -45,7 +45,7 @@ from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 from flydsl.utils.smem_allocator import SmemAllocator, SmemPtr
-from kernels.common import buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops  # the copy shipped in the vLLM image
 
 SWIGLU_ALPHA = 1.702
 SWIGLU_LIMIT = 7.0

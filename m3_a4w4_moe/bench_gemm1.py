@@ -3,7 +3,7 @@
 Run inside the vLLM image (its aiter provides the production prologue:
 ``moe_sorting`` + ``fused_dynamic_mx_quant_moe_sort``):
 
-    PYTHONPATH=/flydsl-main:/flydsl python /flydsl/m3_a4w4_moe/bench_gemm1.py --tokens 16384
+    PYTHONPATH=/flydsl python /flydsl/m3_a4w4_moe/bench_gemm1.py --tokens 16384
 
 Checks (``--check-rows``): sampled valid sorted rows against a float reference
 built from the *same* fp4 activations / weights (dequantised), with the

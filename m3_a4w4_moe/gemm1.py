@@ -51,14 +51,22 @@ from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr import rocdl as _rocdl
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
-from kernels.common import buffer_ops as _buffer_ops
-from kernels.gemm.fp8_gemm_utils import (
-    ceildiv,
-    divmod,
-    swizzle_128,
-)
+from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops  # the copy shipped in the vLLM image
 
 _N_WAVES = 4
+
+
+def divmod(a, b):
+    """divmod for DSL values (the builtin rejects them)."""
+    return (a // b, a % b)
+
+
+def swizzle_128(row, col):
+    """The dense kernel's 128-B-row XOR swizzle: (row, col) -> (row', col')."""
+    offset = row * 128 + col
+    swizzle = ((offset % (16 * 128)) >> 8) << 4
+    swizzled_offset = offset ^ swizzle
+    return swizzled_offset // 128, swizzled_offset % 128
 
 SWIGLU_ALPHA = 1.702
 SWIGLU_LIMIT = 7.0
@@ -401,15 +409,12 @@ class ScaleGatherMoE:
     ):
         self.row_i32 = (K // 256) * 64  # i32 per 32-row group (32 rows x K/32 bytes)
         self.wave_id = wave_id
+        # aiter's buffer_ops returns the raw ROCDL resource (!llvm.ptr<8>) directly
         self.a_rsrc = fx.as_ir_value(
-            fx.rocdl.get_buffer_rsrc(
-                _buffer_ops.create_buffer_resource(a_scale, max_size=False, num_records_bytes=a_scale_bytes)
-            )
+            _buffer_ops.create_buffer_resource(a_scale, max_size=False, num_records_bytes=a_scale_bytes)
         )
         self.b_rsrc = fx.as_ir_value(
-            fx.rocdl.get_buffer_rsrc(
-                _buffer_ops.create_buffer_resource(b_scale, max_size=False, num_records_bytes=b_scale_bytes)
-            )
+            _buffer_ops.create_buffer_resource(b_scale, max_size=False, num_records_bytes=b_scale_bytes)
         )
         self._blk = lane_id // 16
         self._in16 = lane_id % 16
@@ -728,12 +733,8 @@ def compile_moe_gemm1(
             def _gather_scale_thunks(k, slot):
                 return [lambda: scale_gather.gather(k, slot)]
 
-            a_rsrc = fx.rocdl.get_buffer_rsrc(
-                _buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
-            )
-            b_rsrc = fx.rocdl.get_buffer_rsrc(
-                _buffer_ops.create_buffer_resource(W13, max_size=False, num_records_bytes=E * (2 * I) * K_BYTES)
-            )
+            a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
+            b_rsrc = _buffer_ops.create_buffer_resource(W13, max_size=False, num_records_bytes=E * (2 * I) * K_BYTES)
             a0_g2s = G2SLoaderAsm(a_rsrc, gl_off_a0, N_TILES_A, wave_id)
             a1_g2s = G2SLoaderAsm(a_rsrc, gl_off_a1, N_TILES_A, wave_id)
             b_g2s = G2SLoaderAsm(b_rsrc, gl_off_b, N_TILES_B, wave_id)
