@@ -108,6 +108,26 @@ the weights stop coming from HBM. All rows above are one-call / same-input numbe
 | 09-06 | gemm1 only, A loads removed from the K loop (timing experiment, wrong results) | | 17.26 -> 16.07 | the padding-row A loads are worth 1.2 us; a real fix needs A through LDS with one load per tile |
 | 09-06 | gemm2 tn512 ks3 / tn512 ks1 / tn256 tk384 ks2 / tn512 tk384 ks2 / tn256 tk128 ks6 / wpe6 | | 26.94 / 26.97 / 26.67 / 27.67 / 26.75 / 27.43 | nothing beats tn256 tk256 ks3 |
 
+### M=16 tuning round (09-06, conc 4): nothing beats the M=4 config
+
+| change (M=16, pairs, best config otherwise) | per call | note |
+|---|---|---|
+| baseline (g1 tn32 tk128 kw4 pf3 ss nt2; g2 tn256 tk256 ks3 pm hoist nt2) | **69.09 - 69.15** | gemm1 alone 45.5 (258 MB -> 5.7 TB/s), gemm2 ~23.6 (129 MB -> 5.5 TB/s) |
+| g1 pf2 / pf1 | 69.61 / 76.07 | |
+| g1 tn64 pf2 / tn64 pf3 / tn16 pf2 | 75.32 / 75.31 / 73.52 | |
+| g1 k_wave 2 | 74.12 | |
+| g1 waves_per_eu 3 / 4 (176 -> 168 / 128 VGPRs) | 104.5 / 171.8 | spills (6-212); the pressure is not the load ring (see a4 below) |
+| g2 ks1 / ks1 tn128 / tn512 / tn128 / wpe6 / tk384 ks2 | 70.82 / 69.61 / 72.16 / 69.83 / 73.93 / 71.22 | |
+| g1 `--g1-a4 1` (<= 4-row blocks: A through LDS, 1 load per lane per 128 K, LDS readback one tile ahead) | 70.25 | correct (cos 0.99999); gemm1 alone at M=4 17.26 -> 16.56 but the M=4 chain is flat (26.65) and M=16 is worse; kernel now holds both bodies (205 VGPRs, still 2 waves/SIMD). Kept opt-in |
+| g1 a4 + pf2 / a4 pf3 wpe3 / a4 pf2 wpe4 | 69.63 / 82.48 / 109.98 | 176 VGPRs even with the small ring; forcing 168/128 spills 77/212 |
+| duplicate-expert blocks exit before the table build (no barriers) | 69.59 | noise-level; kept (fewer barriers) |
+
+Reading: at M=16 both kernels stream at 5.5-5.7 TB/s and the sorted path reaches 6.1 TB/s
+at M=64, so ~8% is left, all of it per-workgroup fixed cost (prologue chain, pipeline fill,
+epilogue, the last-round tail; 2 workgroups per CU cannot hide it). Getting it needs
+persistent workgroups that prefetch the next tile's W across the tile boundary (and gemm1
+computing the compacted expert list itself), not more tile tuning.
+
 ### Token counts (MTP=3 fixed, so M = 4 x concurrency; best config, 100 inputs/graph)
 
 | M | CK-tile production | ours, 2 kernels | vs CK-tile | note |

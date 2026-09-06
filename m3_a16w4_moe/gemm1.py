@@ -32,6 +32,7 @@ from .utils import (  # noqa: F401
     _umod,
     a16wmix_use_k16,
     decode_pairs_table,
+    wave_count,
 )
 
 
@@ -138,6 +139,7 @@ def _gemm1_body_a16w4(
     pre_arow=None,
     pre_ep=None,
     pairs=False,
+    a_rows4=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -426,6 +428,61 @@ def _gemm1_body_a16w4(
             frags.append(row)
         return frags
 
+    # ---- a_rows4: blocks with <= 4 real rows (decode: every routed expert, and the shared
+    # expert at M <= 4) load only rows 0-3 of the tile with ONE dwordx4 per lane per 128 K
+    # (lane = row*16 + 16 B chunk), park it in a per-wave LDS slot and ds_read the MFMA
+    # fragments from there (rows 4-15 alias rows 0-3: their results are discarded anyway).
+    # 4 -> 1 vector-memory instructions per tile (ATT: VMEM issue back-pressure was the top
+    # stall and the padded-row loads were 1.2 us at M=4); the ring holds 4 instead of 16
+    # VGPRs of A per tile in flight. Two slots per wave; the write of tile t+1 goes in one
+    # iteration ahead of its reads, no barrier (same wave). Lives at LDS offset 0: the
+    # A-LDS region is idle in a_direct mode until the post-loop barrier of the k_wave reduce.
+    if const_expr(a_rows4):
+        assert m_repeat == 1 and TILE_K % 128 == 0, "a_rows4 needs BM=16 and TILE_K % 128 == 0"
+        A4_CH = TILE_K // 8  # 16 B chunks per 4-row tile row
+        A4_NLD = TILE_K // 128  # dwordx4 loads per lane per tile
+        A4_ROW = TILE_K * 2
+        A4_SLOT = 4 * A4_ROW
+        assert 4 * 2 * A4_SLOT <= k_wave * A_LDS_STAGES * BM * LDS_STRIDE * 2, "a_rows4 slots exceed the A-LDS region"
+        a4_st_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
+        a4_wave_base = wave * fx.Int32(2 * A4_SLOT)
+        a4_rows, a4_cols, a4_rowbase = [], [], []
+        for j in range_constexpr(A4_NLD):
+            q = lane + fx.Int32(64 * j)
+            r_j = q // fx.Int32(A4_CH)
+            c_j = q % fx.Int32(A4_CH)
+            # token of row r_j: pre_arow[0] holds row lane%16's token, pull it from lane r_j
+            tok_j = fx.Int32(rocdl.ds_bpermute(T.i32, _raw(r_j * fx.Int32(4)), _raw(pre_arow[0])))
+            a4_rows.append(r_j)
+            a4_cols.append(c_j * fx.Int32(16))
+            a4_rowbase.append(tok_j * fx.Int32(c_k_div4 * 4))  # padding rows (token = M) land OOB -> 0
+
+        def load_a4(base_k):
+            base_k_bytes = base_k * fx.Int32(elem_bytes)
+            regs = []
+            for j in range_constexpr(A4_NLD):
+                gbyte = a4_rowbase[j] + base_k_bytes + a4_cols[j]
+                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy(a_dir_atom, fx.slice(x_dma_tiles4, (None, gbyte // fx.Int32(16))), r)
+                regs.append(r)
+            return regs
+
+        def stage_a4(regs, slot):
+            for j in range_constexpr(A4_NLD):
+                lbyte = a4_wave_base + fx.Int32(slot * A4_SLOT) + a4_rows[j] * fx.Int32(A4_ROW) + a4_cols[j]
+                fx.copy(a4_st_atom, regs[j], fx.slice(s_x_i32x4_tiles, (None, lbyte // fx.Int32(16))))
+
+        def read_a4(slot):
+            rr = lane_mod_16 & fx.Int32(3)
+            base = a4_wave_base + fx.Int32(slot * A4_SLOT) + rr * fx.Int32(A4_ROW)
+            row = []
+            for ku in range_constexpr(k_unroll):
+                byte_off = base + _a_col_bytes_for_ku(ku)
+                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy_atom_call(a_copy_atom, fx.slice(s_x_i32x4_tiles, (None, byte_off // fx.Int32(16))), r)
+                row.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))
+            return [row]
+
     # ---- B (mxfp4 W) raw load: dwordx4 -> v4i32 (8 fp4 per i32) ----------------
     def load_b_raw(base_k, n_blk, n_intra):
         # raw[k0][j] = i32 holding 8 fp4 for K micro-step (k0*4 + j).
@@ -710,7 +767,28 @@ def _gemm1_body_a16w4(
     else:
         k_base = fx.Int32(0)
 
-    if const_expr(a_direct):
+    if const_expr(a_direct and a_rows4):
+        ring = []
+        for t in range_constexpr(min(prefetch, K_TILES_TOTAL)):
+            kb = k_base + fx.Int32(t * TILE_K)
+            ring.append((load_a4(kb), load_b_tile(kb, kt=t if scale_share else None)))
+        # A(t+1) is written to and read back from LDS one iteration ahead, so the ds_read
+        # latency hides behind tile t's MFMAs (DS ops of a wave execute in order, so the
+        # readback after the write and the write after last iteration's reads need no wait).
+        stage_a4(ring[0][0], 0)
+        frags_cur = read_a4(0)
+        for kt in range_constexpr(K_TILES_TOTAL):
+            if const_expr(kt + prefetch < K_TILES_TOTAL):
+                kb = k_base + fx.Int32((kt + prefetch) * TILE_K)
+                ring.append((load_a4(kb), load_b_tile(kb, kt=(kt + prefetch) if scale_share else None)))
+            _a_regs, b_cur = ring.pop(0)  # already staged and read back
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                stage_a4(ring[0][0], (kt + 1) % 2)
+                frags_next = read_a4((kt + 1) % 2)
+            compute_tile(b_cur, frags_cur)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                frags_cur = frags_next
+    elif const_expr(a_direct):
         # No LDS in the K loop: A and W for the next `prefetch` tiles are in flight while
         # tile kt runs its MFMAs, and nothing forces the wave to drain them early.
         # Barrier-free (the k_wave reduce below has its own barriers). Fully unrolled, so
@@ -851,8 +929,13 @@ def compile_gemm1_a16w4_port(
     scale_share=False,
     pairs=False,
     max_pairs=None,
+    a_rows4=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
+
+    ``a_rows4``: blocks with <= 4 real rows stage A through LDS with one load per lane per
+    128 K (see the body); blocks with more rows (shared expert at M > 4) take the plain
+    a_direct path via a uniform runtime branch. Needs a_direct, BM = 16.
 
     ``pairs``: sort-free decode routing (n_tokens <= BM). arg_mind is topk_ids
     [n_tokens, TOPK]; grid = n_tokens*TOPK*NUM_N_BLOCKS; each block derives its expert and
@@ -936,6 +1019,9 @@ def compile_gemm1_a16w4_port(
         max_pairs = int(max_pairs or BM * TOPK)
         assert max_pairs <= BM * TOPK
         _ad_tag += f"_pairs{max_pairs}"
+    if a_rows4:
+        assert a_direct and BM == 16 and xcd_swizzle == 0, "a_rows4 needs a_direct, BM=16, xcd_swizzle=0"
+        _ad_tag += "_a4"
     _tab_off = lds_bytes  # pairs: 32-dword routing table after the A/reduce region
     if pairs:
         lds_bytes += 128
@@ -985,7 +1071,9 @@ def compile_gemm1_a16w4_port(
             _bxm = _mb * fx.Int32(BM)
             if const_expr(pairs):
                 _tab = _lds_ptr3(fx.Int32(fx.ptrtoint(lds_raw_ptr)), fx.Int32(_tab_off))
-                pre_e, _owner = decode_pairs_table(arg_mind, i32_ntok, TOPK, _mb, lane, _tab, max_pairs=max_pairs)
+                pre_e, _owner, _nrows, _build_tab = decode_pairs_table(arg_mind, i32_ntok, TOPK, _mb, lane, _tab, max_pairs=max_pairs)
+                if _owner:
+                    _build_tab()
 
                 def _mind_at(row):
                     return fx.Int32(llvm.load(T.i32, _gep3(_tab, row * fx.Int32(4))))
@@ -1015,6 +1103,13 @@ def compile_gemm1_a16w4_port(
                 ]
                 for mi in range_constexpr(BM // 16)
             ]
+            if const_expr(a_rows4):
+                # real rows of this block: pairs mode has the count from the scan,
+                # the sorted path counts rows with token < n_tokens (lanes 0..15)
+                if const_expr(pairs):
+                    n_rows = _nrows
+                else:
+                    n_rows = wave_count((lane < fx.Int32(16)) & (pre_arow[0] < i32_ntok), lane)
         if const_expr(pairs):
             total_m_blocks = i32_ntok * fx.Int32(TOPK)
         else:
@@ -1050,45 +1145,55 @@ def compile_gemm1_a16w4_port(
                 _tile = _xcd(bx_i32)
             else:
                 _tile = bx_i32
-            _gemm1_body_a16w4(
-                lds_raw_ptr,
-                arg_x,
-                arg_bq,
-                arg_bscale,
-                arg_eids,
-                arg_mind,
-                arg_cumsum,
-                arg_out,
-                _tile,
-                lane,
-                wave,
-                i32_ntok,
-                f32_situ_beta,
-                f32_situ_beta_rcp,
-                f32_situ_linbeta,
-                f32_situ_linbeta_rcp,
-                f32_swiglu_limit,
-                BM=BM,
-                TILE_N=TILE_N,
-                TILE_K=TILE_K,
-                K=_K,
-                INTER=_INTER,
-                NE=NE,
-                TOPK=TOPK,
-                act=act,
-                b_cache_mod=b_cache_mod,
-                w_dtype=w_dtype,
-                w_layout=w_layout,
-                k_wave=k_wave,
-                use_k16=_use_k16,
-                a_direct=a_direct,
-                prefetch=prefetch,
-                scale_share=scale_share,
-                pre_e=pre_e,
-                pre_arow=pre_arow,
-                pre_ep=pre_ep,
-                pairs=pairs,
-            )
+            def _run_body(_a4):
+                _gemm1_body_a16w4(
+                    lds_raw_ptr,
+                    arg_x,
+                    arg_bq,
+                    arg_bscale,
+                    arg_eids,
+                    arg_mind,
+                    arg_cumsum,
+                    arg_out,
+                    _tile,
+                    lane,
+                    wave,
+                    i32_ntok,
+                    f32_situ_beta,
+                    f32_situ_beta_rcp,
+                    f32_situ_linbeta,
+                    f32_situ_linbeta_rcp,
+                    f32_swiglu_limit,
+                    BM=BM,
+                    TILE_N=TILE_N,
+                    TILE_K=TILE_K,
+                    K=_K,
+                    INTER=_INTER,
+                    NE=NE,
+                    TOPK=TOPK,
+                    act=act,
+                    b_cache_mod=b_cache_mod,
+                    w_dtype=w_dtype,
+                    w_layout=w_layout,
+                    k_wave=k_wave,
+                    use_k16=_use_k16,
+                    a_direct=a_direct,
+                    prefetch=prefetch,
+                    scale_share=scale_share,
+                    pre_e=pre_e,
+                    pre_arow=pre_arow,
+                    pre_ep=pre_ep,
+                    pairs=pairs,
+                    a_rows4=_a4,
+                )
+
+            if const_expr(a_rows4):
+                if n_rows <= fx.Int32(4):
+                    _run_body(True)
+                else:
+                    _run_body(False)
+            else:
+                _run_body(False)
 
     @flyc.jit
     def launch_gemm1(

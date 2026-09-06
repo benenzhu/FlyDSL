@@ -142,11 +142,9 @@ def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab_ptr3, max_pair
     for c in range_constexpr(1, n_chunks):
         e_c = fx.Int32(rocdl.readlane(T.i32, _raw(pvs[c]), _raw(p_lane)))
         e = (p_chunk == fx.Int32(c)).select(e_c, e)
-    # padding sentinel in every slot first (slots 0..31), then the rows
-    llvm.StoreOp(_raw(i32_ntok), _gep3(tab_ptr3, (lane % fx.Int32(32)) * fx.Int32(4)))
-    gpu.barrier()
     base = fx.Int32(0)
     rank_p = fx.Int32(0)
+    slots, fuseds = [], []
     for c in range_constexpr(n_chunks):
         is_match = pvs[c] == e
         mask = rocdl.ballot(T.i64, _raw(is_match))
@@ -154,18 +152,37 @@ def decode_pairs_table(arg_topk, i32_ntok, TOPK, p_i32, lane, tab_ptr3, max_pair
         mask_hi = arith.trunci(T.i32, arith.shrui(mask, arith.constant(32, type=T.i64)))
         below = fx.Int32(rocdl.mbcnt_hi(T.i32, mask_hi, rocdl.mbcnt_lo(T.i32, mask_lo, _raw(fx.Int32(0)))))
         rank = base + below  # row of pair q among this expert's pairs (global pair order)
-        fused = (qs[c] // fx.Int32(TOPK)) | ((qs[c] % fx.Int32(TOPK)) << fx.Int32(24))
-        slot = is_match.select(rank, fx.Int32(31))  # non-matching lanes park in slot 31
-        llvm.StoreOp(_raw(fused), _gep3(tab_ptr3, slot * fx.Int32(4)))
+        fuseds.append((qs[c] // fx.Int32(TOPK)) | ((qs[c] % fx.Int32(TOPK)) << fx.Int32(24)))
+        slots.append(is_match.select(rank, fx.Int32(31)))  # non-matching lanes park in slot 31
         r_p = fx.Int32(rocdl.readlane(T.i32, _raw(rank), _raw(p_lane)))
         rank_p = (p_chunk == fx.Int32(c)).select(r_p, rank_p)
-        if c + 1 < n_chunks:
-            # matches in this chunk = rank at lane 63 + lane 63's own match bit
-            tot = rank + is_match.select(fx.Int32(1), fx.Int32(0))
-            base = fx.Int32(rocdl.readlane(T.i32, _raw(tot), _raw(fx.Int32(63))))
-    gpu.barrier()
+        # matches so far = rank at lane 63 + lane 63's own match bit (row count after the last chunk)
+        tot = rank + is_match.select(fx.Int32(1), fx.Int32(0))
+        base = fx.Int32(rocdl.readlane(T.i32, _raw(tot), _raw(fx.Int32(63))))
     owner = rank_p == fx.Int32(0)
-    return e, owner
+
+    def build_table():
+        # padding sentinel in every slot first (slots 0..31), then the rows
+        llvm.StoreOp(_raw(i32_ntok), _gep3(tab_ptr3, (lane % fx.Int32(32)) * fx.Int32(4)))
+        gpu.barrier()
+        for c in range_constexpr(n_chunks):
+            llvm.StoreOp(_raw(fuseds[c]), _gep3(tab_ptr3, slots[c] * fx.Int32(4)))
+        gpu.barrier()
+
+    # The kernel calls build_table() under `if owner:` (a uniform branch the kernel's AST
+    # rewriter turns into scf.if), so duplicate-expert blocks leave after the loads and
+    # ballots without the two barriers (36% of the blocks at M=16).
+    return e, owner, base, build_table
+
+
+def wave_count(pred, lane):
+    """Number of lanes (wave64) where the Boolean ``pred`` holds, as a uniform Int32."""
+    mask = rocdl.ballot(T.i64, _raw(pred))
+    mask_lo = arith.trunci(T.i32, mask)
+    mask_hi = arith.trunci(T.i32, arith.shrui(mask, arith.constant(32, type=T.i64)))
+    below = fx.Int32(rocdl.mbcnt_hi(T.i32, mask_hi, rocdl.mbcnt_lo(T.i32, mask_lo, _raw(fx.Int32(0)))))
+    tot = below + pred.select(fx.Int32(1), fx.Int32(0))
+    return fx.Int32(rocdl.readlane(T.i32, _raw(tot), _raw(fx.Int32(63))))
 
 
 def _lds_ptr3(base_i32, byte_off_i32):

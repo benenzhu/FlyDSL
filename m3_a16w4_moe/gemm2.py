@@ -754,7 +754,9 @@ def compile_gemm2_a16w4_port(
             _sw_base = _global_base_ptr1(arg_sweights)
             if const_expr(pairs):
                 _tab = _lds_ptr3(fx.Int32(fx.ptrtoint(lds_raw_ptr)), fx.Int32(_tab_off))
-                pre_e, _owner = decode_pairs_table(arg_stids, i32_M, TOPK, _mb, lane, _tab, max_pairs=max_pairs)
+                pre_e, _owner, _, _build_tab = decode_pairs_table(arg_stids, i32_M, TOPK, _mb, lane, _tab, max_pairs=max_pairs)
+                if _owner:
+                    _build_tab()
                 _np_m1 = i32_M * fx.Int32(TOPK) - fx.Int32(1)
 
                 def _stid_at(row):  # token | slot<<24 for row of this block (LDS table)

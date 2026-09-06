@@ -75,6 +75,7 @@ def a16w4_gemm1(
     pairs=False,
     topk_ids=None,
     zero_out=None,
+    a_rows4=False,
     stream=None,
 ):
     """Stage 1: gate/up GEMM + activation -> bf16 ``[sorted_size, D_INTER]`` by sorted row."""
@@ -98,6 +99,7 @@ def a16w4_gemm1(
         scale_share=scale_share,
         pairs=pairs,
         max_pairs=_pairs_cap(n_tokens, topk, tile_m) if pairs else None,
+        a_rows4=a_rows4,
     )
     if pairs:
         # sort-free decode routing: one m-block per routing pair, the kernel finds its rows
