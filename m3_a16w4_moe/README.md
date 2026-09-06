@@ -52,7 +52,23 @@ rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/benc
 | 09-05 | bm16 tn64 tk128 kw4 nt2 | tn256 tk256 | 44.3 us | nt weight loads hurt at M=4 |
 | 09-05 | bm16 tn32 tk256 kw1 | tn256 tk256 | (27.8 us) | INVALID: 8 cols/wave -> 0 accumulators, output NaN; now asserted |
 
+| 09-05 | bm16 tn32 tk128 kw4 | tn256 tk256 | 36.3 us | 408 WGs; rocprof: sort 6.1 + gemm1 18.2 + gemm2 8.6 |
+| 09-05 | bm16 tn32 tk256 kw4 | tn256 tk256 | 37.6 us | |
+| 09-05 | bm16 tn16 tk128 kw4 | tn256 tk256 | 36.9 us | 816 WGs, no further gain |
+| 09-06 | bm16 tn32 tk128 kw4 **a_direct** | tn256 tk256 | **34.6 us** | A straight to VGPR, no LDS/barrier in the K loop |
+| 09-06 | bm16 tn64 tk128 kw4 a_direct | tn256 tk256 | 35.5 us | was 40.9 with the LDS A path |
+
 Correctness gate: `cos vs swigluoai ref` >= 0.9999 (bf16-intermediate reference); 0.99999 measured.
+
+### ATT trace of gemm1 (bm16 tn64 tk128 kw4, LDS A path), one CU, 4 waves
+
+66% of cycles stalled: VMEM-wait 37%, VMEM-load (issue back-pressure) 23%, lgkmcnt-wait 23%,
+barrier 5%. The K loop ISA has a `s_waitcnt vmcnt(0)` per tile: the backend inserts it
+after the A LDS-DMA (`buffer_load ... lds`) before the ds_read, and it also drains the
+W loads prefetched for the next tile, so the one-tile-ahead prefetch never overlaps.
+The scalar W-scale reads (`buffer_load_dword`, 8 per tile) account for 21% of stall on
+their own (issue back-pressure). Fix 1 = `a_direct` (above). Traces: `/work/att_g1*`
+in the container; analyzer: `~/FlyDSL/.claude/skills/kernel-trace-analysis/scripts/hotspot_analyzer.py`.
 
 Where the time goes (bm16 tn64 tk128 kw4, M=4): gemm1 streams the same 80 MB of W1 as
 CK-tile but only 204 workgroups x 4 waves are in flight (17 expert blocks x 12 N tiles) on

@@ -128,6 +128,7 @@ def _gemm1_body_a16w4(
     w_layout="standard",
     k_wave=1,
     use_k16=False,
+    a_direct=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -361,6 +362,35 @@ def _gemm1_body_a16w4(
         r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
         fx.copy_atom_call(a_copy_atom, fx.slice(s_x_i32x4_tiles, (None, byte_off // fx.Int32(16))), r)
         return fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16)  # v8bf16
+
+    # ---- A direct global->VGPR (decode path, a_direct=True) ---------------------
+    # Each lane loads its own MFMA A fragment (row lane%16, 8 bf16 at the K slice its
+    # lane group owns) straight from the token row with buffer_load_dwordx4: no LDS, no
+    # barrier, and no LDS-DMA, which on gfx950 makes the backend emit a full
+    # ``s_waitcnt vmcnt(0)`` before the ds_read that also drains the prefetched W loads
+    # (ATT: 37% VMEM-wait + 23% lgkm-wait in the LDS path at M=4). Padding rows carry a
+    # sentinel token >= n_tokens and are OOB-clamped to 0 by the x_buf resource.
+    if const_expr(a_direct):
+        a_dir_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)  # A rows are L2-hot
+        a_row_base_bytes = []
+        for mi in range_constexpr(m_repeat):
+            sorted_row = bx_m + fx.Int32(mi * 16) + lane_mod_16
+            fused = fx.Int32(_global_i32_at(arg_mind, sorted_row))
+            t_i32 = fused & fx.Int32(0x00FFFFFF)
+            a_row_base_bytes.append(t_i32 * fx.Int32(c_k_div4 * 4))
+
+    def load_a_direct(base_k):
+        base_k_bytes = base_k * fx.Int32(elem_bytes)
+        frags = []
+        for mi in range_constexpr(m_repeat):
+            row = []
+            for ku in range_constexpr(k_unroll):
+                gbyte = a_row_base_bytes[mi] + base_k_bytes + _a_col_bytes_for_ku(ku)
+                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy(a_dir_atom, fx.slice(x_dma_tiles4, (None, gbyte // fx.Int32(16))), r)
+                row.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
+            frags.append(row)
+        return frags
 
     # ---- B (mxfp4 W) raw load: dwordx4 -> v4i32 (8 fp4 per i32) ----------------
     def load_b_raw(base_k, n_blk, n_intra):
@@ -618,7 +648,21 @@ def _gemm1_body_a16w4(
     else:
         k_base = fx.Int32(0)
 
-    if const_expr(not _PIPE):
+    if const_expr(a_direct):
+        # No LDS in the K loop: A and W for tile kt+1 are issued before tile kt's MFMAs
+        # and nothing forces the wave to drain them early. Barrier-free (k_wave reduce
+        # below has its own barriers).
+        a_cur = load_a_direct(k_base)
+        b_cur = load_b_tile(k_base)
+        for kt in range_constexpr(K_TILES_TOTAL):
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                a_nxt = load_a_direct(k_base + fx.Int32((kt + 1) * TILE_K))
+                b_nxt = load_b_tile(k_base + fx.Int32((kt + 1) * TILE_K))
+            compute_tile(b_cur, a_cur)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                a_cur = a_nxt
+                b_cur = b_nxt
+    elif const_expr(not _PIPE):
         dma_x_tile_to_lds(k_base, slot=0)
         b0 = load_b_tile(k_base)
         s_waitcnt_lgkm0()
@@ -736,6 +780,7 @@ def compile_gemm1_a16w4_port(
     w_dtype="mxfp4",
     w_layout="standard",
     k_wave=1,
+    a_direct=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
 
@@ -805,9 +850,10 @@ def compile_gemm1_a16w4_port(
     _wd_tag = "" if w_dtype == "mxfp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
+    _ad_tag = "_adirect" if a_direct else ""
     name_suffix = (
         f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}"
-        f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+        f"_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_ad_tag}"
     )
 
     @fx.struct
@@ -896,6 +942,7 @@ def compile_gemm1_a16w4_port(
                 w_layout=w_layout,
                 k_wave=k_wave,
                 use_k16=_use_k16,
+                a_direct=a_direct,
             )
 
     @flyc.jit
