@@ -41,3 +41,20 @@ rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/benc
 | date | gemm1 tiles | gemm2 tiles | graph replay | note |
 |---|---|---|---|---|
 | 09-05 | bm16 tn128 tk256 kw1 | tn256 tk256 | 45.6 us | first run, untuned, on flydsl 0.2.4 |
+| 09-05 | bm16 tn64 tk256 kw1 | tn256 tk256 | 43.0 us | |
+| 09-05 | bm16 tn64 tk128 kw1 | tn256 tk256 | 45.5 us | |
+| 09-05 | bm16 tn64 tk128 kw4 | tn256 tk256 | **40.9 us** | best so far; rocprof: sort 6.0 + gemm1 21.2 + gemm2 8.6 = 35.8 kernel us |
+| 09-05 | bm16 tn64 tk256 kw4 | tn256 tk256 | 41.3 us | |
+| 09-05 | bm16 tn64 tk128 kw2 | tn256 tk256 | 41.4 us | |
+| 09-05 | bm16 tn128 tk128 kw1 | tn256 tk256 | 50.2 us | |
+| 09-05 | bm16 tn128 tk128 kw2 | tn256 tk256 | 47.1 us | |
+| 09-05 | bm16 tn128 tk256 kw1 xcd1 | tn256 tk256 | 46.5 us | xcd swizzle hurts at M=4 |
+| 09-05 | bm16 tn64 tk128 kw4 nt2 | tn256 tk256 | 44.3 us | nt weight loads hurt at M=4 |
+| 09-05 | bm16 tn32 tk256 kw1 | tn256 tk256 | (27.8 us) | INVALID: 8 cols/wave -> 0 accumulators, output NaN; now asserted |
+
+Correctness gate: `cos vs swigluoai ref` >= 0.9999 (bf16-intermediate reference); 0.99999 measured.
+
+Where the time goes (bm16 tn64 tk128 kw4, M=4): gemm1 streams the same 80 MB of W1 as
+CK-tile but only 204 workgroups x 4 waves are in flight (17 expert blocks x 12 N tiles) on
+256 CUs, one K tile ahead. The old a4w4 FlyDSL gemm1 (t32x64x256, "async" pipeline) moves
+the same bytes in 15.2 us, so the gap is pipeline depth, not dequant cost.

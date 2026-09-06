@@ -770,6 +770,12 @@ def compile_gemm1_a16w4_port(
     assert _K % (k_wave * TILE_K) == 0, f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
     assert _N_OUT % 256 == 0, f"2*D_INTER (N_OUT) must be a multiple of 256, got {_N_OUT}"
     assert _INTER % TILE_N == 0, f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
+    # Each N-wave owns TILE_N/(4/k_wave) columns = whole 16-col MFMA tiles; otherwise
+    # num_acc_n rounds to 0 and the kernel silently computes nothing (tn32/kw1 -> NaN).
+    _n_per_wave = TILE_N // (4 // k_wave)
+    assert _n_per_wave % 16 == 0 and _n_per_wave > 0, (
+        f"TILE_N={TILE_N} with k_wave={k_wave} gives {_n_per_wave} cols per wave; need a multiple of 16"
+    )
     assert BM % 16 == 0, f"BM must be a multiple of 16, got {BM}"
     NUM_N_BLOCKS = _INTER // TILE_N
 
