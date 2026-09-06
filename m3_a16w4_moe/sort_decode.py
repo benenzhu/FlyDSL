@@ -301,9 +301,12 @@ def _max_tokens_bucket(n_tokens: int) -> int:
     return b
 
 
-def moe_sort_decode(topk_ids, topk_weights, E, H, block_m, *, out_dtype=torch.bfloat16, zero_ctas=127, threads=256):
+def moe_sort_decode(
+    topk_ids, topk_weights, E, H, block_m, *, out=None, out_dtype=torch.bfloat16, zero_ctas=127, threads=256
+):
     """Drop-in for ``moe_sorting(topk_ids, topk_w, E, H, dtype, block_size)`` ->
-    (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, zeroed out)."""
+    (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids, zeroed out).
+    ``out`` (``[n_tokens, H]`` bf16, contiguous) is zeroed in place when given."""
     n_tokens, topk = topk_ids.shape
     dev = topk_ids.device
     ms = max_sorted_rows(n_tokens, E, topk, block_m)
@@ -311,7 +314,9 @@ def moe_sort_decode(topk_ids, topk_weights, E, H, block_m, *, out_dtype=torch.bf
     sorted_w = torch.empty(ms, dtype=torch.float32, device=dev)
     sorted_eids = torch.empty(ms // block_m, dtype=torch.int32, device=dev)
     num_valid = torch.empty(2, dtype=torch.int32, device=dev)
-    out = torch.empty((n_tokens, H), dtype=out_dtype, device=dev)
+    if out is None:
+        out = torch.empty((n_tokens, H), dtype=out_dtype, device=dev)
+    assert out.shape == (n_tokens, H) and out.element_size() == 2 and out.is_contiguous()
     launch = compile_decode_sort(
         E=E, topk=topk, block_m=block_m, H=H, max_tokens=_max_tokens_bucket(n_tokens), zero_ctas=zero_ctas, threads=threads
     )

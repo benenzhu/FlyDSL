@@ -151,6 +151,50 @@ so copies are not a useful roofline here.)
 
 Compare only numbers measured with 100 different inputs per graph: **26.5 us vs 42.4 us CK-tile**.
 
+### M=32..256 (conc 8..64 with MTP=3): sorted path, 09-07
+
+Pairs mode stops at M=16. Above it the same gemm1/gemm2 run on expert-sorted rows
+(`--sort decode` = `sort_decode.py`, one kernel: block 0 sorts with LDS counters, the other
+127 blocks zero the output; aiter `moe_sorting` contract, matches it on 20 random routings
+per M in `test_sort_decode.py`). aiter's `moe_sorting` is two kernels (~9.6 us); the aiter#3832
+single-CTA sort has no instance for this shape in the new image.
+
+| M | production (aiter) | ours | note |
+|---|---|---|---|
+| 32 | 121.5 (CK a16w4) | **104.8** | -14%; ks3 105.9 |
+| 64 | 153.3 (CK a16w4) | **137.8** (ks3) | -10%; ks1 139.0 |
+| 128 | 181.0 (CK a16w4) / 183.3 (a4w4) | **161.7** (ks1) | -11% |
+| 256 | 200.3 (a4w4, fp4 activations, cos 0.97) / 200.2 (CK a16w4) | **181.6** (ks1) | -9%, bf16 activations, cos 0.99999 |
+
+100 different routings per graph, same GPU for the ours/ks comparisons, production on the other
+GPU. Sort kernel alone in a graph (test_sort_decode.py): 3.75 / 3.94 / 4.26 us at M=64/128/256
+vs aiter 5.15 / 5.51 / 5.80. Production sort inside the chain was 9.5 us at M=32.
+
+What did not help at M=256 (each vs base 182-188 on the same GPU): gemm1 tn64 (=), tn128 (335!),
+tn64 kw2 (+3), xcd1 (+20), pf4/pf5 (+1/+2), pf2 wpe3 (+25, spills), pf1 wpe3 (+4); gemm2 tn512 (+2),
+tn128 (+1), tk768 (+4), wpe4 (+3), pf2 (=). gemm2 ksplit 1 instead of 3: -4.6 at 256, -1 at 128,
++1.2 at 64, +1 at 32 -> ks3 up to M=64, ks1 above. tile-m 32: 228 / 246 at 128 / 256 (untuned).
+
+Where the rest is (rocprof, M=256): gemm1 118-132 us for 645 MB of W13 (5.4 TB/s; 6.6 at M=64),
+gemm2 62-65 for 322 MB (5.2). ATT of one CU: a gemm1 workgroup lives ~30k cycles = 6.5k prologue
+(kernarg -> ids -> first W data) + ~19k streaming at the HBM share + 4k tail, 2 workgroups per CU
+(208 VGPRs); gemm2 workgroups (3 K tiles) are half prologue/tail with 4 per CU. The shared expert's
+16 blocks (L2-served W, at the end of the sorted order) cost ~6.5 us (`--no-shared` timing
+experiment: 185.9 -> 179.3 at 256, 164.4 -> 158.1 at 128). Roofline at 6.1 TB/s would be ~159 us at
+M=256; the remaining ~20 us is per-workgroup latency that only persistent workgroups (prefetching
+the next block's W across the boundary) would hide.
+
+Current best (M > 16):
+
+```bash
+PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tokens 256 --tile-m 16 --k-wave 4 --sort decode \
+    --g1-tile-n 32 --g1-tile-k 128 --g1-a-direct 1 --g1-pf 3 --g1-ss 1 --g1-b-nt 2 \
+    --g2-tile-n 256 --g2-tile-k 256 --g2-xcd 0 --g2-ksplit 1 --g2-pad-mask 1 --g2-hoist 1 --g2-b-nt 2
+```
+(`--g2-ksplit 3` up to M=64.) vLLM branch `m3/05-flydsl-decode-moe`: `install_decode_fast_path`
+now routes M <= 256 (pairs up to 16, sorted above).
+
+
 Current best command:
 
 ```bash
