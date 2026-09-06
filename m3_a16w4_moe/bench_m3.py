@@ -46,11 +46,12 @@ p.add_argument("--g2-pad-mask", type=int, default=0, help="gemm2: OOB-mask paddi
 p.add_argument("--g2-ss", type=int, default=0, help="gemm2: share scale dwords across 128-K halves / 16-col halves")
 p.add_argument("--g2-hoist", type=int, default=-1, help="gemm2 prologue hoist: -1 = follow a_direct, 0/1 force")
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
-p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs"],
+p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs", "decode"],
                help="aiter: opus moe_sorting (production); mxfp4: aiter#3832 single-CTA sort + zero-init (BM=16)")
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--no-check", action="store_true")
+p.add_argument("--no-shared", action="store_true", help="timing experiment: all 5 slots routed (no M-row shared expert)")
 p.add_argument("--loop", type=int, default=0, help="run N eager iterations and exit (for rocprofv3)")
 p.add_argument("--graph-copies", type=int, default=100,
                help="calls captured per graph, each with its OWN x / routing (different experts -> weights come "
@@ -62,6 +63,7 @@ import torch  # noqa: E402
 import aiter  # noqa: E402
 from aiter import dtypes  # noqa: E402
 from aiter.fused_moe import moe_sorting, _adaptive_moe_sort  # noqa: E402
+from m3_a16w4_moe.sort_decode import moe_sort_decode  # noqa: E402
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
@@ -100,8 +102,12 @@ w2_sk = fp4_utils.e8m0_shuffle(w2_s.view(-1, I // 32)).view(torch.uint8).contigu
 # one 35 MB expert set out of the 256 MB infinity cache.
 def make_input():
     x = torch.randn((M, H), dtype=torch.bfloat16, device=dev)
-    routed = torch.stack([torch.randperm(E - 1, device=dev)[: K - 1] for _ in range(M)])
-    topk_ids = torch.cat([routed, torch.full((M, 1), E - 1, device=dev)], dim=1).to(torch.int32)
+    if args.no_shared:
+        # timing experiment: 5 distinct routed experts, no expert with M rows
+        topk_ids = torch.stack([torch.randperm(E, device=dev)[:K] for _ in range(M)]).to(torch.int32)
+    else:
+        routed = torch.stack([torch.randperm(E - 1, device=dev)[: K - 1] for _ in range(M)])
+        topk_ids = torch.cat([routed, torch.full((M, 1), E - 1, device=dev)], dim=1).to(torch.int32)
     w_r = torch.rand((M, K - 1), device=dev)
     w_r = w_r / w_r.sum(dim=1, keepdim=True) * 2.0  # renormalised, routed_scaling_factor 2.0
     topk_w = torch.cat([w_r, torch.ones((M, 1), device=dev)], dim=1).to(torch.float32)
@@ -149,7 +155,10 @@ def run(inp=None):
             n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, pairs=True, topk=K, topk_ids=topk_ids, topk_weights=topk_w, **g2_kw,
         )
         return out
-    if args.sort == "mxfp4":
+    if args.sort == "decode":
+        # our one-kernel sort + zero (sort_decode.py): block 0 sorts, the other blocks zero `out`
+        sorted_ids, sorted_w, sorted_eids, num_valid, out = moe_sort_decode(topk_ids, topk_w, E, H, BM)
+    elif args.sort == "mxfp4":
         # aiter#3832 moe_sort_quant with kSkipQuant: block 0 sorts (LDS counters), the other
         # CTAs zero `out`; same output contract as moe_sorting (token | slot<<24, pad = M).
         sorted_ids, sorted_w, sorted_eids, num_valid, out = _adaptive_moe_sort(
