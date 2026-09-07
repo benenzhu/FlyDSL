@@ -60,21 +60,30 @@ def _sconst(v):
 
 
 def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch=3, k_batch=4,
-                     b_cache_mod=2, w_layout="standard", waves_per_eu=None):
+                     b_cache_mod=2, w_layout="standard", waves_per_eu=None, n_waves=4, k_waves=1):
     K, INTER = D_HIDDEN, D_INTER
     N_OUT = 2 * INTER
-    assert BM == 16 and TILE_N in (64, 128, 256) and INTER % TILE_N == 0 and K % 256 == 0
+    NW = n_waves                       # waves per workgroup; NWN of them split N, KW split K (LDS reduce at the end)
+    KW = k_waves
+    assert BM == 16 and NW in (2, 4) and KW in (1, 2) and NW % KW == 0
+    NWN = NW // KW
+    assert TILE_N in (32, 64, 128, 256) and INTER % TILE_N == 0 and K % 256 == 0
     assert w_layout in ("standard", "guinterleave")
     KT = K // 128                      # 128-K tiles: 1 KB of W per 16 columns, 256 B of A per row
+    KTW = KT // KW                     # K-tiles per K-wave
     KB = k_batch
-    assert KT % KB == 0 and KB % 2 == 0 and 1 <= prefetch < KT
-    NPW = TILE_N // 4                  # columns per wave (gate and up each)
+    assert KT % KW == 0 and KTW % KB == 0 and KB % 2 == 0 and KTW % 2 == 0 and 1 <= prefetch < KTW
+    NPW = TILE_N // NWN                # columns per wave (gate and up each)
     NI = NPW // 16
+    assert NPW % 16 == 0 and NI >= 1
+    NR = BM // (4 * NW)                # A load rounds per K-tile: one wave instruction covers 4 rows x 256 B
     NNB = INTER // TILE_N
-    ROWB = KB * 256                    # A bytes per row per batch
+    ROWB = KB * 256                    # A bytes per row per batch (per K-wave)
     RS = ROWB + _NW_PAD                # padded LDS row stride
-    SLOT = BM * RS
-    LDS_BYTES = 2 * SLOT
+    KSLOT = BM * RS                    # one K-wave's batch
+    SLOT = KW * KSLOT
+    RED_BYTES = (KW - 1) * NWN * 2 * NI * 1024   # K-reduce scratch (aliases the A slots after the loop)
+    LDS_BYTES = max(2 * SLOT, RED_BYTES)
     # W (mxfp4) preshuffle layout (aiter make_preshuffle_b_layout, N-major, fp4 bytes):
     # (N_OUT/16, K/128, klane 4, nlane 16, kpack 16 B): one 16-col x 128-K block = 1 KB contiguous,
     # lane (klane, n) holds the 32 K of column n at klane -> voffset = lane * 16 B.
@@ -91,9 +100,10 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
 
     _wl = "" if w_layout == "standard" else "_gu"
     _wpe = f"_w{waves_per_eu}" if waves_per_eu else ""
+    _nwt = (f"_nw{NW}" if NW != 4 else "") + (f"_kw{KW}" if KW > 1 else "")
 
-    @flyc.kernel(name=f"gemm1_a16w4_nw{_wl}_h{K}_i{INTER}_ne{NE}_bm{BM}_tn{TILE_N}_pf{prefetch}_kb{KB}_bcm{b_cache_mod}{_wpe}",
-                 known_block_size=[256, 1, 1])
+    @flyc.kernel(name=f"gemm1_a16w4_nw{_wl}_h{K}_i{INTER}_ne{NE}_bm{BM}_tn{TILE_N}_pf{prefetch}_kb{KB}_bcm{b_cache_mod}{_wpe}{_nwt}",
+                 known_block_size=[64 * NW, 1, 1])
     def kernel(
         arg_x: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64, arg_eids: fx.Int64,
         arg_cumsum: fx.Int64, arg_mind: fx.Int64, i32_ntok: fx.Int32,
@@ -105,6 +115,7 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
         lane = tx % fx.Int32(64)
         wave = fx.Int32(rocdl.readfirstlane(T.i32, fx.as_ir_value(tx // fx.Int32(64))))
         l16, q16 = lane % fx.Int32(16), lane // fx.Int32(16)
+        wave_n, wave_k = wave % fx.Int32(NWN), wave // fx.Int32(NWN)
         cumsum0 = fx.Int32(_global_i32_at(arg_cumsum, fx.Int32(0)))
         mb, nb = pid // fx.Int32(NNB), pid % fx.Int32(NNB)
         mbase = mb * fx.Int32(BM)
@@ -112,11 +123,11 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
             e = fx.Int32(rocdl.readfirstlane(T.i32, _raw(fx.Int32(_global_i32_at(arg_eids, mb)))))
             if const_expr(_NW_FAKE_W):
                 e = fx.Int32(0)
-            # A batch staging: wave w, load j: lane -> row w*4 + lane//16, 16 B chunk j*16 + lane%16 of
-            # the batch's ROWB bytes. Padding rows carry a token >= ntok and read as 0 through the
-            # OOB-clamped resource (sized to the real [ntok, K] bf16 buffer).
-            ld_row = wave * fx.Int32(4) + q16
-            ld_tok = fx.Int32(_global_i32_at(arg_mind, mbase + ld_row)) & fx.Int32(0xFFFFFF)
+            # A batch staging: wave w, round r, load j: lane -> row w*4 + r*4*NW + lane//16, 16 B chunk
+            # j*16 + lane%16 of the batch's ROWB bytes. Padding rows carry a token >= ntok and read as 0
+            # through the OOB-clamped resource (sized to the real [ntok, K] bf16 buffer).
+            ld_row = [wave * fx.Int32(4) + fx.Int32(r * 4 * NW) + q16 for r in range_constexpr(NR)]
+            ld_tok = [fx.Int32(_global_i32_at(arg_mind, mbase + ld_row[r])) & fx.Int32(0xFFFFFF) for r in range_constexpr(NR)]
             if const_expr(_NW_FAKE_A):
                 ld_tok = ld_row
             # epilogue rows: lane (q16, l16) holds rows q16*4 + ii of column l16
@@ -128,24 +139,30 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
             outr = bop.create_buffer_resource_from_addr(_raw(fx.Int64(arg_out)), num_records_bytes=_raw(fx.Int64(cumsum0) * fx.Int64(INTER * 2)))
             lds = llvm.inttoptr(ir.Type.parse("!llvm.ptr<3>"), fx.as_ir_value(fx.Int32(fx.ptrtoint(smem))))
 
-            ld_gdw = (ld_tok * fx.Int32(K * 2) + l16 * fx.Int32(16)) // fx.Int32(4)
-            ld_lbyte = ld_row * fx.Int32(RS) + l16 * fx.Int32(16)
+            ld_gdw = [(ld_tok[r] * fx.Int32(K * 2) + l16 * fx.Int32(16)) // fx.Int32(4) for r in range_constexpr(NR)]
+            ld_lbyte = [ld_row[r] * fx.Int32(RS) + l16 * fx.Int32(16) for r in range_constexpr(NR)]
 
             def load_a_batch(b):
-                so = _sconst(b * ROWB)   # batch base in an SGPR; j*256 rides in the immediate offset field
-                return [bop.buffer_load(xr, ld_gdw + fx.Int32(j * 64), vec_width=4, dtype=fx.Int32, soffset_bytes=so)
-                        for j in range_constexpr(KB)]
+                # batch b of every K-wave: tiles kw*KTW + b*KB + j; base in an SGPR, j*256 in the imm field
+                out = []
+                for kw in range_constexpr(KW):
+                    so = _sconst((kw * KTW + b * KB) * 256)
+                    out += [bop.buffer_load(xr, ld_gdw[r] + fx.Int32(j * 64), vec_width=4, dtype=fx.Int32, soffset_bytes=so)
+                            for r in range_constexpr(NR) for j in range_constexpr(KB)]
+                return out
 
             def stage_a_batch(regs, slot):
                 if const_expr(not _NW_NO_A):
-                    for j in range_constexpr(KB):
-                        ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(ld_lbyte + fx.Int32(slot * SLOT + j * 256)), elem_type=T.i8)
-                        llvm.StoreOp(fx.as_ir_value(regs[j]), ptr, alignment=16)
+                    for kw in range_constexpr(KW):
+                        for r in range_constexpr(NR):
+                            for j in range_constexpr(KB):
+                                ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(ld_lbyte[r] + fx.Int32(slot * SLOT + kw * KSLOT + j * 256)), elem_type=T.i8)
+                                llvm.StoreOp(fx.as_ir_value(regs[(kw * NR + r) * KB + j]), ptr, alignment=16)
                 s_waitcnt_lgkm0()
                 gpu.barrier()
 
             # MFMA A fragment (K-step ku of tile kt): row l16, K = klane*32 + ku*8 .. +8 -> bytes q16*64 + ku*16
-            rd_base = l16 * fx.Int32(RS) + q16 * fx.Int32(64)
+            rd_base = wave_k * fx.Int32(KSLOT) + l16 * fx.Int32(RS) + q16 * fx.Int32(64)
 
             def read_a_tile(kt):
                 slot, j = (kt // KB) % 2, kt % KB
@@ -159,7 +176,7 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
                 return out
 
             # ---- W addressing (gu 0 = gate, 1 = up), per wave NI 16-col tiles -------------------
-            nbase = nb * fx.Int32(TILE_N) + wave * fx.Int32(NPW)
+            nbase = nb * fx.Int32(TILE_N) + wave_n * fx.Int32(NPW)
             if const_expr(w_layout == "guinterleave"):
                 # GUGU: gate/up 16-row blocks interleaved; scale packs gate (byte 0/2) and up (1/3)
                 n0 = [(nbase + fx.Int32(ni * 16)) // fx.Int32(16) for ni in range_constexpr(NI)]
@@ -173,8 +190,9 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
                 npk = [[(ng[gu][ni] // fx.Int32(16)) % fx.Int32(2) for ni in range_constexpr(NI)] for gu in range_constexpr(2)]
             # per column tile one vector address (lane*16 B + the tile's block base); the K position is
             # (kt//4)*4096 in an SGPR (_sconst) + (kt%4)*1024 in the immediate offset field
-            wvo = [[lane * fx.Int32(4) + nblk[gu][ni] * fx.Int32(KT * 256) for ni in range_constexpr(NI)] for gu in range_constexpr(2)]
-            svo = [[lane + mni[gu][ni] * fx.Int32(SC_STRIDE_N0) for ni in range_constexpr(NI)] for gu in range_constexpr(2)]
+            # (a K-wave's K range starts at tile wave_k*KTW: folded into the vector addresses)
+            wvo = [[lane * fx.Int32(4) + nblk[gu][ni] * fx.Int32(KT * 256) + wave_k * fx.Int32(KTW * 256) for ni in range_constexpr(NI)] for gu in range_constexpr(2)]
+            svo = [[lane + mni[gu][ni] * fx.Int32(SC_STRIDE_N0) + wave_k * fx.Int32(KTW // 2 * 64) for ni in range_constexpr(NI)] for gu in range_constexpr(2)]
 
             def load_b_tile(kt, prev):
                 so = _sconst((kt // 4) * 4096)
@@ -230,33 +248,65 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
                 ring.append(load_b_tile(t, ring[-1] if ring else None))
             stage_a_batch(abuf, 0)
             abuf = None
-            for kt in range_constexpr(KT):
-                if const_expr(kt % KB == 0 and kt + KB < KT and not _NW_NO_A):
+            for kt in range_constexpr(KTW):
+                if const_expr(kt % KB == 0 and kt + KB < KTW and not _NW_NO_A):
                     abuf = load_a_batch(kt // KB + 1)      # before this iteration's W loads
-                if const_expr(kt + prefetch < KT):
+                if const_expr(kt + prefetch < KTW):
                     ring.append(load_b_tile(kt + prefetch, ring[-1]))
                 bb, sc = ring.pop(0)
                 aa = read_a_tile(kt)
                 compute_tile(bb, sc, aa, kt)
                 if const_expr(_NW_SCHED):
                     rocdl.sched_barrier(0)
-                if const_expr(kt % KB == KB - 1 and kt + 1 < KT):
+                if const_expr(kt % KB == KB - 1 and kt + 1 < KTW):
                     stage_a_batch(abuf, (kt // KB + 1) % 2)   # this batch's reads are done (MFMAs above)
                     abuf = None
+
+            if const_expr(KW > 1):
+                # K-reduce: K-waves > 0 park their partial sums in LDS (A slots are free once every wave
+                # passed the barrier), K-wave 0 adds them and runs the epilogue alone.
+                s_waitcnt_lgkm0()
+                gpu.barrier()
+                red = [[((wave_n * fx.Int32(2) + fx.Int32(gu)) * fx.Int32(NI) + fx.Int32(ni)) * fx.Int32(1024) + lane * fx.Int32(16)
+                        for ni in range_constexpr(NI)] for gu in range_constexpr(2)]
+                if wave_k > fx.Int32(0):
+                    for gu in range_constexpr(2):
+                        for ni in range_constexpr(NI):
+                            ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(red[gu][ni] + (wave_k - fx.Int32(1)) * fx.Int32(NWN * 2 * NI * 1024)), elem_type=T.i8)
+                            llvm.StoreOp(fx.as_ir_value(fx.Vector(fx.memref_load_vec(acc[gu][ni]))), ptr, alignment=16)
+                s_waitcnt_lgkm0()
+                gpu.barrier()
+                if wave_k == fx.Int32(0):
+                    for gu in range_constexpr(2):
+                        for ni in range_constexpr(NI):
+                            v = fx.Vector(fx.memref_load_vec(acc[gu][ni]))
+                            for kw in range_constexpr(1, KW):
+                                ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(red[gu][ni] + fx.Int32((kw - 1) * NWN * 2 * NI * 1024)), elem_type=T.i8)
+                                pv = fx.Vector(llvm.load(T.vec(4, T.f32), ptr, alignment=16))
+                                v = fx.Vector.from_elements([v[i] + pv[i] for i in range_constexpr(4)], fx.Float32)
+                            acc[gu][ni].store(v)
 
             # ---- epilogue: swigluoai(gate, up) -> bf16 [sorted_row, inter], padding rows masked ----
             neg_limit = -fx.Float32(f32_limit)
             alpha = fx.Float32(f32_alpha)
-            for ii in range_constexpr(4):
-                sorted_row = mbase + q16 * fx.Int32(4) + fx.Int32(ii)
-                valid = ep_tok[ii] < i32_ntok
-                for ni in range_constexpr(NI):
-                    g = fx.Float32(fx.Vector(fx.memref_load_vec(acc[0][ni]))[ii])
-                    u = fx.Float32(fx.Vector(fx.memref_load_vec(acc[1][ni]))[ii])
-                    y = _swigluoai_f32(g, u, alpha, neg_limit)
-                    yb = y.to(fx.BFloat16)
-                    out_idx = sorted_row * fx.Int32(INTER) + nbase + fx.Int32(ni * 16) + l16
-                    bop.buffer_store(yb, outr, _raw(out_idx), mask=valid, cache_modifier=_NW_STORE_CPOL)
+
+            def epilogue():
+                for ii in range_constexpr(4):
+                    sorted_row = mbase + q16 * fx.Int32(4) + fx.Int32(ii)
+                    valid = ep_tok[ii] < i32_ntok
+                    for ni in range_constexpr(NI):
+                        g = fx.Float32(fx.Vector(fx.memref_load_vec(acc[0][ni]))[ii])
+                        u = fx.Float32(fx.Vector(fx.memref_load_vec(acc[1][ni]))[ii])
+                        y = _swigluoai_f32(g, u, alpha, neg_limit)
+                        yb = y.to(fx.BFloat16)
+                        out_idx = sorted_row * fx.Int32(INTER) + nbase + fx.Int32(ni * 16) + l16
+                        bop.buffer_store(yb, outr, _raw(out_idx), mask=valid, cache_modifier=_NW_STORE_CPOL)
+
+            if const_expr(KW > 1):
+                if wave_k == fx.Int32(0):
+                    epilogue()
+            else:
+                epilogue()
 
     @flyc.jit
     def launch(
@@ -268,7 +318,7 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
         kernel(
             arg_x, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_mind, i32_ntok, f32_alpha, f32_limit, arg_out,
             **({"value_attrs": {"rocdl.waves_per_eu": waves_per_eu}} if waves_per_eu else {}),
-        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+        ).launch(grid=(grid_x, 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
     return launch
 
@@ -281,14 +331,14 @@ def get_gemm1_nw(**kw):
 def a16w4_gemm1_nw(
     *, x_bf16, w1_u8, w1_scale_u8, inter_sorted_bf16, n_tokens, NE, D_HIDDEN, D_INTER, topk,
     tile_m, tile_n, tile_k, sorted_expert_ids, num_valid_ids, sorted_token_ids,
-    prefetch=3, k_batch=4, b_nt=2, w_layout="standard", waves_per_eu=None,
+    prefetch=3, k_batch=4, b_nt=2, w_layout="standard", waves_per_eu=None, n_waves=4, k_waves=1,
     alpha=1.702, swiglu_limit=7.0, act="swigluoai", stream=None, **_unused,
 ):
     """Drop-in for ``host.a16w4_gemm1`` on the sorted path (tile_m 16, tile_k 128)."""
     assert tile_m == 16 and tile_k == 128 and act == "swigluoai"
     launch = get_gemm1_nw(
         D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, NE=NE, TOPK=topk, BM=tile_m, TILE_N=tile_n,
-        prefetch=prefetch, k_batch=k_batch, b_cache_mod=b_nt, w_layout=w_layout, waves_per_eu=waves_per_eu,
+        prefetch=prefetch, k_batch=k_batch, b_cache_mod=b_nt, w_layout=w_layout, waves_per_eu=waves_per_eu, n_waves=n_waves, k_waves=k_waves,
     )
     grid = int(sorted_expert_ids.numel()) * (D_INTER // tile_n)
     _run_compiled(

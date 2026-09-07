@@ -36,6 +36,7 @@ p.add_argument("--g1-a4", type=int, default=0, help="gemm1: <=4-row blocks stage
 p.add_argument("--g1-ss", type=int, default=0, help="1: share W-scale dwords across tiles of one 256-K group")
 p.add_argument("--g1-impl", choices=["base", "persist", "persist-lookahead", "persist-fused-reduce", "persist-interleave", "agpr", "agpr-ring", "nw"], default="base")
 p.add_argument("--g1-kb", type=int, default=4, help="nw: 128-K tiles per A batch through LDS")
+p.add_argument("--g1-nwave", type=int, default=4, help="nw: waves per workgroup (2 or 4)")
 p.add_argument("--g2-impl", choices=["base", "nw"], default="base")
 p.add_argument("--g2-nb", type=int, default=4, help="gemm2 nw: n-blocks per workgroup")
 p.add_argument("--g1-ctas", type=int, default=512, help="persistent gemm1 CTA count")
@@ -81,7 +82,7 @@ from m3_a16w4_moe.host import a16w4_gemm1, a16w4_gemm2  # noqa: E402
 if args.g1_impl == "nw":
     from functools import partial
     from m3_a16w4_moe.gemm1_nw import a16w4_gemm1_nw
-    a16w4_gemm1 = partial(a16w4_gemm1_nw, k_batch=args.g1_kb)
+    a16w4_gemm1 = partial(a16w4_gemm1_nw, k_batch=args.g1_kb, n_waves=args.g1_nwave, k_waves=args.k_wave)
 elif args.g1_impl != "base":
     from functools import partial
     from m3_a16w4_moe.host_persist import a16w4_gemm1_persist
