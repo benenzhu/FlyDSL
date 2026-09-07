@@ -4,7 +4,7 @@
 Runs inside the production vLLM image. The kernels are the vLLM ones
 (``vllm/models/minimax_m3/amd/ops/moe_a16w4_decode``, imported through
 ``vllm_ops.py`` from the worktree on /dev/shm). Chain per call:
-  sort (aiter moe_sorting / vLLM sort_decode / lab sort_decode_wave / sort-free pairs)
+  sort (aiter moe_sorting / vLLM sort_decode / lab sort_decode_wave / inline sort in the GEMMs)
   ->  gemm1 (gate/up + swigluaoi, bf16 out)  ->  gemm2 (down, routing-weighted atomic add)
 Inputs are generated exactly like m3-compare/scripts/bench_moe_m4.py (same seed -> same
 weights and routing); every captured call has its own input (weights come from HBM like real
@@ -29,10 +29,10 @@ p.add_argument("--seed", type=int, default=0)
 p.add_argument("--tile-m", type=int, default=16, help="sort block / gemm m-block rows (the kernels are built for 16)")
 # gemm1 / gemm2 tiles are fixed in the vLLM kernels (gemm1.py LARGE_M_TOKENS, gemm2.py KSPLIT_SMALL_M_TOKENS)
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
-p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs", "decode", "decode-wave"],
+p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "inline", "decode", "decode-wave"],
                help="aiter: opus moe_sorting; mxfp4: aiter#3832 single-CTA sort + zero-init; decode: the vLLM "
-                    "sort_decode kernel (production); decode-wave: lab sort_decode_wave.py; pairs: sort-free "
-                    "(n_tokens <= 16, production for M <= 16)")
+                    "sort_decode kernel (production); decode-wave: lab sort_decode_wave.py; inline: no sort "
+                    "kernel, the GEMM blocks sort the routing pairs themselves (n_tokens <= 16, production for M <= 16)")
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--no-check", action="store_true")
@@ -119,7 +119,7 @@ g2_kw = {}
 def run(inp=None):
     global last_sort
     x, topk_ids, topk_w = inputs[0] if inp is None else inp
-    if args.sort == "pairs":
+    if args.sort == "inline":
         # no sort kernel: gemm1/gemm2 derive expert + rows from the routing pairs
         # (n_tokens <= BM) and gemm1 zeroes `out` for gemm2's atomics.
         if args.stages < 2:
@@ -127,13 +127,13 @@ def run(inp=None):
         out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
         a16w4_gemm1(
             x_bf16=x, w1_u8=w1_k, w1_scale_u8=w1_sk, inter_sorted_bf16=inter_sorted,
-            n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, topk=K, pairs=True, topk_ids=topk_ids, zero_out=out, **g1_kw,
+            n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, topk=K, inline_sort=True, topk_ids=topk_ids, zero_out=out, **g1_kw,
         )
         if args.stages < 3:
             return out
         a16w4_gemm2(
             inter_sorted_bf16=inter_sorted, w2_u8=w2_k, w2_scale_u8=w2_sk, out_bf16=out,
-            n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, pairs=True, topk=K, topk_ids=topk_ids, topk_weights=topk_w, **g2_kw,
+            n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, inline_sort=True, topk=K, topk_ids=topk_ids, topk_weights=topk_w, **g2_kw,
         )
         return out
     if args.sort in ("decode", "decode-wave"):
@@ -210,7 +210,7 @@ def snapshot(out, sort_state=None):
     """
     if args.stages != 2:
         return out.clone()
-    if args.sort == "pairs":
+    if args.sort == "inline":
         raise ValueError("stage-2 validation currently requires a sorted chain")
     ids, num_valid = last_sort if sort_state is None else sort_state
     ids = ids[:int(num_valid.flatten()[0].item())]

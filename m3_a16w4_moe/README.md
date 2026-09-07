@@ -21,7 +21,7 @@ keeping bf16 activations (no fp4 activation quant, so accuracy matches productio
 - `bench_m3.py`: decode chain bench (sort -> gemm1 -> gemm2) on the production tiles (fixed inside
   the vLLM kernels: `gemm1.py` LARGE_M_TOKENS, `gemm2.py` KSPLIT_SMALL_M_TOKENS), swigluoai
   reference, 100 inputs per graph;
-  `--sort aiter|decode|decode-wave|pairs|mxfp4`, `--stages`, `--loop N` for rocprofv3.
+  `--sort aiter|decode|decode-wave|inline|mxfp4`, `--stages`, `--loop N` for rocprofv3.
 - `test_sort_decode.py`: the sort against aiter `moe_sorting` (same contract) + timing.
 - `sort_decode_wave.py`: lab-only sort variant (wave prefix scan; the mid-batch chain in
   `m3_a4w4_moe` uses it up to 1024 tokens). Not in vLLM.
@@ -33,7 +33,7 @@ keeping bf16 activations (no fp4 activation quant, so accuracy matches productio
 ```bash
 docker exec -it m3cmp_new1 bash
 cd /flydsl && PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tokens 32 --sort decode
-PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tokens 4 --sort pairs
+PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tokens 4 --sort inline
 PYTHONPATH=/flydsl python3 m3_a16w4_moe/test_sort_decode.py --tokens 4 32 256
 # per-kernel breakdown
 rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/bench_m3.py --no-check --loop 200
