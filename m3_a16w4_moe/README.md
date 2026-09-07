@@ -18,6 +18,9 @@ keeping bf16 activations (no fp4 activation quant, so accuracy matches productio
 ## What is here
 
 - `vllm_ops.py`: `import_ops("moe_a16w4_decode")` / `import_ops("moe_a4w4_prefill")`.
+- `vllm_tests.sh [decode|prefill|all|bench]`: copies the two ops packages + test files from the
+  worktree into the container and runs the vLLM unit tests (24 decode / 5 prefill) or the
+  decode chain timing; one summary line each.
 - `bench_m3.py`: decode chain bench (sort -> gemm1 -> gemm2) on the production tiles (fixed inside
   the vLLM kernels: `gemm1.py` LARGE_M_TOKENS, `gemm2.py` KSPLIT_SMALL_M_TOKENS), swigluoai
   reference, 100 inputs per graph;
