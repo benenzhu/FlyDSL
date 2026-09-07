@@ -36,11 +36,14 @@ p.add_argument("--bm", type=int, choices=[0, 32, 64, 128, 256], default=0,
                     "1090 us, 32768: 1929 vs 2020; 8192: 637 vs 614, 4096: 428 vs 402 -> 128 there)")
 p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
+p.add_argument("--mid-g1", choices=["base", "agpr", "agpr-wide", "agpr-wide-splitring"], default="base")
 p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations for rocprofv3, after setup")
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--check-tokens", type=int, default=64)
+p.add_argument("--check-determinism", action="store_true", help="optional bitwise diagnostic; compare reference cosine by default")
+p.add_argument("--diagnose-weight-power", action="store_true", help="compare aiter against a squared-route-weight reference and exit before timing")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--no-prod", action="store_true")
 p.add_argument("--tail", choices=["none", "residual", "prod"], default="none",
@@ -63,6 +66,9 @@ from m3_a4w4_moe.reduce_fp8 import compile_moe_reduce_fp8  # noqa: E402
 from m3_a4w4_moe.sort import SortBuffers, compile_moe_sort  # noqa: E402
 from m3_a4w4_moe.tile_map import compile_tile_map, tile_map_grid  # noqa: E402
 from m3_a4w4_moe.gemm1_mid import compile_moe_gemm1_mid  # noqa: E402
+from m3_a4w4_moe.gemm1_mid_agpr import compile_moe_gemm1_mid as compile_g1_agpr  # noqa: E402
+from m3_a4w4_moe.gemm1_mid_agpr_wide import compile_moe_gemm1_mid as compile_g1_agpr_wide  # noqa: E402
+from m3_a4w4_moe.gemm1_mid_agpr_wide_splitring import compile_moe_gemm1_mid as compile_g1_agpr_wide_splitring  # noqa: E402
 from m3_a4w4_moe.gemm2_mid import compile_moe_gemm2_mid  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_fp8 import compile_moe_gemm2_mid as compile_moe_gemm2_mid_fp8  # noqa: E402
 from m3_a16w4_moe.sort_decode_wave import compile_decode_sort, _ptr, _max_tokens_bucket  # noqa: E402
@@ -142,7 +148,9 @@ launch_sort = (compile_decode_sort(E=E, topk=K, block_m=BM, H=H, max_tokens=_max
                if args.chain == "mid" else compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.sort_ctas))
 launch_tm = None if args.chain == "mid" else compile_tile_map(I=I, BM=BM)
 fn_tm = None
-launch1 = (compile_moe_gemm1_mid(H=H, I=I, E=E, BLOCK_M=BM) if args.chain == "mid"
+mid_g1_builder = {"base": compile_moe_gemm1_mid, "agpr": compile_g1_agpr,
+                  "agpr-wide": compile_g1_agpr_wide, "agpr-wide-splitring": compile_g1_agpr_wide_splitring}[args.mid_g1]
+launch1 = (mid_g1_builder(H=H, I=I, E=E, BLOCK_M=BM) if args.chain == "mid"
            else compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM))
 if args.chain == "mid":
     g2_builder = compile_moe_gemm2_mid_fp8 if args.out == "fp8" else compile_moe_gemm2_mid
@@ -322,7 +330,7 @@ c0 = cases[0]
 nv = int(c0.bufs.num_valid_ids[0].item())
 print(
     f"[moe] M={M} topk={K} E={E}: sorted rows valid {nv} / alloc {c0.num_m_blocks * BM}, setup x{len(cases)} "
-    f"{time.time() - t0:.1f}s",
+    f"{time.time() - t0:.1f}s chain={args.chain} mid_g1={args.mid_g1} out={args.out}",
     flush=True,
 )
 if args.loop:
@@ -338,7 +346,7 @@ if not args.no_prod:
     y_prod = c0.prod().clone()
     torch.cuda.synchronize()
 # determinism: the same inputs again must give the same bits (a race shows up here)
-for rep in range(2):
+for rep in range(2 if args.check_determinism else 0):
     y2 = c0.mine().clone()
     torch.cuda.synchronize()
     d = (y2.view(torch.int16) != y_mine.view(torch.int16)).any(dim=1)
@@ -411,7 +419,8 @@ def _stage_determinism():
         assert torch.equal(v1, v2) and torch.equal(v1, f(r3)), f"{k}: stage is not bitwise deterministic"
 
 
-_stage_determinism()
+if args.check_determinism:
+    _stage_determinism()
 
 
 def _cos(a, b):
@@ -425,9 +434,10 @@ def _dequant(q, s, n_cols):
     return (v.view(q.shape[0], -1, 32) * sc.unsqueeze(-1)).view(q.shape[0], n_cols)
 
 
+numerical_ok = True
 if not args.no_prod:
     same = y_mine.view(torch.int16) == y_prod.view(torch.int16)
-    assert torch.isfinite(y_mine).all() and _cos(y_mine, y_prod) >= 0.995, "whole-chain mismatch vs aiter"
+    numerical_ok = bool(torch.isfinite(y_mine).all())
     # bf16 ulp distance: the int16 patterns are monotonic in magnitude per sign; across
     # sign / zero use the value distance in units of the larger magnitude's ulp
     a16, b16 = y_mine.view(torch.int16).int(), y_prod.view(torch.int16).int()
@@ -449,7 +459,7 @@ if args.check_tokens > 0:
     xs = u8(xs).view(M, H // 32)
     toks = torch.randperm(M, device=dev)[: args.check_tokens].tolist()
     w13d, w2d = {}, {}
-    cm, cp = [], []
+    cm, cp, cp_squared = [], [], []
     sim = {k: [] for k in ("bf16", "mx32", "mx8", "plain", "plain_w", "row")}
 
     def _e4m3(v):
@@ -467,6 +477,7 @@ if args.check_tokens > 0:
     for t in toks:
         xd = _dequant(xq[t : t + 1], xs[t : t + 1], H).view(H)
         out = torch.zeros(H, dtype=torch.float32, device=dev)
+        out_squared = torch.zeros_like(out)
         for j in range(K):
             e = int(c0.topk_ids[t, j])
             if e not in w13d:
@@ -479,6 +490,8 @@ if args.check_tokens > 0:
             ye = a @ w2d[e].T
             wj = float(c0.topk_w[t, j])
             out += wj * ye
+            if args.diagnose_weight_power:
+                out_squared += wj * wj * ye
             if args.sim_fp8_formats:
                 acc = sim.setdefault("_acc", {})
                 acc.setdefault("bf16", torch.zeros_like(out)).add_((ye * wj).to(torch.bfloat16).float())
@@ -494,6 +507,8 @@ if args.check_tokens > 0:
         cm.append(_cos(y_mine[t], out))
         if not args.no_prod:
             cp.append(_cos(y_prod[t], out))
+            if args.diagnose_weight_power:
+                cp_squared.append(_cos(y_prod[t], out_squared))
     msg = f"[moe] cos vs fp32 reference on {len(toks)} tokens: mine min {min(cm):.5f} mean {statistics.mean(cm):.5f}"
     if cp:
         msg += f"; prod min {min(cp):.5f} mean {statistics.mean(cp):.5f}"
@@ -501,6 +516,11 @@ if args.check_tokens > 0:
     assert min(cm) >= 0.97, "whole-chain mismatch vs fp32 reference"
     if cp:
         assert statistics.mean(cm) >= statistics.mean(cp) - 0.002, "mean cosine materially worse than aiter"
+    if args.diagnose_weight_power:
+        print(f"[moe] aiter cosine vs squared-route-weight reference: min {min(cp_squared):.5f} mean {statistics.mean(cp_squared):.5f}", flush=True)
+        raise SystemExit(0)
+    if cp:
+        assert min(cp) >= 0.97, "aiter comparison path fails its independent reference"
     if args.sim_fp8_formats:
         print(
             "[moe] fp8 format sim (cos of the bf16 final sum vs fp32 ref, min / mean): "
@@ -508,6 +528,8 @@ if args.check_tokens > 0:
             flush=True,
         )
 
+
+assert numerical_ok, "whole-chain mismatch vs aiter (see independent reference above)"
 
 # ---- timing ----
 def time_graph(fn_of_case, label):
@@ -521,7 +543,7 @@ def time_graph(fn_of_case, label):
     torch.cuda.synchronize()
     g.replay()
     torch.cuda.synchronize()
-    if label == "mine (whole graph)":
+    if label == "mine (whole graph)" and args.check_determinism:
         snapshots = [c.y.clone() for c in cases]
         for trial in range(2):
             g.replay()

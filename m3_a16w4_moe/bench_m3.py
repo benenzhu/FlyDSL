@@ -34,7 +34,7 @@ p.add_argument("--g1-a-direct", type=int, default=0, help="1: A straight global-
 p.add_argument("--g1-pf", type=int, default=1, help="K tiles in flight ahead of compute (a_direct only)")
 p.add_argument("--g1-a4", type=int, default=0, help="gemm1: <=4-row blocks stage A through LDS, one load per lane per 128 K")
 p.add_argument("--g1-ss", type=int, default=0, help="1: share W-scale dwords across tiles of one 256-K group")
-p.add_argument("--g1-impl", choices=["base", "persist", "persist-lookahead", "persist-fused-reduce", "persist-interleave"], default="base")
+p.add_argument("--g1-impl", choices=["base", "persist", "persist-lookahead", "persist-fused-reduce", "persist-interleave", "agpr", "agpr-ring"], default="base")
 p.add_argument("--g1-ctas", type=int, default=512, help="persistent gemm1 CTA count")
 p.add_argument("--g2-tile-n", type=int, default=256)
 p.add_argument("--g2-tile-k", type=int, default=256)
@@ -53,6 +53,7 @@ p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs", "d
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--no-check", action="store_true")
+p.add_argument("--check-determinism", action="store_true", help="optional bitwise diagnostic; cosine is the default acceptance check")
 p.add_argument("--no-shared", action="store_true", help="timing experiment: all 5 slots routed (no M-row shared expert)")
 p.add_argument("--loop", type=int, default=0, help="run N eager iterations and exit (for rocprofv3)")
 p.add_argument("--graph-copies", type=int, default=100,
@@ -279,10 +280,11 @@ if not args.no_check:
     out = snapshot(out)
     ref = reference()
     check_ref(out, ref, "swigluoai reference")
-    for trial in range(2):
+    for trial in range(2 if args.check_determinism else 0):
         again = snapshot(run())
         assert torch.equal(out.view(torch.int16), again.view(torch.int16)), f"eager trial {trial + 2}: not bitwise deterministic"
-    print("[a16w4-flydsl] eager same input x3: bitwise identical", flush=True)
+    if args.check_determinism:
+        print("[a16w4-flydsl] eager same input x3: bitwise identical", flush=True)
 
 # ---- HIP-graph replay timing (how vLLM runs it) ----
 s = torch.cuda.Stream()
@@ -303,11 +305,12 @@ if not args.no_check:
     graph_out = snapshot(outs_g[-1], graph_sort)
     graph_ref = reference(inputs[-1]) if len(inputs) > 1 else ref
     check_ref(graph_out, graph_ref, "graph last-input reference")
-    for trial in range(2):
+    for trial in range(2 if args.check_determinism else 0):
         g.replay()
         again = snapshot(outs_g[-1], graph_sort)
         assert torch.equal(graph_out.view(torch.int16), again.view(torch.int16)), f"graph trial {trial + 2}: not bitwise deterministic"
-    print("[a16w4-flydsl] graph same input x3: bitwise identical", flush=True)
+    if args.check_determinism:
+        print("[a16w4-flydsl] graph same input x3: bitwise identical", flush=True)
 meds = []
 for r in range(args.rounds):
     for _ in range(20):

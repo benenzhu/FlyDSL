@@ -122,3 +122,29 @@ The ~0.2 us saving is far smaller than the full-layer target gap.
 Full-layer context from the station (not newly measured here): aiter
 M32/64/128/256 = 121.5/153.3/181.0/200.3 us; one-weight-read floor at
 7 TB/s = 88.8/120.7/136.3/138.6 us. No full-layer speedup is claimed.
+
+## Checkpoint 4: four-wave AGPR controls and updated acceptance
+
+The user supplied the `att-hotloop-benchmark` skill from the `zty_dev_moe`
+branch and asked to test a four-wave VGPR/AGPR split on small M, using actual
+ATT cycle windows to schedule instructions. Its scripts were fetched under
+`m3-compare/work/moe_midm/att_hotloop_skill/`.
+
+`gemm1_agpr.py` preserves the old tile/pipeline and pins C to AGPR. Opaque
+MFMA asm initially produced NaNs until an explicit `s_nop 1` was inserted
+between packed-fp4 conversion and MFMA operand consumption. After that,
+M32/64/128/256 all pass cosine and eager/graph bitwise diagnostics. Sort+G1:
+71.28 [69.79,71.33] / 91.61 [91.47,93.51] / 107.25 [107.19,109.34] /
+124.36 [124.32,126.40] us. This is effectively unchanged from the old kernel.
+
+`gemm1_agpr_ring.py` uses a larger N tile with C in AGPR and replaces each
+consumed W column fragment in place with its next-K load. Wait counters are
+derived from the actual issue-event sequence. M32 TN128 and TN256 both pass,
+but sort+G1 is 82.10 [80.00,82.86] / 93.19 [93.15,95.24] us: slower.
+They use 132 VGPR + 64 AGPR and 204 VGPR + 128 AGPR, respectively, no spills.
+
+**Latest user acceptance supersedes the original bitwise requirement:**
+compare cosine against the same mathematical reference as aiter. Bitwise
+repetition is now optional (`--check-determinism`); differences in final bits
+alone do not reject a candidate. NaNs and material cosine loss still fail.
+End-to-end gsm8k remains part of the station's final service validation.

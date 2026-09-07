@@ -61,3 +61,48 @@ whole chain. ATT collection with `sys_trace: true` hit a rocprofv3 finalizer
 segfault while serializing HIP API arguments; GPU work and the kernel CSV
 completed first. Retry uses the established ATT-only configuration in a new
 output directory. No kernel failure is inferred from this tool finalizer error.
+
+## Checkpoint 2: AGPR / wider tiles; aiter fp8 reference issue at M2048
+
+Independent G1 files, M512 isolated latency (us, 100 inputs, five rounds):
+
+| Variant | Median [range] |
+|---|---|
+| mid, depth 1 | 131.3 [129.2,133.0] |
+| mid, depth 2 | 128.2 [125.7,129.4] |
+| scalar K offsets | 129.2 [127.4,131.4] |
+| shallow A / deep W | 130.2 [127.8,131.7] |
+| pinned AGPR, TN128 | 129.8 [128.0,131.8] |
+| pinned AGPR, TN256 | 124.4 [119.8,126.1] |
+| TN256, shallow A / deep W | 124.6 [120.3,126.0] |
+| TN256, rotate K quarter per wave | 127.3 [123.6,129.5] |
+
+All passed the explicit quantized reference (zero sampled payload/scale
+differences) and the then-required eager/graph bitwise diagnostics. Depth
+1/2 reduced register counts to 116/162 without a speedup; simply increasing
+occupancy was not enough. TN256 AGPR uses 204 VGPR + 64 AGPR; splitting A/W
+rings reduces that to 180 + 64, still with similar time.
+
+`--chain mid --mid-g1 agpr-wide-splitring --bm 32 --copies 100 --tail prod`,
+fp8 enabled for both sides: M512 235.7 [235.7,235.8] vs aiter 212.7
+[212.6,212.7]; M1024 306.1 [306.0,306.1] vs 242.3 [242.2,242.3]. Still slower.
+
+M2048 could not be accepted against the fp8-enabled aiter path: mine vs aiter
+cosine 0.909868. Independent fp32 reference on 64 tokens gives mine
+min/mean 0.98787/0.98979, aiter 0.89509/0.90107. The error is therefore in the
+aiter comparison path or its invocation, not evidence of a new-kernel loss.
+The squared-route-weight hypothesis was tested and rejected (aiter cosine
+against that reference only 0.87526 mean). Investigate before using its
+performance as a baseline. The suspect path is the M2048 reduce epilogue
+with `AITER_FLYDSL_STAGE2_FP8=1` / `MXFP4_G2_KSTATIC=1`; small-M atomic
+aiter paths do not activate this fp8-output mode.
+
+Latest user instruction: approximate cosine parity is sufficient; bitwise
+checks are optional diagnostics now (`--check-determinism`). The benchmark
+prints pairwise cosine but accepts by finite output and independent reference
+cosine, requiring a healthy aiter reference as well.
+
+The `sys_trace` finalizer left one sleeping profiler Python process with a
+CUDA context. Its exact PID/command was verified and the process was cleaned
+up with TERM then KILL (no pattern kills). Subsequent GPU selection reported
+zero process VRAM and an idle device. Ordinary benchmark defaults are unchanged.
