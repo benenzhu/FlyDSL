@@ -35,7 +35,11 @@ from flydsl.expr.typing import T
 
 from .gemm1 import _swigluoai_f32
 from .host import _run_compiled
-from .utils import _e8m0_byte_to_f32, _global_i32_at, _raw, buffer_ops as bop, s_waitcnt_lgkm0
+from .host import _pairs_cap
+from .utils import (
+    _e8m0_byte_to_f32, _gep1, _gep3, _global_base_ptr1, _global_i32_at, _lds_ptr3, _raw,
+    buffer_ops as bop, decode_pairs_table, s_waitcnt_lgkm0,
+)
 
 _NW_STORE_CPOL = int(os.environ.get("M3_D1_STORE_CPOL", "0"), 0)
 # timing-only diagnostics (wrong results): FAKE_A = every block reads rows 0..15 (A always L2-hot),
@@ -60,7 +64,12 @@ def _sconst(v):
 
 
 def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch=3, k_batch=4,
-                     b_cache_mod=2, w_layout="standard", waves_per_eu=None, n_waves=4, k_waves=1):
+                     b_cache_mod=2, w_layout="standard", waves_per_eu=None, n_waves=4, k_waves=1,
+                     pairs=False, max_pairs=None):
+    """``pairs``: sort-free decode routing (n_tokens <= BM, see utils.decode_pairs_table): arg_mind
+    is topk_ids [n_tokens, TOPK], one m-block per routing pair (grid = n_tokens*TOPK*NNB), each
+    block derives its expert and rows from the pairs, duplicate-expert blocks exit, and the blocks
+    of pair 0 zero ``arg_zero`` (the stage-2 output gemm2 accumulates into)."""
     K, INTER = D_HIDDEN, D_INTER
     N_OUT = 2 * INTER
     NW = n_waves                       # waves per workgroup; NWN of them split N, KW split K (LDS reduce at the end)
@@ -84,6 +93,11 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
     SLOT = KW * KSLOT
     RED_BYTES = (KW - 1) * NWN * 2 * NI * 1024   # K-reduce scratch (aliases the A slots after the loop)
     LDS_BYTES = max(2 * SLOT, RED_BYTES)
+    _tab_off = LDS_BYTES                         # pairs: 32-entry routing table after the A region
+    if pairs:
+        max_pairs = int(max_pairs or BM * TOPK)
+        assert max_pairs <= BM * TOPK
+        LDS_BYTES += 128
     # W (mxfp4) preshuffle layout (aiter make_preshuffle_b_layout, N-major, fp4 bytes):
     # (N_OUT/16, K/128, klane 4, nlane 16, kpack 16 B): one 16-col x 128-K block = 1 KB contiguous,
     # lane (klane, n) holds the 32 K of column n at klane -> voffset = lane * 16 B.
@@ -100,7 +114,7 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
 
     _wl = "" if w_layout == "standard" else "_gu"
     _wpe = f"_w{waves_per_eu}" if waves_per_eu else ""
-    _nwt = (f"_nw{NW}" if NW != 4 else "") + (f"_kw{KW}" if KW > 1 else "")
+    _nwt = (f"_nw{NW}" if NW != 4 else "") + (f"_kw{KW}" if KW > 1 else "") + (f"_pairs{max_pairs}" if pairs else "")
 
     @flyc.kernel(name=f"gemm1_a16w4_nw{_wl}_h{K}_i{INTER}_ne{NE}_bm{BM}_tn{TILE_N}_pf{prefetch}_kb{KB}_bcm{b_cache_mod}{_wpe}{_nwt}",
                  known_block_size=[64 * NW, 1, 1])
@@ -108,6 +122,7 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
         arg_x: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64, arg_eids: fx.Int64,
         arg_cumsum: fx.Int64, arg_mind: fx.Int64, i32_ntok: fx.Int32,
         f32_alpha: fx.Float32, f32_limit: fx.Float32, arg_out: fx.Int64,
+        arg_zero: fx.Int64, i32_zero_dw: fx.Int32,
     ):
         smem = fx.SharedAllocator().allocate(Shared).peek().raw.ptr
         tx = fx.Int32(gpu.thread_id("x"))
@@ -116,23 +131,47 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
         wave = fx.Int32(rocdl.readfirstlane(T.i32, fx.as_ir_value(tx // fx.Int32(64))))
         l16, q16 = lane % fx.Int32(16), lane // fx.Int32(16)
         wave_n, wave_k = wave % fx.Int32(NWN), wave // fx.Int32(NWN)
-        cumsum0 = fx.Int32(_global_i32_at(arg_cumsum, fx.Int32(0)))
         mb, nb = pid // fx.Int32(NNB), pid % fx.Int32(NNB)
         mbase = mb * fx.Int32(BM)
-        if mbase < cumsum0:
-            e = fx.Int32(rocdl.readfirstlane(T.i32, _raw(fx.Int32(_global_i32_at(arg_eids, mb)))))
+        if const_expr(pairs):
+            # block = routing pair mb: expert + rows from a ballot over the pairs into an LDS table
+            tab = _lds_ptr3(fx.Int32(fx.ptrtoint(smem)), fx.Int32(_tab_off))
+            e_pair, owner, _nrows, build_tab = decode_pairs_table(arg_mind, i32_ntok, TOPK, mb, lane, tab, max_pairs=max_pairs)
+            if owner:
+                build_tab()
+            cumsum0 = i32_ntok * fx.Int32(TOPK * BM)
+            go = owner
+            # zero the stage-2 output (gemm2 accumulates with atomics): the NNB blocks of pair 0
+            # stride over it, one dword per thread
+            if mb == fx.Int32(0):
+                zb = _global_base_ptr1(arg_zero)
+                for iv in range(pid * fx.Int32(64 * NW) + tx, i32_zero_dw, NNB * 64 * NW):
+                    llvm.StoreOp(_raw(fx.Int32(0)), _gep1(zb, fx.Int32(iv) * fx.Int32(4)))
+
+            def mind_at(row):
+                return fx.Int32(llvm.load(T.i32, _gep3(tab, row * fx.Int32(4))))
+        else:
+            cumsum0 = fx.Int32(_global_i32_at(arg_cumsum, fx.Int32(0)))
+            go = mbase < cumsum0
+
+            def mind_at(row):
+                return fx.Int32(_global_i32_at(arg_mind, mbase + row))
+        if go:
+            if const_expr(pairs):
+                e = e_pair
+            else:
+                e = fx.Int32(rocdl.readfirstlane(T.i32, _raw(fx.Int32(_global_i32_at(arg_eids, mb)))))
             if const_expr(_NW_FAKE_W):
                 e = fx.Int32(0)
             # A batch staging: wave w, round r, load j: lane -> row w*4 + r*4*NW + lane//16, 16 B chunk
             # j*16 + lane%16 of the batch's ROWB bytes. Padding rows carry a token >= ntok and read as 0
             # through the OOB-clamped resource (sized to the real [ntok, K] bf16 buffer).
             ld_row = [wave * fx.Int32(4) + fx.Int32(r * 4 * NW) + q16 for r in range_constexpr(NR)]
-            ld_tok = [fx.Int32(_global_i32_at(arg_mind, mbase + ld_row[r])) & fx.Int32(0xFFFFFF) for r in range_constexpr(NR)]
+            ld_tok = [mind_at(ld_row[r]) & fx.Int32(0xFFFFFF) for r in range_constexpr(NR)]
             if const_expr(_NW_FAKE_A):
                 ld_tok = ld_row
             # epilogue rows: lane (q16, l16) holds rows q16*4 + ii of column l16
-            ep_tok = [fx.Int32(_global_i32_at(arg_mind, mbase + q16 * fx.Int32(4) + fx.Int32(ii))) & fx.Int32(0xFFFFFF)
-                      for ii in range_constexpr(4)]
+            ep_tok = [mind_at(q16 * fx.Int32(4) + fx.Int32(ii)) & fx.Int32(0xFFFFFF) for ii in range_constexpr(4)]
             xr = bop.create_buffer_resource_from_addr(_raw(fx.Int64(arg_x)), num_records_bytes=_raw(fx.Int64(i32_ntok) * fx.Int64(K * 2)))
             wr = bop.create_buffer_resource_from_addr(_raw(fx.Int64(arg_bq)), num_records_bytes=min(W_BYTES, 0xFFFFFFFF))
             sr = bop.create_buffer_resource_from_addr(_raw(fx.Int64(arg_bscale)), num_records_bytes=min(SW_BYTES, 0xFFFFFFFF))
@@ -312,11 +351,13 @@ def compile_gemm1_nw(*, D_HIDDEN, D_INTER, NE, TOPK, BM=16, TILE_N=128, prefetch
     def launch(
         arg_x: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64, arg_eids: fx.Int64,
         arg_cumsum: fx.Int64, arg_mind: fx.Int64, i32_ntok: fx.Int32, i32_grid: fx.Int32,
-        f32_alpha: fx.Float32, f32_limit: fx.Float32, arg_out: fx.Int64, stream: fx.Stream,
+        f32_alpha: fx.Float32, f32_limit: fx.Float32, arg_out: fx.Int64, arg_zero: fx.Int64, i32_zero_dw: fx.Int32,
+        stream: fx.Stream,
     ):
         grid_x = fx.Int64(i32_grid)
         kernel(
             arg_x, arg_bq, arg_bscale, arg_eids, arg_cumsum, arg_mind, i32_ntok, f32_alpha, f32_limit, arg_out,
+            arg_zero, i32_zero_dw,
             **({"value_attrs": {"rocdl.waves_per_eu": waves_per_eu}} if waves_per_eu else {}),
         ).launch(grid=(grid_x, 1, 1), block=(64 * NW, 1, 1), stream=stream)
 
@@ -330,20 +371,31 @@ def get_gemm1_nw(**kw):
 
 def a16w4_gemm1_nw(
     *, x_bf16, w1_u8, w1_scale_u8, inter_sorted_bf16, n_tokens, NE, D_HIDDEN, D_INTER, topk,
-    tile_m, tile_n, tile_k, sorted_expert_ids, num_valid_ids, sorted_token_ids,
+    tile_m, tile_n, tile_k, sorted_expert_ids=None, num_valid_ids=None, sorted_token_ids=None,
+    pairs=False, topk_ids=None, zero_out=None,
     prefetch=3, k_batch=4, b_nt=2, w_layout="standard", waves_per_eu=None, n_waves=4, k_waves=1,
     alpha=1.702, swiglu_limit=7.0, act="swigluoai", stream=None, **_unused,
 ):
-    """Drop-in for ``host.a16w4_gemm1`` on the sorted path (tile_m 16, tile_k 128)."""
+    """Drop-in for ``host.a16w4_gemm1`` (tile_m 16, tile_k 128): sorted path, or ``pairs`` (n_tokens <= tile_m)."""
     assert tile_m == 16 and tile_k == 128 and act == "swigluoai"
     launch = get_gemm1_nw(
         D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, NE=NE, TOPK=topk, BM=tile_m, TILE_N=tile_n,
-        prefetch=prefetch, k_batch=k_batch, b_cache_mod=b_nt, w_layout=w_layout, waves_per_eu=waves_per_eu, n_waves=n_waves, k_waves=k_waves,
+        prefetch=prefetch, k_batch=k_batch, b_cache_mod=b_nt, w_layout=w_layout, waves_per_eu=waves_per_eu,
+        n_waves=n_waves, k_waves=k_waves, pairs=pairs, max_pairs=_pairs_cap(n_tokens, topk, tile_m) if pairs else None,
     )
-    grid = int(sorted_expert_ids.numel()) * (D_INTER // tile_n)
+    if pairs:
+        assert int(n_tokens) <= tile_m and topk_ids is not None and zero_out is not None
+        max_m_blocks = int(n_tokens) * int(topk)
+        eids_ptr, cumsum_ptr, mind_ptr = 0, 0, topk_ids.data_ptr()
+        zero_ptr, zero_dw = zero_out.data_ptr(), (zero_out.numel() * zero_out.element_size()) // 4
+    else:
+        max_m_blocks = int(sorted_expert_ids.numel())
+        eids_ptr, cumsum_ptr, mind_ptr = sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), sorted_token_ids.data_ptr()
+        zero_ptr, zero_dw = 0, 0
+    grid = max_m_blocks * (D_INTER // tile_n)
     _run_compiled(
-        launch, x_bf16.data_ptr(), w1_u8.data_ptr(), w1_scale_u8.data_ptr(), sorted_expert_ids.data_ptr(),
-        num_valid_ids.data_ptr(), sorted_token_ids.data_ptr(), int(n_tokens), int(grid), float(alpha),
-        float(swiglu_limit), inter_sorted_bf16.data_ptr(), torch.cuda.current_stream() if stream is None else stream,
+        launch, x_bf16.data_ptr(), w1_u8.data_ptr(), w1_scale_u8.data_ptr(), eids_ptr, cumsum_ptr, mind_ptr,
+        int(n_tokens), int(grid), float(alpha), float(swiglu_limit), inter_sorted_bf16.data_ptr(),
+        int(zero_ptr), int(zero_dw), torch.cuda.current_stream() if stream is None else stream,
     )
     return inter_sorted_bf16
