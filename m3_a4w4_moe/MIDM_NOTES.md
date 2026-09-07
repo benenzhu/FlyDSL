@@ -1,5 +1,14 @@
 # Middle-batch fp4 MoE — checkpoint 1
 
+> 2026-09-07 dedup: the production prefill kernels (gemm1/gemm2/sort/tile_map/lowlevel)
+> now live only in vLLM (`vllm/models/minimax_m3/amd/ops/moe_a4w4_prefill/`, imported
+> here through `m3_a16w4_moe/vllm_ops.py`). Of the mid-batch variants only the winners
+> stay in this directory: `gemm1_mid_alds.py` + `gemm2_mid_atomic_alds.py` (helpers in
+> `lab_utils.py`), plus `reduce_fp8.py` for the fp8 route-out mode. The dead-end files
+> named below (`gemm1_mid.py`, `_agpr*`, `_k2`, `_soffset`, `_splitring`, `gemm2_mid.py`,
+> `_fp8`, `_persist`, `_atomic`, `gemm1_1x4/persist/s3.py`, `gemm2_persist.py`) are in
+> the branch history (`m3-a16w4-moe` 4033603 / this branch's first commit 743067d).
+
 The new chain is opt-in (`bench_moe_a4w4 --chain mid --bm 32`). It is correct
 at the tested M512 shape but **does not yet beat aiter**. No vLLM integration.
 

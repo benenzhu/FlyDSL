@@ -31,9 +31,11 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from m3_a16w4_moe.utils import s_waitcnt_lgkm0
-from m3_a16w4_moe.gemm1_agpr_ring import _pin_accumulators
-from .gemm1 import (
+from m3_a16w4_moe.vllm_ops import import_ops
+from .lab_utils import _pin_accumulators, s_waitcnt_lgkm0
+
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.gemm1 import (  # noqa: E402
     _buffer_ops as bop, _swiglu_oai, _quant_prep_fp4, _fmax,
     _e8m0_roundup_fp4, _as_f32, _cvt_pk_fp4, _permlane16_swap,
     Mfma16x16x128Fp4, _asm_void,

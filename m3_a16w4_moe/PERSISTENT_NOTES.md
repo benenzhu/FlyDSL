@@ -1,5 +1,10 @@
 # Persistent decode experiment — checkpoint 1
 
+> 2026-09-07: the persistent kernels (`gemm1_persist*.py`, `host_persist.py`,
+> `gemm1_agpr*.py`) were removed from this branch with the dedup (kernels live in vLLM,
+> this directory keeps tooling only); they are in the branch history (`m3-a16w4-moe`
+> 4033603 / 743067d). The notes below describe those files.
+
 This is work in progress, **not a validated fast path**. The production kernel
 and the benchmark's default implementation remain `gemm1.py`.
 

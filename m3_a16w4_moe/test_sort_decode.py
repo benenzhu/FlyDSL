@@ -3,7 +3,8 @@ Usage: python m3_a16w4_moe/test_sort_decode.py [--module sort_decode] [--tokens 
 import argparse, importlib, time, torch
 
 p = argparse.ArgumentParser()
-p.add_argument("--module", default="sort_decode")
+p.add_argument("--module", default="sort_decode", choices=["sort_decode", "sort_decode_wave"],
+               help="sort_decode = the vLLM kernel (moe_a16w4_decode/sort_decode.py); sort_decode_wave = the lab variant")
 p.add_argument("--tokens", type=int, nargs="+", default=[1, 4, 16, 32, 64, 128, 256])
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
@@ -13,7 +14,12 @@ p.add_argument("--trials", type=int, default=20)
 args = p.parse_args()
 
 from aiter.fused_moe import moe_sorting  # noqa: E402
-mod = importlib.import_module(f"m3_a16w4_moe.{args.module}")
+if args.module == "sort_decode_wave":
+    mod = importlib.import_module("m3_a16w4_moe.sort_decode_wave")
+else:
+    from m3_a16w4_moe.vllm_ops import import_ops
+
+    mod = import_ops("moe_a16w4_decode").sort_decode
 dev = "cuda"
 E, K, H, BM = args.experts, args.topk, args.hidden, args.block_m
 torch.manual_seed(0)

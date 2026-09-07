@@ -18,7 +18,10 @@ from flydsl.expr import range_constexpr  # noqa: E402
 from flydsl.expr import rocdl as _rocdl  # noqa: E402
 from flydsl.expr.typing import T as _T  # noqa: E402
 from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops  # noqa: E402
-from m3_a4w4_moe.gemm1 import G2SLoaderAsm, _Buf  # noqa: E402
+from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
+
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.gemm1 import G2SLoaderAsm, _Buf  # noqa: E402
 
 N_LD = 16  # 16-B-per-lane instructions per wave per iteration (16 KB per wave, 64 KB per CTA)
 N_ST_MIX = 12

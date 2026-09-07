@@ -33,7 +33,10 @@ from flydsl._mlir.dialects import arith as _arith  # noqa: E402
 from flydsl.expr.typing import T as _T  # noqa: E402
 from aiter.fused_moe import moe_sorting  # noqa: E402
 from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops  # noqa: E402
-from m3_a4w4_moe.gemm1 import G2SLoaderAsm, _Buf, _divmod_nonneg, wait_barrier  # noqa: E402
+from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
+
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.gemm1 import G2SLoaderAsm, _Buf, _divmod_nonneg, wait_barrier  # noqa: E402
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokens", type=int, default=4096)

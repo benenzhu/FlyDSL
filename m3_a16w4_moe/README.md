@@ -1,8 +1,47 @@
-# MiniMax-M3 decode MoE (M=4), a16w4 in FlyDSL
+# MiniMax-M3 decode MoE (M <= 256), a16w4 in FlyDSL: lab scaffolding
 
-Goal: beat the CK-tile a16w4 MoE path vLLM uses for MiniMax-M3 on MI355X at decode
-(M=4, TP4 shape: hidden 6144, inter 768, 128 routed + 1 shared expert, topk 4+1),
+**The kernels live in vLLM, not here.** Since 2026-09-07 this directory only holds the
+benchmark / test / trace tooling; the decode kernels (sort_decode, gemm1, gemm2, host
+wrappers) are the single copy in the vLLM branch `m3/05-flydsl-decode-moe`,
+`vllm/models/minimax_m3/amd/ops/moe_a16w4_decode/`, and the prefill kernels are in
+`.../moe_a4w4_prefill/`. `vllm_ops.py` imports them from the worktree
+(`M3_VLLM_OPS`, default `/dev/shm/m3-compare/wt-m3-05/vllm/models/minimax_m3/amd/ops`,
+visible inside the bench containers because they run with `--ipc=host`), so whatever
+that checkout has is what the benches run. Earlier revisions of this branch
+(`m3-a16w4-moe`, last 4033603) carry the kernel history and the dead-end variants
+(agpr / persistent / nw experiments); the results log below refers to them.
+
+Goal (unchanged): beat the CK-tile a16w4 MoE path vLLM uses for MiniMax-M3 on MI355X at
+decode (TP4 shape: hidden 6144, inter 768, 128 routed + 1 shared expert, topk 4+1),
 keeping bf16 activations (no fp4 activation quant, so accuracy matches production).
+
+## What is here
+
+- `vllm_ops.py`: `import_ops("moe_a16w4_decode")` / `import_ops("moe_a4w4_prefill")`.
+- `bench_m3.py`: decode chain bench (sort -> gemm1 -> gemm2), production tiles by default
+  (`moe_a16w4_decode._gemm1_cfg` / `GEMM2_CFG`), swigluoai reference, 100 inputs per graph;
+  `--sort aiter|decode|decode-wave|pairs|mxfp4`, `--stages`, `--loop N` for rocprofv3.
+- `test_sort_decode.py`: the sort against aiter `moe_sorting` (same contract) + timing.
+- `sort_decode_wave.py`: lab-only sort variant (wave prefix scan; the mid-batch chain in
+  `m3_a4w4_moe` uses it up to 1024 tokens). Not in vLLM.
+- `att_summary.py`: ATT trace summariser; traces under `att_traces/`.
+- `PERSISTENT_NOTES.md`: the persistent-gemm1 experiment (dead end, kernels in history).
+
+## Run (inside the image)
+
+```bash
+docker exec -it m3cmp_new1 bash
+cd /flydsl && PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tokens 32 --sort decode
+PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tokens 4 --sort pairs
+PYTHONPATH=/flydsl python3 m3_a16w4_moe/test_sort_decode.py --tokens 4 32 256
+# per-kernel breakdown
+rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/bench_m3.py --no-check --loop 200
+```
+
+The end-to-end package timing (the vLLM `a16w4_decode_moe` entry point, HIP graph, 100
+inputs) is `work/moe_bench/vllm_dec_bench.py` in m3-compare (`/work/vllm_dec_bench.py` in
+the container); it runs the vLLM copy installed in the image, so `docker cp` the two ops
+directories from the worktree first.
 
 ## Baseline (production image, GPU graph replay, M=4)
 
@@ -12,29 +51,6 @@ keeping bf16 activations (no fp4 activation quant, so accuracy matches productio
 | aiter#3832 a4w4 FlyDSL port (fp4 activations, cos 0.97) | sort+quant 4.1 + gemm1 22.3 + gemm2 7.9 | 39.2 us |
 
 Numbers from `m3-compare/scripts/bench_moe_m4.py` + rocprofv3 (see m3-compare NIGHTLOG 2026-09-04).
-
-## What is here
-
-Starting point is FlyDSL's `kernels/moe/moe_2stage_a16wmix` (PR #948, also vendored in
-aiter main but only enabled for SiTUv2 there). Copied, then:
-
-- `utils.py`: flydsl 0.2.4 shims (`buffer_ops` import, `s_waitcnt` raw encoding, static
-  `crd2idx`) so it runs on the flydsl inside the production vLLM image.
-- `gemm1.py`: `act="swigluoai"` epilogue (gpt-oss / MiniMax swiglu: alpha 1.702, limit 7).
-- `host.py`: explicit-tile launch wrappers (no CSV lookup).
-- `bench_m3.py`: M=4 bench, same inputs as `bench_moe_m4.py`, swigluoai reference,
-  graph-replay timing; `--loop N` for rocprofv3.
-
-Chain per call: aiter `moe_sorting` (sort + zero output) -> gemm1 -> gemm2 (atomic add).
-
-## Run (inside the image)
-
-```bash
-docker exec -it m3cmp_kda bash
-cd /flydsl && PYTHONPATH=/flydsl python3 m3_a16w4_moe/bench_m3.py --tile-m 16 --g1-tile-n 128 --g1-tile-k 256
-# per-kernel breakdown
-rocprofv3 --kernel-trace --stats -d /work/rp_flydsl -- python3 m3_a16w4_moe/bench_m3.py --no-check --loop 200
-```
 
 ## Results log
 

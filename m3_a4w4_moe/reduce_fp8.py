@@ -29,7 +29,10 @@ from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
 
-from m3_a4w4_moe.gemm2 import _i1, _as_f32
+from m3_a16w4_moe.vllm_ops import import_ops
+
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.gemm2 import _as_f32, _i1  # noqa: E402
 
 _TOKENS_PER_CTA = 4
 

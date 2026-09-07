@@ -24,8 +24,11 @@ p.add_argument("--seed", type=int, default=0)
 args = p.parse_args()
 
 import flydsl.compiler as flyc  # noqa: E402
-from m3_a4w4_moe.gemm1 import SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
-from m3_a4w4_moe.sort import SortBuffers, compile_moe_sort  # noqa: E402
+from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
+
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.gemm1 import SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
+from moe_a4w4_prefill.sort import SortBuffers, compile_moe_sort  # noqa: E402
 
 import aiter  # noqa: E402,F401
 import aiter.fused_moe as FM  # noqa: E402
@@ -240,7 +243,7 @@ print(
 _dequant = lambda q, s, n: (fp4_utils.mxfp4_to_f32(q.reshape(-1)).view(q.shape[0], -1, 32) * fp4_utils.e8m0_to_f32(s.reshape(-1)).view(q.shape[0], -1, 1)).view(q.shape[0], n)  # noqa: E731
 bad = torch.nonzero(d.abs() >= 2)
 if bad.numel() > 0:
-    from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA
+    from moe_a4w4_prefill.gemm1 import SWIGLU_ALPHA
 
     xq, xs = per_1x32_f4_quant(x, quant_dtype=dtypes.fp4x2)
     xq, xs = u8(xq).view(M, H // 2), u8(xs).view(M, H // 32)

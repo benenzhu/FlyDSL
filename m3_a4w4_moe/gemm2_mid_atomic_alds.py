@@ -22,8 +22,7 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels import buffer_ops as bop
-from m3_a16w4_moe.gemm2 import _atomic_bf16_epilog
-from m3_a16w4_moe.utils import s_waitcnt_lgkm0
+from .lab_utils import _atomic_bf16_epilog, s_waitcnt_lgkm0
 
 _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "2"), 0)
 # pair mode: workgroups (mb, nb) and (mb+1, nb) get block ids p and p+8, i.e. the same XCD in the same

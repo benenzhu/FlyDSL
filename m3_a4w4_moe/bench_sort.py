@@ -39,7 +39,10 @@ args = p.parse_args()
 import aiter  # noqa: E402,F401
 from aiter.fused_moe import moe_sorting  # noqa: E402
 
-from m3_a4w4_moe.sort import SortBuffers, compile_moe_sort  # noqa: E402
+from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
+
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.sort import SortBuffers, compile_moe_sort  # noqa: E402
 
 torch.manual_seed(args.seed)
 dev = "cuda"

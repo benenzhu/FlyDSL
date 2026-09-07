@@ -1,4 +1,5 @@
-"""Correctness + timing of ``m3_a4w4_moe.gemm1`` (MiniMax-M3 prefill MoE stage 1).
+"""Correctness + timing of the prefill MoE stage-1 kernel (vLLM ``moe_a4w4_prefill/gemm1.py``,
+imported through ``m3_a16w4_moe/vllm_ops.py``) and of the lab mid-batch variant ``gemm1_mid_alds.py``.
 
 Run inside the vLLM image (its aiter provides the production prologue:
 ``moe_sorting`` + ``fused_dynamic_mx_quant_moe_sort``):
@@ -33,18 +34,13 @@ p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--check-rows", type=int, default=256, help="sampled sorted rows to verify (0 = skip)")
 p.add_argument("--check-determinism", action="store_true", help="optional bitwise diagnostic")
 p.add_argument("--seed", type=int, default=0)
-p.add_argument("--no-xcd", action="store_true", help="plain block order instead of the XCD-aware remap")
 p.add_argument("--dump-ir", action="store_true")
 p.add_argument("--fake-dense", choices=["rows", "gather"], default=None,
                help="after the real prologue, overwrite routing: 'rows' = expert 0 everywhere + contiguous token "
                     "rows (pure kernel overhead vs the dense kernel); 'gather' = expert 0 everywhere but the real "
                     "gathered rows (isolates the A gather from expert switching); disables the check")
-p.add_argument("--wgm", type=int, default=4, help="m-tiles per XCD group in the block remap")
-p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist", "mid", "mid-soffset", "mid-splitring", "mid-agpr", "mid-agpr-wide", "mid-agpr-wide-splitring", "mid-agpr-rotate", "mid-k2", "mid-alds"], default="2x2",
-               help="2x2 = gemm1.py (4-wave 2x2 quadrants); 1x4 = gemm1_1x4.py (Kimi v36 port, BM128 only); "
-                    "persist = gemm1_persist.py (2x2, one CTA per CU, cross-block pipelined); "
-                    "s3 = gemm1_s3.py (2x2, 3-stage LDS ring, DMA three K-steps ahead, BM128)")
-p.add_argument("--ctas", type=int, default=256, help="persist: number of CTAs (multiple of 8)")
+p.add_argument("--kernel", choices=["2x2", "mid-alds"], default="2x2",
+               help="2x2 = the vLLM prefill gemm1 (4-wave 2x2 quadrants); mid-alds = gemm1_mid_alds.py (lab, 512..1024 tokens)")
 p.add_argument("--prefetch", type=int, default=3, help="mid: K tiles prefetched in VGPRs")
 p.add_argument("--k-batch", type=int, default=4, help="mid-alds: K tiles per LDS-staged A batch")
 p.add_argument("--g1-tn", type=int, default=256, help="mid-alds: gate(+up) columns per workgroup (128, 256 or 384)")
@@ -53,18 +49,10 @@ p.add_argument("--order", choices=["expert", "xcd"], default="expert",
 args = p.parse_args()
 
 import flydsl.compiler as flyc  # noqa: E402
-from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
-from m3_a4w4_moe.gemm1_1x4 import compile_moe_gemm1_1x4, ptr_arg  # noqa: E402
-from m3_a4w4_moe.gemm1_persist import compile_moe_gemm1_persist  # noqa: E402
-from m3_a4w4_moe.gemm1_s3 import compile_moe_gemm1_s3  # noqa: E402
-from m3_a4w4_moe.gemm1_mid import compile_moe_gemm1_mid  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_soffset import compile_moe_gemm1_mid as compile_moe_gemm1_mid_soffset  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_splitring import compile_moe_gemm1_mid as compile_moe_gemm1_mid_splitring  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_agpr import compile_moe_gemm1_mid as compile_moe_gemm1_mid_agpr  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_agpr_wide import compile_moe_gemm1_mid as compile_moe_gemm1_mid_agpr_wide  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_agpr_wide_splitring import compile_moe_gemm1_mid as compile_moe_gemm1_mid_agpr_wide_splitring  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_agpr_rotate import compile_moe_gemm1_mid as compile_moe_gemm1_mid_agpr_rotate  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_k2 import compile_moe_gemm1_mid as compile_moe_gemm1_mid_k2  # noqa: E402
+from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
+
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_alds import compile_moe_gemm1_mid as compile_moe_gemm1_mid_alds  # noqa: E402
 
 import aiter  # noqa: E402,F401
@@ -164,7 +152,6 @@ class Case:
             self.sorted_eids = torch.zeros_like(self.sorted_eids)
         self.num_m_blocks = int(self.sorted_eids.shape[0])
         self.tile_map, self.grid = build_tile_map(self.sorted_eids, self.num_valid, self.num_m_blocks)
-        self.dbg = torch.zeros(args.ctas, dtype=torch.int32, device=dev)  # persist: progress markers (debug)
         rows = self.num_m_blocks * BM
         self.out_q = torch.empty((rows, I // 2), dtype=torch.uint8, device=dev)
         self.out_s = torch.empty((rows * (I // 32),), dtype=torch.uint8, device=dev)
@@ -186,28 +173,6 @@ class Case:
             self.tile_map,
             self.grid,
             torch.cuda.current_stream(),
-        ) + ((ptr_arg(self.dbg),) if args.kernel == "persist" else ())
-
-    def args_1x4(self):
-        def pa(t):
-            assert t.is_contiguous()
-            return ptr_arg(t)
-
-        return (
-            pa(self.out_q),
-            pa(self.out_s),
-            pa(u8(self.a_q)),
-            pa(u8(w1_k)),
-            pa(u8(self.a_s)),
-            pa(u8(w1_sk)),
-            pa(self.sorted_eids),
-            pa(self.sorted_ids),
-            pa(self.tile_map),
-            M,
-            self.num_m_blocks,
-            int(u8(self.a_s).numel()),
-            self.grid,
-            torch.cuda.current_stream(),
         )
 
 
@@ -223,37 +188,17 @@ print(
 )
 
 t0 = time.time()
-if args.kernel == "1x4":
-    assert BM == 128 and args.order == "expert", "1x4 kernel: BM128 + expert-order tile_map only"
-    launch_1x4 = compile_moe_gemm1_1x4(H=H, I=I, E=E, tile_m=BM)
-
-    def call(case):
-        launch_1x4(*case.args_1x4())
+if args.kernel == "mid-alds":
+    launch = compile_moe_gemm1_mid_alds(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch, k_batch=args.k_batch, TILE_N=args.g1_tn)
 else:
-    if args.kernel in ("mid", "mid-soffset", "mid-splitring", "mid-agpr", "mid-agpr-wide", "mid-agpr-wide-splitring", "mid-agpr-rotate", "mid-k2", "mid-alds"):
-        builder = {"mid": compile_moe_gemm1_mid, "mid-soffset": compile_moe_gemm1_mid_soffset,
-                   "mid-splitring": compile_moe_gemm1_mid_splitring, "mid-agpr": compile_moe_gemm1_mid_agpr,
-                   "mid-agpr-wide": compile_moe_gemm1_mid_agpr_wide,
-                   "mid-agpr-wide-splitring": compile_moe_gemm1_mid_agpr_wide_splitring,
-                   "mid-agpr-rotate": compile_moe_gemm1_mid_agpr_rotate, "mid-k2": compile_moe_gemm1_mid_k2,
-                   "mid-alds": compile_moe_gemm1_mid_alds}[args.kernel]
-        if args.kernel == "mid-alds":
-            launch = builder(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch, k_batch=args.k_batch, TILE_N=args.g1_tn)
-        else:
-            launch = builder(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch)
-    elif args.kernel == "persist":
-        assert args.order == "expert"
-        launch = compile_moe_gemm1_persist(H=H, I=I, E=E, BLOCK_M=BM, n_cta=args.ctas)
-    elif args.kernel == "s3":
-        launch = compile_moe_gemm1_s3(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
-                                      tile_map=args.order == "expert")
-    else:
-        launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM, use_xcd_remap=not args.no_xcd, xcd_wgm=args.wgm,
-                                   tile_map=args.order == "expert")
-    fn = flyc.compile(launch, *c0.args())
+    launch = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM)
+fn = flyc.compile(launch, *c0.args())
 
-    def call(case):
-        fn(*case.args())
+
+def call(case):
+    fn(*case.args())
+
+
 print(f"[gemm1:{args.kernel}] compile {time.time() - t0:.1f}s", flush=True)
 call(c0)
 torch.cuda.synchronize()

@@ -37,8 +37,8 @@ p.add_argument("--bm", type=int, choices=[0, 32, 64, 128, 256], default=0,
 p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
 p.add_argument("--no-check", action="store_true", help="timing-only diagnostics: do not assert on the reference cosines")
-p.add_argument("--mid-g1", choices=["base", "agpr", "agpr-wide", "agpr-wide-splitring", "alds"], default="base")
-p.add_argument("--mid-g2", choices=["base", "persist", "atomic", "atomic-alds"], default="base")
+p.add_argument("--mid-g1", choices=["alds"], default="alds", help="mid chain gemm1 (gemm1_mid_alds.py; the other variants were dead ends, see MIDM_NOTES.md)")
+p.add_argument("--mid-g2", choices=["atomic-alds"], default="atomic-alds", help="mid chain gemm2 (gemm2_mid_atomic_alds.py)")
 p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations for rocprofv3, after setup")
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
@@ -64,20 +64,18 @@ p.add_argument("--sim-fp8-formats", action="store_true",
 args = p.parse_args()
 
 import flydsl.compiler as flyc  # noqa: E402
-from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
-from m3_a4w4_moe.gemm2 import compile_moe_gemm2, gemm2_grid  # noqa: E402
+# production kernels come from the vLLM tree (m3_a16w4_moe/vllm_ops.py)
+from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
+
+import_ops("moe_a16w4_decode")
+import_ops("moe_a4w4_prefill")
+from moe_a4w4_prefill.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # noqa: E402
+from moe_a4w4_prefill.gemm2 import compile_moe_gemm2, gemm2_grid  # noqa: E402
+from moe_a4w4_prefill.sort import SortBuffers, compile_moe_sort  # noqa: E402
+from moe_a4w4_prefill.tile_map import compile_tile_map, tile_map_grid  # noqa: E402
+# lab-only kernels: fp8 route-out reduce, the mid-batch (512..1024 tokens) chain and its sort
 from m3_a4w4_moe.reduce_fp8 import compile_moe_reduce_fp8  # noqa: E402
-from m3_a4w4_moe.sort import SortBuffers, compile_moe_sort  # noqa: E402
-from m3_a4w4_moe.tile_map import compile_tile_map, tile_map_grid  # noqa: E402
-from m3_a4w4_moe.gemm1_mid import compile_moe_gemm1_mid  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_agpr import compile_moe_gemm1_mid as compile_g1_agpr  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_agpr_wide import compile_moe_gemm1_mid as compile_g1_agpr_wide  # noqa: E402
-from m3_a4w4_moe.gemm1_mid_agpr_wide_splitring import compile_moe_gemm1_mid as compile_g1_agpr_wide_splitring  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_alds import compile_moe_gemm1_mid as compile_g1_alds  # noqa: E402
-from m3_a4w4_moe.gemm2_mid import compile_moe_gemm2_mid  # noqa: E402
-from m3_a4w4_moe.gemm2_mid_fp8 import compile_moe_gemm2_mid as compile_moe_gemm2_mid_fp8  # noqa: E402
-from m3_a4w4_moe.gemm2_mid_persist import compile_moe_gemm2_mid_persist  # noqa: E402
-from m3_a4w4_moe.gemm2_mid_atomic import compile_moe_gemm2_mid as compile_moe_gemm2_mid_atomic  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_atomic_alds import compile_moe_gemm2_mid as compile_moe_gemm2_mid_atomic_alds  # noqa: E402
 from m3_a16w4_moe.sort_decode_wave import compile_decode_sort, _ptr, _max_tokens_bucket  # noqa: E402
 
@@ -156,22 +154,12 @@ launch_sort = (compile_decode_sort(E=E, topk=K, block_m=BM, H=H, max_tokens=_max
                if args.chain == "mid" else compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.sort_ctas))
 launch_tm = None if args.chain == "mid" else compile_tile_map(I=I, BM=BM)
 fn_tm = None
-mid_g1_builder = {"base": compile_moe_gemm1_mid, "agpr": compile_g1_agpr,
-                  "agpr-wide": compile_g1_agpr_wide, "agpr-wide-splitring": compile_g1_agpr_wide_splitring,
-                  "alds": compile_g1_alds}[args.mid_g1]
+mid_g1_builder = {"alds": compile_g1_alds}[args.mid_g1]
 launch1 = (mid_g1_builder(H=H, I=I, E=E, BLOCK_M=BM) if args.chain == "mid"
            else compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM))
 if args.chain == "mid":
-    if args.mid_g2 == "atomic-alds":
-        g2_builder = compile_moe_gemm2_mid_atomic_alds
-    elif args.mid_g2.startswith("atomic"):
-        g2_builder = compile_moe_gemm2_mid_atomic
-    elif args.mid_g2 == "persist":
-        assert args.out == "fp8"
-        g2_builder = compile_moe_gemm2_mid_persist
-    else:
-        g2_builder = compile_moe_gemm2_mid_fp8 if args.out == "fp8" else compile_moe_gemm2_mid
-    launch2 = g2_builder(H=H, I=I, E=E, topk=K, BLOCK_M=BM)
+    assert args.out == "bf16", "mid chain: bf16 atomic output only"
+    launch2 = compile_moe_gemm2_mid_atomic_alds(H=H, I=I, E=E, topk=K, BLOCK_M=BM)
 else:
     launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out, sort_block_m=BM)
 launch_r = compile_moe_reduce_fp8(H=H, topk=K) if args.out == "fp8" else None

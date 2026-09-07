@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""MiniMax-M3 (TP4) decode MoE at M=4 on the FlyDSL a16w4 3-kernel chain.
+"""MiniMax-M3 (TP4) decode MoE (M <= 256) on the FlyDSL a16w4 chain, vs the aiter sort.
 
-Runs inside the production vLLM image (flydsl 0.2.4 + its aiter). Chain per call:
-  aiter moe_sorting (sort + zero output)  ->  gemm1 (gate/up + swigluoai, bf16 out)
-  ->  gemm2 (down, routing-weighted atomic add)
+Runs inside the production vLLM image. The kernels are the vLLM ones
+(``vllm/models/minimax_m3/amd/ops/moe_a16w4_decode``, imported through
+``vllm_ops.py`` from the worktree on /dev/shm). Chain per call:
+  sort (aiter moe_sorting / vLLM sort_decode / lab sort_decode_wave / sort-free pairs)
+  ->  gemm1 (gate/up + swigluaoi, bf16 out)  ->  gemm2 (down, routing-weighted atomic add)
 Inputs are generated exactly like m3-compare/scripts/bench_moe_m4.py (same seed -> same
-weights and routing), so numbers are comparable with the CK-tile a16w4 baseline
-(43.9 us graph replay: sort 5.7 + fill 4.1 + gemm1 19.5 + swiglu 4.3 + gemm2 10.0).
+weights and routing); every captured call has its own input (weights come from HBM like real
+decode). Default tiles are the production ones (``moe_a16w4_decode._gemm1_cfg`` / ``GEMM2_CFG``).
 
-  PYTHONPATH=/flydsl python3 /flydsl/m3_a16w4_moe/bench_m3.py --tile-m 16 --g1-tile-n 64 \
-      --g1-tile-k 128 --k-wave 4
+  PYTHONPATH=/flydsl python3 /flydsl/m3_a16w4_moe/bench_m3.py --tokens 32 --sort decode
 """
 import argparse
 import os
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 p = argparse.ArgumentParser()
 p.add_argument("--tokens", type=int, default=4)
@@ -23,37 +26,23 @@ p.add_argument("--inter", type=int, default=768)
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--seed", type=int, default=0)
-p.add_argument("--tile-m", type=int, default=16)
-p.add_argument("--g1-tile-n", type=int, default=128)
-p.add_argument("--g1-tile-k", type=int, default=256)
-p.add_argument("--k-wave", type=int, default=1)
-p.add_argument("--g1-b-nt", type=int, default=0)
-p.add_argument("--g1-xcd", type=int, default=0)
-p.add_argument("--g1-wpe", type=int, default=0, help="waves_per_eu attr (0 = unset)")
-p.add_argument("--g1-a-direct", type=int, default=0, help="1: A straight global->VGPR (no LDS/barrier)")
-p.add_argument("--g1-pf", type=int, default=1, help="K tiles in flight ahead of compute (a_direct only)")
-p.add_argument("--g1-a4", type=int, default=0, help="gemm1: <=4-row blocks stage A through LDS, one load per lane per 128 K")
-p.add_argument("--g1-ss", type=int, default=0, help="1: share W-scale dwords across tiles of one 256-K group")
-p.add_argument("--g1-impl", choices=["base", "persist", "persist-lookahead", "persist-fused-reduce", "persist-interleave", "agpr", "agpr-ring", "nw"], default="base")
-p.add_argument("--g1-kb", type=int, default=4, help="nw: 128-K tiles per A batch through LDS")
-p.add_argument("--g1-nwave", type=int, default=4, help="nw: waves per workgroup (2 or 4)")
-p.add_argument("--g2-impl", choices=["base", "nw"], default="base")
-p.add_argument("--g2-nb", type=int, default=4, help="gemm2 nw: n-blocks per workgroup")
-p.add_argument("--g1-ctas", type=int, default=512, help="persistent gemm1 CTA count")
-p.add_argument("--g2-tile-n", type=int, default=256)
-p.add_argument("--g2-tile-k", type=int, default=256)
-p.add_argument("--g2-b-nt", type=int, default=0)
-p.add_argument("--g2-xcd", type=int, default=1)
+p.add_argument("--tile-m", type=int, default=16, help="sort block / gemm m-block rows (the kernels are built for 16)")
+p.add_argument("--g1-tile-n", type=int, default=0, help="gemm1 columns per workgroup (32/64/128/256); 0 = production config for this M")
+p.add_argument("--g1-kw", type=int, default=0, help="gemm1 K-waves (1: four N-waves, 2: 2 N x 2 K); 0 = production")
+p.add_argument("--g1-kb", type=int, default=0, help="gemm1 128-K tiles per A batch through LDS; 0 = production")
+p.add_argument("--g1-pf", type=int, default=0, help="gemm1 W tiles in flight; 0 = production")
+p.add_argument("--g1-b-nt", type=int, default=-1, help="gemm1 W load cache modifier; -1 = production")
+p.add_argument("--g1-wpe", type=int, default=-1, help="gemm1 waves_per_eu attr; -1 = production, 0 = unset")
+p.add_argument("--g2-tile-n", type=int, default=0, help="0 = production")
+p.add_argument("--g2-tile-k", type=int, default=0, help="0 = production")
+p.add_argument("--g2-b-nt", type=int, default=-1, help="-1 = production")
 p.add_argument("--g2-wpe", type=int, default=0)
-p.add_argument("--g2-a-direct", type=int, default=0)
-p.add_argument("--g2-pf", type=int, default=1)
-p.add_argument("--g2-ksplit", type=int, default=1, help="gemm2 split-K across CTAs (atomics sum the partials)")
-p.add_argument("--g2-pad-mask", type=int, default=0, help="gemm2: OOB-mask padding rows in the A loads")
-p.add_argument("--g2-ss", type=int, default=0, help="gemm2: share scale dwords across 128-K halves / 16-col halves")
-p.add_argument("--g2-hoist", type=int, default=-1, help="gemm2 prologue hoist: -1 = follow a_direct, 0/1 force")
+p.add_argument("--g2-ksplit", type=int, default=0, help="gemm2 split-K across CTAs; 0 = production (3 up to 64 tokens, else 1)")
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
 p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs", "decode", "decode-wave"],
-               help="aiter: opus moe_sorting (production); mxfp4: aiter#3832 single-CTA sort + zero-init (BM=16)")
+               help="aiter: opus moe_sorting; mxfp4: aiter#3832 single-CTA sort + zero-init; decode: the vLLM "
+                    "sort_decode kernel (production); decode-wave: lab sort_decode_wave.py; pairs: sort-free "
+                    "(n_tokens <= 16, production for M <= 16)")
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--no-check", action="store_true")
@@ -67,30 +56,19 @@ p.add_argument("--stages", type=int, default=3, choices=[1, 2, 3], help="1: sort
 args = p.parse_args()
 
 import torch  # noqa: E402
-import aiter  # noqa: E402
+import aiter  # noqa: E402,F401
 from aiter import dtypes  # noqa: E402
 from aiter.fused_moe import moe_sorting, _adaptive_moe_sort  # noqa: E402
-from m3_a16w4_moe.sort_decode import moe_sort_decode  # noqa: E402
-if args.sort == "decode-wave":
-    from m3_a16w4_moe.sort_decode_wave import moe_sort_decode
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
+from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from m3_a16w4_moe.host import a16w4_gemm1, a16w4_gemm2  # noqa: E402
-if args.g1_impl == "nw":
-    from functools import partial
-    from m3_a16w4_moe.gemm1_nw import a16w4_gemm1_nw
-    a16w4_gemm1 = partial(a16w4_gemm1_nw, k_batch=args.g1_kb, n_waves=args.g1_nwave, k_waves=args.k_wave)
-elif args.g1_impl != "base":
-    from functools import partial
-    from m3_a16w4_moe.host_persist import a16w4_gemm1_persist
-    a16w4_gemm1 = partial(a16w4_gemm1_persist, n_ctas=args.g1_ctas, kernel_variant=args.g1_impl)
-if args.g2_impl == "nw":
-    from functools import partial
-    from m3_a16w4_moe.gemm2_nw import a16w4_gemm2_nw
-    a16w4_gemm2 = partial(a16w4_gemm2_nw, nb=args.g2_nb)
+dec = import_ops("moe_a16w4_decode")
+from moe_a16w4_decode.host import a16w4_gemm1, a16w4_gemm2  # noqa: E402
+from moe_a16w4_decode.sort_decode import moe_sort_decode  # noqa: E402
+if args.sort == "decode-wave":
+    from m3_a16w4_moe.sort_decode_wave import moe_sort_decode  # noqa: F811
 
 torch.manual_seed(args.seed)
 dev = "cuda"
@@ -143,18 +121,21 @@ max_sorted = M * K + E * BM - K
 inter_sorted = torch.empty((max_sorted, I), dtype=torch.bfloat16, device=dev)
 last_sort = None
 
+assert BM == 16, "the vLLM decode kernels are built for 16-row m-blocks"
+cfg1, cfg2 = dec._gemm1_cfg(M), dict(dec.GEMM2_CFG)
+if M > dec.GEMM2_KSPLIT_SMALL_M:
+    cfg2["ksplit"] = 1
 g1_kw = dict(
-    tile_m=BM, tile_n=args.g1_tile_n, tile_k=args.g1_tile_k, k_wave=args.k_wave,
-    b_nt=args.g1_b_nt, xcd_swizzle=args.g1_xcd, waves_per_eu=args.g1_wpe or None,
-    act="swigluoai", alpha=ALPHA, swiglu_limit=LIMIT, w_layout=args.w_layout, a_direct=bool(args.g1_a_direct),
-    prefetch=args.g1_pf, scale_share=bool(args.g1_ss), a_rows4=bool(args.g1_a4),
+    tile_n=args.g1_tile_n or cfg1["tile_n"], k_waves=args.g1_kw or cfg1["k_waves"],
+    k_batch=args.g1_kb or cfg1["k_batch"], prefetch=args.g1_pf or cfg1["prefetch"],
+    b_nt=cfg1["b_nt"] if args.g1_b_nt < 0 else args.g1_b_nt,
+    waves_per_eu=cfg1.get("waves_per_eu") if args.g1_wpe < 0 else (args.g1_wpe or None),
+    alpha=ALPHA, swiglu_limit=LIMIT, w_layout=args.w_layout,
 )
 g2_kw = dict(
-    tile_m=BM, tile_n=args.g2_tile_n, tile_k=args.g2_tile_k,
-    b_nt=args.g2_b_nt, xcd_swizzle=args.g2_xcd, waves_per_eu=args.g2_wpe or None,
-    a_direct=bool(args.g2_a_direct), prefetch=args.g2_pf,
-    ksplit=args.g2_ksplit, pad_mask=bool(args.g2_pad_mask),
-    hoist=None if args.g2_hoist < 0 else bool(args.g2_hoist), scale_share=bool(args.g2_ss),
+    tile_n=args.g2_tile_n or cfg2["tile_n"], tile_k=args.g2_tile_k or cfg2["tile_k"],
+    b_nt=cfg2["b_nt"] if args.g2_b_nt < 0 else args.g2_b_nt, waves_per_eu=args.g2_wpe or None,
+    ksplit=args.g2_ksplit or cfg2["ksplit"],
 )
 
 
@@ -272,10 +253,10 @@ def check_ref(out, ref, label):
     assert torch.isfinite(out).all() and score >= 0.9999, f"{label}: numerical check failed"
 
 
-tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct} pf{args.g1_pf} ss{args.g1_ss} a4{args.g1_a4}"
-       f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} ad{args.g2_a_direct} pf{args.g2_pf} ks{args.g2_ksplit} pm{args.g2_pad_mask} ho{args.g2_hoist} ss{args.g2_ss} | {args.w_layout} sort={args.sort}")
+tag = (f"g1 tn{g1_kw['tile_n']} kw{g1_kw['k_waves']} kb{g1_kw['k_batch']} pf{g1_kw['prefetch']} nt{g1_kw['b_nt']} "
+       f"wpe{g1_kw['waves_per_eu']} | g2 tn{g2_kw['tile_n']} tk{g2_kw['tile_k']} nt{g2_kw['b_nt']} ks{g2_kw['ksplit']} "
+       f"| {args.w_layout} sort={args.sort} stages={args.stages}")
 t0 = time.time()
-tag += f" g1_impl={args.g1_impl} kb={args.g1_kb} g2_impl={args.g2_impl} nb={args.g2_nb} ctas={args.g1_ctas} stages={args.stages}"
 out = run()
 torch.cuda.synchronize()
 print(f"[a16w4-flydsl] first call (JIT) {time.time() - t0:.1f}s  {tag}", flush=True)
