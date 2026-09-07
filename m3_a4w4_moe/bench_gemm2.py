@@ -144,7 +144,6 @@ class Case:
             self.h_s,
             self.sorted_ids.contiguous(),
             self.sorted_eids.contiguous(),
-            self.num_valid.contiguous(),
             M,
             self.num_m_blocks,
             int(u8(self.a_s).numel()),

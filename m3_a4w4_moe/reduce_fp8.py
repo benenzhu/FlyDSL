@@ -32,7 +32,11 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from m3_a16w4_moe.vllm_ops import import_ops
 
 import_ops("moe_a4w4_prefill")
-from moe_a4w4_prefill.gemm2 import _as_f32, _i1  # noqa: E402
+from moe_a4w4_prefill.gemm2 import _as_f32  # noqa: E402
+
+
+def _i1(v: bool):
+    return fx.Boolean(v).ir_value()
 
 _TOKENS_PER_CTA = 4
 
