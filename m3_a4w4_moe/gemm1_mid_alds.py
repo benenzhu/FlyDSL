@@ -49,8 +49,13 @@ _MID_PAIR = int(os.environ.get("M3_MID_PAIR", "0"))
 _ALDS_BAR = int(os.environ.get("M3_ALDS_BAR", "0"))
 
 
+_G1_TN = int(os.environ.get("M3_MID_G1_TN", "0"))   # 0 = the caller's TILE_N
+
+
 def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=256):
-    assert BLOCK_M in (32, 64) and H % 256 == 0 and I % 128 == 0 and TILE_N in (128, 256)
+    if _G1_TN:
+        TILE_N = _G1_TN
+    assert BLOCK_M in (32, 64, 128) and H % 256 == 0 and I % 128 == 0 and TILE_N in (128, 256, 384)
     BM, BN, KT, KB = BLOCK_M, TILE_N, H // 128, k_batch
     assert I % BN == 0 and KT % KB == 0 and KB % 2 == 0
     NI = BN // 4 // 16
@@ -179,6 +184,7 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
             sring = [load_a_scale(0, None)]
             stage_a_batch(abuf, 0)
             abuf = None
+            aa_prev = None
             for kt in range_constexpr(KT):
                 if const_expr(kt % KB == 0 and kt + KB < KT and _ALDS_BAR != 6):
                     abuf = load_a_batch(kt // KB + 1)      # before this iteration's W loads
@@ -198,6 +204,12 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
                                 aa[mi], bb[gu][ni], acc[mi][ni][gu], sa[mi // 2], sb[gu][ni // 2],
                                 kt % 2, mi % 2, ni % 2,
                             )
+                if const_expr(_ALDS_BAR == 7):
+                    if aa_prev is not None:
+                        _asm_void([fx.as_ir_value(v) for v in aa_prev], "", ",".join(["v"] * MR))
+                    aa_prev = aa
+                if const_expr(_ALDS_BAR == 8):
+                    _asm_void([], "s_nop 15\ns_nop 15\ns_nop 15\ns_nop 15", "")
                 if const_expr(kt % KB == KB - 1 and kt + 1 < KT):
                     stage_a_batch(abuf, (kt // KB + 1) % 2)   # this batch's reads are done (MFMAs above)
                     abuf = None

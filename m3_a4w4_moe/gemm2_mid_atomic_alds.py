@@ -31,12 +31,23 @@ _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "2"), 0)
 # XCD's L2 (a BM-row sort then costs one W read per expert up to 2*BM rows). Default 0.
 _MID_PAIR = int(os.environ.get("M3_MID_PAIR", "0"))
 _G2_FAKE_W = int(os.environ.get("M3_MID_G2_FAKE_W", "0"))
+# 1 = run the atomic epilogue in two BM/2-row halves through a half-size LDS region (occupancy:
+# 64 KB -> 32 KB at BM64, so more workgroups per CU overlap their atomics with others' W stream).
+_G2_EPI_HALVES = int(os.environ.get("M3_MID_G2_EPI_HALVES", "0"))
+
+
+_G2_TN = int(os.environ.get("M3_MID_G2_TN", "0"))   # 0 = the caller's TILE_N
+_G2_PF = int(os.environ.get("M3_MID_G2_PF", "0"))   # 0 = the caller's prefetch
 
 
 def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3):
+    if _G2_TN:
+        TILE_N = _G2_TN
+    if _G2_PF:
+        prefetch = _G2_PF
     BM, BN, MR = BLOCK_M, TILE_N, BLOCK_M // 16
     NI, KT = BN // 4 // 16, I // 128
-    assert BM in (32, 64) and BN in (128, 256) and H % BN == 0 and I % 256 == 0
+    assert BM in (32, 64, 128) and BN in (128, 256) and H % BN == 0 and I % 256 == 0
     assert 1 <= prefetch < KT
     ROWB = I // 2                  # bytes of one A row
     RS = ROWB + 16                 # padded LDS row stride
@@ -44,7 +55,8 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
     assert NCH % 256 == 0
     NLD = NCH // 256               # 1 KB loads per wave
     A_LDS = BM * RS
-    EPI_LDS = BM * BN * 4
+    EPI_LDS = (BM // 2 if _G2_EPI_HALVES else BM) * BN * 4
+    assert not _G2_EPI_HALVES or MR % 2 == 0
     LDS_BYTES = max(A_LDS, EPI_LDS)
 
     @fx.struct
@@ -145,14 +157,28 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
                         ))
             s_waitcnt_lgkm0()
             gpu.barrier()  # every wave is done reading A before the epilogue reuses the LDS
-            _atomic_bf16_epilog(
-                fx.Int32(fx.ptrtoint(smem)), acc,
-                fx.Int64(fx.ptrtoint(fx.get_iter(O))),
-                fx.Int64(fx.ptrtoint(fx.get_iter(ids))),
-                fx.Int64(fx.ptrtoint(fx.get_iter(weights))),
-                mbase, nb, wave, lane, ntok, BM, H, BN,
-                pre_packed=ep_ids, pre_weight=ep_weights,
-            )
+            if const_expr(_G2_EPI_HALVES):
+                for hh in range_constexpr(2):
+                    if const_expr(hh == 1):
+                        s_waitcnt_lgkm0()
+                        gpu.barrier()  # the first half's LDS reads are done before the second half writes
+                    _atomic_bf16_epilog(
+                        fx.Int32(fx.ptrtoint(smem)), acc[hh * (MR // 2):(hh + 1) * (MR // 2)],
+                        fx.Int64(fx.ptrtoint(fx.get_iter(O))),
+                        fx.Int64(fx.ptrtoint(fx.get_iter(ids))),
+                        fx.Int64(fx.ptrtoint(fx.get_iter(weights))),
+                        mbase + fx.Int32(hh * (BM // 2)), nb, wave, lane, ntok, BM // 2, H, BN,
+                        pre_packed=ep_ids[hh * (BM // 16):(hh + 1) * (BM // 16)], pre_weight=ep_weights[hh * (BM // 16):(hh + 1) * (BM // 16)],
+                    )
+            else:
+                _atomic_bf16_epilog(
+                    fx.Int32(fx.ptrtoint(smem)), acc,
+                    fx.Int64(fx.ptrtoint(fx.get_iter(O))),
+                    fx.Int64(fx.ptrtoint(fx.get_iter(ids))),
+                    fx.Int64(fx.ptrtoint(fx.get_iter(weights))),
+                    mbase, nb, wave, lane, ntok, BM, H, BN,
+                    pre_packed=ep_ids, pre_weight=ep_weights,
+                )
 
     @flyc.jit
     def launch(

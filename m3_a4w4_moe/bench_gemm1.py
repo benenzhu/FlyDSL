@@ -47,7 +47,7 @@ p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist", "mid", "mid-s
 p.add_argument("--ctas", type=int, default=256, help="persist: number of CTAs (multiple of 8)")
 p.add_argument("--prefetch", type=int, default=3, help="mid: K tiles prefetched in VGPRs")
 p.add_argument("--k-batch", type=int, default=4, help="mid-alds: K tiles per LDS-staged A batch")
-p.add_argument("--g1-tn", type=int, default=256, help="mid-alds: gate(+up) columns per workgroup (128 or 256)")
+p.add_argument("--g1-tn", type=int, default=256, help="mid-alds: gate(+up) columns per workgroup (128, 256 or 384)")
 p.add_argument("--order", choices=["expert", "xcd"], default="expert",
                help="block order: expert = host tile_map, n-slab-major per expert (default); xcd = dense-style WGM groups")
 args = p.parse_args()
