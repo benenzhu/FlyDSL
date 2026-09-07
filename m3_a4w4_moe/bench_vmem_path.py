@@ -17,7 +17,7 @@ from flydsl._mlir.dialects import arith as _arith  # noqa: E402
 from flydsl.expr import range_constexpr  # noqa: E402
 from flydsl.expr import rocdl as _rocdl  # noqa: E402
 from flydsl.expr.typing import T as _T  # noqa: E402
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops  # noqa: E402
+from aiter.ops.flydsl.kernels import buffer_ops  # noqa: E402
 from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
 
 import_ops("moe_a4w4_prefill")
@@ -43,8 +43,8 @@ def compile_vmem(mode: str):
         lane = tid % 64
         wave = tid // 64
         cta = fx.block_idx.x
-        src_rsrc = _buffer_ops.create_buffer_resource(SRC, max_size=True)
-        dst_rsrc = _buffer_ops.create_buffer_resource(DST, max_size=True)
+        src_rsrc = buffer_ops.create_buffer_resource(SRC, max_size=True)
+        dst_rsrc = buffer_ops.create_buffer_resource(DST, max_size=True)
         region = (cta % fx.Int32(N_XCD)) * fx.Int32(REGION)
         lane_off = [region + fx.Int32((s * 4) * 1024) + wave * fx.Int32(1024) + lane * fx.Int32(16) for s in range(N_LD)]
         v4 = _ir.VectorType.get([4], _T.i32)
@@ -63,7 +63,7 @@ def compile_vmem(mode: str):
                 _rocdl.s_waitcnt(vmcnt=N_LD, lgkmcnt=0)
             elif mode == "vgpr":
                 vals = [
-                    _buffer_ops.buffer_load(
+                    buffer_ops.buffer_load(
                         src_rsrc, lane_off[s] // fx.Int32(4), vec_width=4, dtype=fx.Int32, soffset_bytes=fx.as_ir_value(koff)
                     )
                     for s in range(N_LD)
@@ -72,16 +72,16 @@ def compile_vmem(mode: str):
                     acc = _arith.XOrIOp(acc, v).result
             elif mode == "store":
                 for s in range_constexpr(N_LD):
-                    _buffer_ops.buffer_store(one4, dst_rsrc, lane_off[s], offset_is_bytes=True, soffset_bytes=fx.as_ir_value(koff))
+                    buffer_ops.buffer_store(one4, dst_rsrc, lane_off[s], offset_is_bytes=True, soffset_bytes=fx.as_ir_value(koff))
             else:
                 g2s.load(dst0, koff)
                 for s in range_constexpr(N_ST_MIX):
-                    _buffer_ops.buffer_store(one4, dst_rsrc, lane_off[s], offset_is_bytes=True, soffset_bytes=fx.as_ir_value(koff))
+                    buffer_ops.buffer_store(one4, dst_rsrc, lane_off[s], offset_is_bytes=True, soffset_bytes=fx.as_ir_value(koff))
                 _rocdl.s_waitcnt(vmcnt=N_LD + N_ST_MIX, lgkmcnt=0)
             st = yield [acc]
         _rocdl.s_waitcnt(vmcnt=0, lgkmcnt=0)
         if mode == "vgpr":
-            _buffer_ops.buffer_store(st[0], dst_rsrc, cta * fx.Int32(4096) + tid * fx.Int32(16), offset_is_bytes=True)
+            buffer_ops.buffer_store(st[0], dst_rsrc, cta * fx.Int32(4096) + tid * fx.Int32(16), offset_is_bytes=True)
 
     @flyc.jit
     def launch(SRC: fx.Tensor, DST: fx.Tensor, n_iter: fx.Int32, n_cta: fx.Int32, stream: fx.Stream):

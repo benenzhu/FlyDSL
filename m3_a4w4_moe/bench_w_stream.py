@@ -32,7 +32,7 @@ from flydsl._mlir import ir as _ir  # noqa: E402
 from flydsl._mlir.dialects import arith as _arith  # noqa: E402
 from flydsl.expr.typing import T as _T  # noqa: E402
 from aiter.fused_moe import moe_sorting  # noqa: E402
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops  # noqa: E402
+from aiter.ops.flydsl.kernels import buffer_ops  # noqa: E402
 from m3_a16w4_moe.vllm_ops import import_ops  # noqa: E402
 
 import_ops("moe_a4w4_prefill")
@@ -114,16 +114,16 @@ def compile_stream():
         base_ptr = lds.buf.ptr
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
-        ids_rsrc = _buffer_ops.create_buffer_resource(sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BM * 4))
-        eid_rsrc = _buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4)
+        ids_rsrc = buffer_ops.create_buffer_resource(sorted_ids, max_size=False, num_records_bytes=num_m_blocks * (BM * 4))
+        eid_rsrc = buffer_ops.create_buffer_resource(sorted_expert_ids, max_size=False, num_records_bytes=num_m_blocks * 4)
         intra_xcd, xcd = _divmod_nonneg(fx.block_idx.x, 8)
         remapped = xcd * (grid_size // 8) + intra_xcd
-        tm_rsrc = _buffer_ops.create_buffer_resource(tile_map_t, max_size=False, num_records_bytes=grid_size * 4)
-        entry = fx.Int32(_buffer_ops.buffer_load(tm_rsrc, remapped, vec_width=1, dtype=fx.Int32))
+        tm_rsrc = buffer_ops.create_buffer_resource(tile_map_t, max_size=False, num_records_bytes=grid_size * 4)
+        entry = fx.Int32(buffer_ops.buffer_load(tm_rsrc, remapped, vec_width=1, dtype=fx.Int32))
         tile_i = entry >> 3
         tile_j = entry & 7
         block_valid = entry >= 0
-        expert = fx.Int32(_buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32))
+        expert = fx.Int32(buffer_ops.buffer_load(eid_rsrc, tile_i, vec_width=1, dtype=fx.Int32))
         m_base = tile_i * BM
         if block_valid:
             # ---- B offsets: gemm1's _b_offsets (aiter layout) or K-major ----
@@ -145,7 +145,7 @@ def compile_stream():
                 # K-major slab: [expert][n_tile][k][256 rows x 128 B]; up half = rows 128..255
                 B0 = expert * (2 * I * K_BYTES) + tile_j * (256 * K_BYTES)
                 B1 = B0 + 128 * 128
-            b_rsrc = _buffer_ops.create_buffer_resource(W13, max_size=False, num_records_bytes=E * (2 * I) * K_BYTES)
+            b_rsrc = buffer_ops.create_buffer_resource(W13, max_size=False, num_records_bytes=E * (2 * I) * K_BYTES)
             b_g2s = G2SLoaderAsm(b_rsrc, offs_b, N_TILES_B, wave_id, cpol=args.cpol)
             b_g2s.set_wave_base(base_ptr)
             b_dst0 = _Buf(base_ptr, 0)
@@ -156,12 +156,12 @@ def compile_stream():
                     for rnd in range_constexpr(N_TILES_A):
                         row = lane_id // 8 + wave_id * 8 + rnd * (_N_WAVES * 8)
                         col = (lane_id % 8) * 16
-                        sid = fx.Int32(_buffer_ops.buffer_load(ids_rsrc, m_base + half * LDS_BLOCK_M + row, vec_width=1, dtype=fx.Int32))
+                        sid = fx.Int32(buffer_ops.buffer_load(ids_rsrc, m_base + half * LDS_BLOCK_M + row, vec_width=1, dtype=fx.Int32))
                         tok = sid & fx.Int32(0x00FFFFFF)
                         offs.append(tok * fx.Int32(K_BYTES) + col)
                     return offs
 
-                a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
+                a_rsrc = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
                 a0_g2s = G2SLoaderAsm(a_rsrc, _a_offs(0), N_TILES_A, wave_id, cpol=args.cpol)
                 a1_g2s = G2SLoaderAsm(a_rsrc, _a_offs(1), N_TILES_A, wave_id, cpol=args.cpol)
                 a0_g2s.set_wave_base(base_ptr)
@@ -197,7 +197,7 @@ def compile_stream():
                 zero4 = _arith.ConstantOp(v4, _ir.DenseElementsAttr.get_splat(v4, _ir.IntegerAttr.get(_T.i32, 0))).result
                 if const_expr(args.with_a):
                     a_offs_all = _a_offs(0) + _a_offs(1)
-                    a_rsrc_v = _buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
+                    a_rsrc_v = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
                 b_offs_all = [fx.Int32(B0) + o for o in offs_b] + [fx.Int32(B1) + o for o in offs_b]
 
                 def _batch_v(k):
@@ -206,11 +206,11 @@ def compile_stream():
                     vals = []
                     if const_expr(args.with_a):
                         vals += [
-                            _buffer_ops.buffer_load(a_rsrc_v, o // fx.Int32(4), vec_width=4, dtype=fx.Int32, soffset_bytes=ka)
+                            buffer_ops.buffer_load(a_rsrc_v, o // fx.Int32(4), vec_width=4, dtype=fx.Int32, soffset_bytes=ka)
                             for o in a_offs_all
                         ]
                     vals += [
-                        _buffer_ops.buffer_load(b_rsrc, o // fx.Int32(4), vec_width=4, dtype=fx.Int32, soffset_bytes=kb)
+                        buffer_ops.buffer_load(b_rsrc, o // fx.Int32(4), vec_width=4, dtype=fx.Int32, soffset_bytes=kb)
                         for o in b_offs_all
                     ]
                     return [fx.as_ir_value(v) for v in vals]
@@ -235,10 +235,10 @@ def compile_stream():
                 acc = st[0]
                 for v in st[1:]:
                     acc = _arith.XOrIOp(acc, v).result
-                out_rsrc = _buffer_ops.create_buffer_resource(tile_map_t, max_size=False, num_records_bytes=grid_size * 4)
+                out_rsrc = buffer_ops.create_buffer_resource(tile_map_t, max_size=False, num_records_bytes=grid_size * 4)
                 # keep the loads alive: a store nobody reads, only from lane 0 of a block that never exists
                 if fx.block_idx.x == fx.Int32(-1):
-                    _buffer_ops.buffer_store(acc, out_rsrc, fx.Int32(0), offset_is_bytes=True)
+                    buffer_ops.buffer_store(acc, out_rsrc, fx.Int32(0), offset_is_bytes=True)
 
     @flyc.jit
     def launch(

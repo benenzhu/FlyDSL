@@ -21,7 +21,7 @@ from flydsl._mlir import ir as _ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
-from aiter.ops.flydsl.kernels import buffer_ops as bop
+from aiter.ops.flydsl.kernels import buffer_ops
 from .lab_utils import _atomic_bf16_epilog, s_waitcnt_lgkm0
 
 _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "2"), 0)
@@ -74,8 +74,8 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
         lane = tx % fx.Int32(64)
         wave = fx.Int32(rocdl.readfirstlane(T.i32, fx.as_ir_value(tx // fx.Int32(64))))
         l16, q16 = lane % fx.Int32(16), lane // fx.Int32(16)
-        nr = bop.create_buffer_resource(nvalid, max_size=False, num_records_bytes=4)
-        valid_rows = fx.Int32(bop.buffer_load(nr, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True))
+        nr = buffer_ops.create_buffer_resource(nvalid, max_size=False, num_records_bytes=4)
+        valid_rows = fx.Int32(buffer_ops.buffer_load(nr, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True))
         if const_expr(_MID_PAIR):
             g, r = pid // fx.Int32(16), pid % fx.Int32(16)
             item = g * fx.Int32(8) + r % fx.Int32(8)
@@ -83,16 +83,16 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
         else:
             mb, nb = pid // fx.Int32(H // BN), pid % fx.Int32(H // BN)
         if mb * fx.Int32(BM) < valid_rows:
-            er = bop.create_buffer_resource(eids, max_size=False, num_records_bytes=nblocks * 4)
-            expert = fx.Int32(bop.buffer_load(er, mb, vec_width=1, dtype=fx.Int32, is_scalar=True))
+            er = buffer_ops.create_buffer_resource(eids, max_size=False, num_records_bytes=nblocks * 4)
+            expert = fx.Int32(buffer_ops.buffer_load(er, mb, vec_width=1, dtype=fx.Int32, is_scalar=True))
             if const_expr(_G2_FAKE_W):
                 expert = fx.Int32(0)
-            ir = bop.create_buffer_resource(ids, max_size=False, num_records_bytes=nblocks * BM * 4)
-            rr = bop.create_buffer_resource(weights, max_size=False, num_records_bytes=nblocks * BM * 4)
-            ar = bop.create_buffer_resource(A, max_size=False, num_records_bytes=nblocks * BM * (I // 2))
-            wr = bop.create_buffer_resource(W, max_size=False, num_records_bytes=E * H * I // 2)
-            asr = bop.create_buffer_resource(AS, max_size=False, num_records_bytes=nblocks * BM * (I // 32))
-            wsr = bop.create_buffer_resource(WS, max_size=False, num_records_bytes=E * H * I // 32)
+            ir = buffer_ops.create_buffer_resource(ids, max_size=False, num_records_bytes=nblocks * BM * 4)
+            rr = buffer_ops.create_buffer_resource(weights, max_size=False, num_records_bytes=nblocks * BM * 4)
+            ar = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=nblocks * BM * (I // 2))
+            wr = buffer_ops.create_buffer_resource(W, max_size=False, num_records_bytes=E * H * I // 2)
+            asr = buffer_ops.create_buffer_resource(AS, max_size=False, num_records_bytes=nblocks * BM * (I // 32))
+            wsr = buffer_ops.create_buffer_resource(WS, max_size=False, num_records_bytes=E * H * I // 32)
             mbase = mb * fx.Int32(BM)
             nbase = nb * fx.Int32(BN) + wave * fx.Int32(NI * 16)
             lds = llvm.inttoptr(_ir.Type.parse("!llvm.ptr<3>"), fx.as_ir_value(fx.Int32(fx.ptrtoint(smem))))
@@ -102,21 +102,21 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
             a_lbyte = []
             for j in range_constexpr(NLD):
                 c = (wave * fx.Int32(NLD) + fx.Int32(j)) * fx.Int32(64) + lane
-                abuf.append(bop.buffer_load(ar, (mbase * fx.Int32(ROWB)) // fx.Int32(4) + c * fx.Int32(4), vec_width=4, dtype=fx.Int32))
+                abuf.append(buffer_ops.buffer_load(ar, (mbase * fx.Int32(ROWB)) // fx.Int32(4) + c * fx.Int32(4), vec_width=4, dtype=fx.Int32))
                 a_lbyte.append((c // fx.Int32(ROWB // 16)) * fx.Int32(RS) + (c % fx.Int32(ROWB // 16)) * fx.Int32(16))
             m_lane = tx // fx.Int32(32)
-            ep_ids = [fx.Int32(bop.buffer_load(ir, mbase + fx.Int32(mr * 8) + m_lane, vec_width=1, dtype=fx.Int32)) for mr in range_constexpr(BM // 8)]
-            ep_weights = [fx.Float32(bop.buffer_load(rr, mbase + fx.Int32(mr * 8) + m_lane, vec_width=1, dtype=fx.Float32)) for mr in range_constexpr(BM // 8)]
+            ep_ids = [fx.Int32(buffer_ops.buffer_load(ir, mbase + fx.Int32(mr * 8) + m_lane, vec_width=1, dtype=fx.Int32)) for mr in range_constexpr(BM // 8)]
+            ep_weights = [fx.Float32(buffer_ops.buffer_load(rr, mbase + fx.Int32(mr * 8) + m_lane, vec_width=1, dtype=fx.Float32)) for mr in range_constexpr(BM // 8)]
 
             def load_tile(kt, prev):
                 bb = []
                 for ni in range_constexpr(NI):
                     nblk = expert * fx.Int32(H // 16) + nbase // fx.Int32(16) + fx.Int32(ni)
                     off = nblk * fx.Int32(I * 8) + fx.Int32(kt * 1024) + q16 * fx.Int32(256) + l16 * fx.Int32(16)
-                    bb.append(bop.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32, cache_modifier=_MID_W_CPOL))
+                    bb.append(buffer_ops.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32, cache_modifier=_MID_W_CPOL))
                 if const_expr(kt % 2 == 0):
-                    sa = [bop.buffer_load(asr, (mbase // fx.Int32(32) + fx.Int32(mp)) * fx.Int32(I // 256 * 64) + fx.Int32(kt // 2 * 64) + q16 * fx.Int32(16) + l16, vec_width=1, dtype=fx.Int32) for mp in range_constexpr(MR // 2)]
-                    sb = [bop.buffer_load(wsr, (expert * fx.Int32(H // 32) + nbase // fx.Int32(32) + fx.Int32(np)) * fx.Int32(I // 256 * 64) + fx.Int32(kt // 2 * 64) + q16 * fx.Int32(16) + l16, vec_width=1, dtype=fx.Int32) for np in range_constexpr(NI // 2)]
+                    sa = [buffer_ops.buffer_load(asr, (mbase // fx.Int32(32) + fx.Int32(mp)) * fx.Int32(I // 256 * 64) + fx.Int32(kt // 2 * 64) + q16 * fx.Int32(16) + l16, vec_width=1, dtype=fx.Int32) for mp in range_constexpr(MR // 2)]
+                    sb = [buffer_ops.buffer_load(wsr, (expert * fx.Int32(H // 32) + nbase // fx.Int32(32) + fx.Int32(np)) * fx.Int32(I // 256 * 64) + fx.Int32(kt // 2 * 64) + q16 * fx.Int32(16) + l16, vec_width=1, dtype=fx.Int32) for np in range_constexpr(NI // 2)]
                 else:
                     sa, sb = prev[1], prev[2]
                 return bb, sa, sb
@@ -126,7 +126,7 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
             def read_a_tile(kt):
                 out = []
                 for mi in range_constexpr(MR):
-                    ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(rd_base[mi] + fx.Int32(kt * 64)), elem_type=T.i8)
+                    ptr = buffer_ops.get_element_ptr(lds, byte_offset=fx.as_ir_value(rd_base[mi] + fx.Int32(kt * 64)), elem_type=T.i8)
                     out.append(fx.Vector(llvm.load(T.vec(4, T.i32), ptr, alignment=16)))
                 return out
 
@@ -136,7 +136,7 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
                 ring.append(load_tile(kt, ring[-1] if ring else None))
             # stage the A tile (its loads were issued before the W ring: waiting for them leaves W in flight)
             for j in range_constexpr(NLD):
-                ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(a_lbyte[j]), elem_type=T.i8)
+                ptr = buffer_ops.get_element_ptr(lds, byte_offset=fx.as_ir_value(a_lbyte[j]), elem_type=T.i8)
                 llvm.StoreOp(fx.as_ir_value(abuf[j]), ptr, alignment=16)
             s_waitcnt_lgkm0()
             gpu.barrier()

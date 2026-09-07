@@ -27,7 +27,7 @@ from flydsl._mlir.dialects import vector as _vector
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T as _T
 from flydsl.expr.typing import Vector as Vec
-from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops
+from aiter.ops.flydsl.kernels import buffer_ops
 
 from m3_a16w4_moe.vllm_ops import import_ops
 
@@ -74,21 +74,21 @@ def compile_moe_reduce_fp8(*, H: int, topk: int):
         lane = fx.thread_idx.x % 64
         wave = fx.thread_idx.x // 64
         tok = fx.block_idx.x * _TOKENS_PER_CTA + wave
-        out_rsrc = _buffer_ops.create_buffer_resource(OUT, max_size=False, num_records_bytes=n_tokens * (topk * H))
-        sc_rsrc = _buffer_ops.create_buffer_resource(OUT_sc, max_size=False, num_records_bytes=n_tokens * (topk * SC_COLS))
-        w_rsrc = _buffer_ops.create_buffer_resource(W, max_size=False, num_records_bytes=n_tokens * (topk * 4))
-        y_rsrc = _buffer_ops.create_buffer_resource(Y, max_size=False, num_records_bytes=n_tokens * (H * 2))
+        out_rsrc = buffer_ops.create_buffer_resource(OUT, max_size=False, num_records_bytes=n_tokens * (topk * H))
+        sc_rsrc = buffer_ops.create_buffer_resource(OUT_sc, max_size=False, num_records_bytes=n_tokens * (topk * SC_COLS))
+        w_rsrc = buffer_ops.create_buffer_resource(W, max_size=False, num_records_bytes=n_tokens * (topk * 4))
+        y_rsrc = buffer_ops.create_buffer_resource(Y, max_size=False, num_records_bytes=n_tokens * (H * 2))
         if tok < n_tokens:
             acc = [[fx.Float32(0.0) for _ in range(16)] for _ in range(CHUNKS)]
             for k in range_constexpr(topk):
                 row = tok * topk + k
-                w = fx.Float32(_buffer_ops.buffer_load(w_rsrc, row, vec_width=1, dtype=fx.Float32))
+                w = fx.Float32(buffer_ops.buffer_load(w_rsrc, row, vec_width=1, dtype=fx.Float32))
                 row_dw = row * (H // 4)
                 for i in range_constexpr(CHUNKS):
                     data = Vec(
-                        _buffer_ops.buffer_load(out_rsrc, row_dw + i * 256 + lane * 4, vec_width=4, dtype=fx.Int32)
+                        buffer_ops.buffer_load(out_rsrc, row_dw + i * 256 + lane * 4, vec_width=4, dtype=fx.Int32)
                     )
-                    e8 = fx.Int32(_buffer_ops.buffer_load(sc_rsrc, row * SC_COLS + i * 32 + lane // 2, vec_width=1, dtype=fx.Int8))
+                    e8 = fx.Int32(buffer_ops.buffer_load(sc_rsrc, row * SC_COLS + i * 32 + lane // 2, vec_width=1, dtype=fx.Int8))
                     e8 = e8 & fx.Int32(0xFF)
                     sw = _as_f32(e8 << 23) * w
                     for d in range_constexpr(4):
@@ -102,8 +102,8 @@ def compile_moe_reduce_fp8(*, H: int, topk: int):
             for i in range_constexpr(CHUNKS):
                 packed = [_pack_bf16x2(acc[i][2 * j], acc[i][2 * j + 1]) for j in range(8)]
                 base = y_dw + i * 512 + lane * 8
-                _buffer_ops.buffer_store(_v4i32(packed[0:4]), y_rsrc, base)
-                _buffer_ops.buffer_store(_v4i32(packed[4:8]), y_rsrc, base + 4)
+                buffer_ops.buffer_store(_v4i32(packed[0:4]), y_rsrc, base)
+                buffer_ops.buffer_store(_v4i32(packed[4:8]), y_rsrc, base + 4)
 
     @flyc.jit
     def launch_reduce(OUT: fx.Tensor, OUT_sc: fx.Tensor, W: fx.Tensor, Y: fx.Tensor, n_tokens: fx.Int32, stream: fx.Stream):
