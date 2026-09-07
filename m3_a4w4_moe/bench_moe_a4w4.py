@@ -224,7 +224,6 @@ class Case:
             self.h_s,
             b.sorted_ids,
             b.sorted_expert_ids,
-            b.num_valid_ids,
             M,
             self.num_m_blocks,
             int(u8(self.a_s).numel()),

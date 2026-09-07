@@ -186,7 +186,6 @@ a1 = (
     h_s,
     bufs.sorted_ids,
     bufs.sorted_expert_ids,
-    bufs.num_valid_ids,
     M,
     num_m_blocks,
     int(u8(a_s).numel()),
