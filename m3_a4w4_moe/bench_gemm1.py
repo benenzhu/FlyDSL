@@ -38,11 +38,12 @@ p.add_argument("--fake-dense", choices=["rows", "gather"], default=None,
                     "rows (pure kernel overhead vs the dense kernel); 'gather' = expert 0 everywhere but the real "
                     "gathered rows (isolates the A gather from expert switching); disables the check")
 p.add_argument("--wgm", type=int, default=4, help="m-tiles per XCD group in the block remap")
-p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist"], default="2x2",
+p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist", "mid"], default="2x2",
                help="2x2 = gemm1.py (4-wave 2x2 quadrants); 1x4 = gemm1_1x4.py (Kimi v36 port, BM128 only); "
                     "persist = gemm1_persist.py (2x2, one CTA per CU, cross-block pipelined); "
                     "s3 = gemm1_s3.py (2x2, 3-stage LDS ring, DMA three K-steps ahead, BM128)")
 p.add_argument("--ctas", type=int, default=256, help="persist: number of CTAs (multiple of 8)")
+p.add_argument("--prefetch", type=int, default=3, help="mid: K tiles prefetched in VGPRs")
 p.add_argument("--order", choices=["expert", "xcd"], default="expert",
                help="block order: expert = host tile_map, n-slab-major per expert (default); xcd = dense-style WGM groups")
 args = p.parse_args()
@@ -52,6 +53,7 @@ from m3_a4w4_moe.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1  # n
 from m3_a4w4_moe.gemm1_1x4 import compile_moe_gemm1_1x4, ptr_arg  # noqa: E402
 from m3_a4w4_moe.gemm1_persist import compile_moe_gemm1_persist  # noqa: E402
 from m3_a4w4_moe.gemm1_s3 import compile_moe_gemm1_s3  # noqa: E402
+from m3_a4w4_moe.gemm1_mid import compile_moe_gemm1_mid  # noqa: E402
 
 import aiter  # noqa: E402,F401
 from aiter import dtypes  # noqa: E402
@@ -216,7 +218,9 @@ if args.kernel == "1x4":
     def call(case):
         launch_1x4(*case.args_1x4())
 else:
-    if args.kernel == "persist":
+    if args.kernel == "mid":
+        launch = compile_moe_gemm1_mid(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch)
+    elif args.kernel == "persist":
         assert args.order == "expert"
         launch = compile_moe_gemm1_persist(H=H, I=I, E=E, BLOCK_M=BM, n_cta=args.ctas)
     elif args.kernel == "s3":
@@ -239,6 +243,11 @@ _nv = int(c0.num_valid[0].item())
 _dq = (c0.out_q != _q1)[:_nv]
 _ds = c0.out_s != _s1
 print(f"[gemm1] determinism: run 2 vs run 1 fp4 bytes differing {int(_dq.sum())} (rows {int(_dq.any(dim=1).sum())} of {_nv}), scale bytes differing {int(_ds.sum())}", flush=True)
+assert not _dq.any() and not _ds.any(), "gemm1 run 2 is not bitwise deterministic"
+call(c0)
+torch.cuda.synchronize()
+assert torch.equal(c0.out_q[:_nv], _q1[:_nv]) and torch.equal(c0.out_s, _s1), "gemm1 run 3 is not bitwise deterministic"
+print("[gemm1] eager same input x3: bitwise identical", flush=True)
 
 # ---- correctness on sampled valid rows ----
 if args.check_rows > 0 and not args.fake_dense:
@@ -253,6 +262,7 @@ if args.check_rows > 0 and not args.fake_dense:
     real = tok < M
     same_s = torch.equal(a_s_unsh[:nv][real], xs_ref[tok[real]])
     print(f"[gemm1] prologue check: a_q == per_1x32 quant {same_q}; sorted+shuffled a_s == e8m0_shuffle(gathered) {same_s}")
+    assert same_q and same_s, "input quant/sort mismatch"
 
     out_s_unsh = e8m0_unshuffle(c0.out_s, c0.num_m_blocks * BM, I // 32)
     rows_all = torch.nonzero(real).flatten()
@@ -286,13 +296,13 @@ if args.check_rows > 0 and not args.fake_dense:
         qv = grid[idx]
         # even neighbour on ties: grid indices with even "mantissa" are 0,1(0.5? no) -> handle by
         # picking the lower value when the lower grid index is even
-        lo = torch.clamp(idx - 1, min=0)
-        qv = torch.where(tie & (lo % 2 == 0), grid[lo], qv)
+        qv = grid[idx + (tie & (idx % 2 == 1)).long()]
         return torch.copysign(qv, q) * scale.unsqueeze(1), e8.to(torch.uint8)
 
     n_bad_q, n_bad_s, n_tot = 0, 0, 0
     worst = 0.0
     cos_all = []
+    cos_quant = []
     for r in sel.tolist():
         t = int(tok[r])
         e = int(c0.sorted_eids[r // BM])
@@ -313,12 +323,16 @@ if args.check_rows > 0 and not args.fake_dense:
         n_tot += I
         worst = max(worst, float((h_k - h_ref).abs().max() / (h_ref.abs().max() + 1e-6)))
         cos_all.append(float((h_k @ h_ref) / (h_k.norm() * h_ref.norm() + 1e-12)))
+        qr = q_ref.reshape(-1)
+        cos_quant.append(float((h_k @ qr) / (h_k.norm() * qr.norm() + 1e-12)))
     print(
         f"[gemm1] check {len(sel)} rows: scale bytes mismatched {n_bad_s}/{n_tot // 32}, "
         f"fp4 values mismatched {n_bad_q}/{n_tot} ({n_bad_q / n_tot:.2%}); cos vs float ref "
         f"min {min(cos_all):.5f} mean {statistics.mean(cos_all):.5f}; worst |err|/max {worst:.3f}",
         flush=True,
     )
+    print(f"[gemm1] cos vs explicitly quantized reference min {min(cos_quant):.8f}", flush=True)
+    assert min(cos_quant) >= 0.9999 and n_bad_s <= max(1, n_tot // 3200), "gemm1 quantized reference mismatch"
 
 # ---- timing: graph of `copies` calls, each its own input ----
 for c in cases:
@@ -331,6 +345,14 @@ with torch.cuda.graph(g):
 torch.cuda.synchronize()
 g.replay()
 torch.cuda.synchronize()
+_graph_q = [c.out_q.clone() for c in cases]
+_graph_s = [c.out_s.clone() for c in cases]
+for _ in range(2):
+    g.replay()
+    torch.cuda.synchronize()
+    for c, q, sc in zip(cases, _graph_q, _graph_s):
+        assert torch.equal(c.out_q, q) and torch.equal(c.out_s, sc), "graph gemm1 is not bitwise deterministic"
+print(f"[gemm1] graph same inputs x3: bitwise identical ({len(cases)} input sets)", flush=True)
 meds = []
 for _ in range(args.rounds):
     st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)

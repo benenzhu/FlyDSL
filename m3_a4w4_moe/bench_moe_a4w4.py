@@ -30,11 +30,13 @@ p.add_argument("--inter", type=int, default=768)
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--n-split", type=int, default=2)
-p.add_argument("--bm", type=int, choices=[0, 128, 256], default=0,
+p.add_argument("--bm", type=int, choices=[0, 32, 64, 128, 256], default=0,
                help="sort block size = gemm1 tile rows (256 = half the W13 bytes per FLOP, 2x the padding; gemm2 stays "
                     "128-row tiles and skips all-padding tiles). 0 = auto: 256 from 16384 tokens up (chain 16384: 1059 vs "
                     "1090 us, 32768: 1929 vs 2020; 8192: 637 vs 614, 4096: 428 vs 402 -> 128 there)")
 p.add_argument("--sort-ctas", type=int, default=32)
+p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
+p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations for rocprofv3, after setup")
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
@@ -60,6 +62,10 @@ from m3_a4w4_moe.gemm2 import compile_moe_gemm2, gemm2_grid  # noqa: E402
 from m3_a4w4_moe.reduce_fp8 import compile_moe_reduce_fp8  # noqa: E402
 from m3_a4w4_moe.sort import SortBuffers, compile_moe_sort  # noqa: E402
 from m3_a4w4_moe.tile_map import compile_tile_map, tile_map_grid  # noqa: E402
+from m3_a4w4_moe.gemm1_mid import compile_moe_gemm1_mid  # noqa: E402
+from m3_a4w4_moe.gemm2_mid import compile_moe_gemm2_mid  # noqa: E402
+from m3_a4w4_moe.gemm2_mid_fp8 import compile_moe_gemm2_mid as compile_moe_gemm2_mid_fp8  # noqa: E402
+from m3_a16w4_moe.sort_decode_wave import compile_decode_sort, _ptr, _max_tokens_bucket  # noqa: E402
 
 import aiter  # noqa: E402,F401
 from aiter import ActivationType, QuantType, dtypes  # noqa: E402
@@ -77,7 +83,7 @@ from aiter.utility import fp4_utils  # noqa: E402
 torch.manual_seed(args.seed)
 dev = "cuda"
 M, H, I, E, K = args.tokens, args.hidden, args.inter, args.experts, args.topk
-BM = args.bm if args.bm else (256 if args.tokens >= 16384 else 128)
+BM = args.bm if args.bm else (32 if args.chain == "mid" else (256 if args.tokens >= 16384 else 128))
 fp4 = torch.float4_e2m1fn_x2
 
 
@@ -132,11 +138,17 @@ def build_tile_map(sorted_eids, num_valid, num_m_blocks):
     return tm.to(torch.int32).contiguous(), grid
 
 
-launch_sort = compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.sort_ctas)
-launch_tm = compile_tile_map(I=I, BM=BM)
+launch_sort = (compile_decode_sort(E=E, topk=K, block_m=BM, H=H, max_tokens=_max_tokens_bucket(M))
+               if args.chain == "mid" else compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.sort_ctas))
+launch_tm = None if args.chain == "mid" else compile_tile_map(I=I, BM=BM)
 fn_tm = None
-launch1 = compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM)
-launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out, sort_block_m=BM)
+launch1 = (compile_moe_gemm1_mid(H=H, I=I, E=E, BLOCK_M=BM) if args.chain == "mid"
+           else compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM))
+if args.chain == "mid":
+    g2_builder = compile_moe_gemm2_mid_fp8 if args.out == "fp8" else compile_moe_gemm2_mid
+    launch2 = g2_builder(H=H, I=I, E=E, topk=K, BLOCK_M=BM)
+else:
+    launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out, sort_block_m=BM)
 launch_r = compile_moe_reduce_fp8(H=H, topk=K) if args.out == "fp8" else None
 fn1 = fn2 = fnr = None
 
@@ -148,7 +160,7 @@ class Case:
         self.bufs = SortBuffers.allocate(M, E, K, BM, args.sort_ctas, dev)
         self.num_m_blocks = self.bufs.max_sorted // BM
         rows = self.num_m_blocks * BM
-        self.num_m_blocks2 = rows // 128  # gemm2 tiles are always 128 rows
+        self.num_m_blocks2 = self.num_m_blocks if args.chain == "mid" else rows // 128
         self.h_q = torch.zeros((rows, I // 2), dtype=torch.uint8, device=dev)
         self.h_s = torch.zeros((rows * (I // 32),), dtype=torch.uint8, device=dev)
         self.out = torch.zeros((M * K, H), dtype=torch.uint8 if args.out == "fp8" else torch.bfloat16, device=dev)
@@ -160,21 +172,27 @@ class Case:
             self.norm_w = torch.zeros((H,), dtype=torch.bfloat16, device=dev)  # Gemma: scale = 1 + w
         self.grid2 = gemm2_grid(self.num_m_blocks2, args.n_split)
         self.grid1 = tile_map_grid(self.num_m_blocks, I)
-        self.tile_map = torch.empty((self.grid1 + 1,), dtype=torch.int32, device=dev)
+        self.tile_map = torch.zeros((self.grid1 + 1,), dtype=torch.int32, device=dev)
         # run once eagerly (compiles on first use)
         self.stage_sort()
         self.stage_quant()
         self.stage_tile_map(compile_first=True)
         torch.cuda.synchronize()
-        tm_ref, grid_ref = build_tile_map(self.bufs.sorted_expert_ids, self.bufs.num_valid_ids, self.num_m_blocks)
-        assert grid_ref == self.grid1 and bool((tm_ref == self.tile_map).all()), "tile_map kernel != torch build"
+        if args.chain != "mid":
+            tm_ref, grid_ref = build_tile_map(self.bufs.sorted_expert_ids, self.bufs.num_valid_ids, self.num_m_blocks)
+            assert grid_ref == self.grid1 and bool((tm_ref == self.tile_map).all()), "tile_map kernel != torch build"
         self.stage_gemm1(compile_first=True)
         self.stage_gemm2(compile_first=True)
         self.stage_reduce(compile_first=True)
 
     # ---- stages ----
     def stage_sort(self):
-        launch_sort(*self.bufs.launch_args(self.topk_ids, self.topk_w, M))
+        if args.chain == "mid":
+            b = self.bufs
+            launch_sort(_ptr(self.topk_ids), _ptr(self.topk_w), _ptr(b.sorted_ids), _ptr(b.sorted_weights),
+                        _ptr(b.sorted_expert_ids), _ptr(b.num_valid_ids), _ptr(self.y), M, torch.cuda.current_stream())
+        else:
+            launch_sort(*self.bufs.launch_args(self.topk_ids, self.topk_w, M))
 
     def stage_quant(self):
         b = self.bufs
@@ -208,6 +226,8 @@ class Case:
 
     def stage_tile_map(self, compile_first=False):
         global fn_tm
+        if args.chain == "mid":
+            return
         if compile_first and fn_tm is None:
             fn_tm = flyc.compile(launch_tm, *self.args_tm())
         fn_tm(*self.args_tm())
@@ -305,6 +325,11 @@ print(
     f"{time.time() - t0:.1f}s",
     flush=True,
 )
+if args.loop:
+    for i in range(args.loop):
+        cases[i % len(cases)].mine()
+    torch.cuda.synchronize()
+    raise SystemExit(0)
 
 # ---- correctness ----
 y_mine = c0.mine().clone()
@@ -318,6 +343,7 @@ for rep in range(2):
     torch.cuda.synchronize()
     d = (y2.view(torch.int16) != y_mine.view(torch.int16)).any(dim=1)
     print(f"[moe] determinism: mine run {rep + 2} vs run 1: rows differing {int(d.sum())}/{M}", flush=True)
+    assert not d.any(), "non-atomic chain is not bitwise deterministic"
 if not args.no_prod:
     y2 = c0.prod().clone()
     torch.cuda.synchronize()
@@ -351,7 +377,7 @@ def _stage_determinism():
             **({"out_s": c0.out_s.clone()} if args.out == "fp8" else {}),
         }
 
-    r1, r2 = _run(), _run()
+    r1, r2, r3 = _run(), _run(), _run()
     nv = int(b.num_valid_ids[0].item())
     sid = b.sorted_ids[:nv]
     tok, slot = (sid & 0xFFFFFF).long(), (sid >> 24).long()
@@ -382,6 +408,7 @@ def _stage_determinism():
             rows = torch.nonzero(diff.any(dim=1)).flatten()
             msg += f"; rows {int(rows.numel())}, first {rows[:6].tolist()}"
         print(msg, flush=True)
+        assert torch.equal(v1, v2) and torch.equal(v1, f(r3)), f"{k}: stage is not bitwise deterministic"
 
 
 _stage_determinism()
@@ -400,6 +427,7 @@ def _dequant(q, s, n_cols):
 
 if not args.no_prod:
     same = y_mine.view(torch.int16) == y_prod.view(torch.int16)
+    assert torch.isfinite(y_mine).all() and _cos(y_mine, y_prod) >= 0.995, "whole-chain mismatch vs aiter"
     # bf16 ulp distance: the int16 patterns are monotonic in magnitude per sign; across
     # sign / zero use the value distance in units of the larger magnitude's ulp
     a16, b16 = y_mine.view(torch.int16).int(), y_prod.view(torch.int16).int()
@@ -470,6 +498,9 @@ if args.check_tokens > 0:
     if cp:
         msg += f"; prod min {min(cp):.5f} mean {statistics.mean(cp):.5f}"
     print(msg, flush=True)
+    assert min(cm) >= 0.97, "whole-chain mismatch vs fp32 reference"
+    if cp:
+        assert statistics.mean(cm) >= statistics.mean(cp) - 0.002, "mean cosine materially worse than aiter"
     if args.sim_fp8_formats:
         print(
             "[moe] fp8 format sim (cos of the bf16 final sum vs fp32 ref, min / mean): "
@@ -490,6 +521,14 @@ def time_graph(fn_of_case, label):
     torch.cuda.synchronize()
     g.replay()
     torch.cuda.synchronize()
+    if label == "mine (whole graph)":
+        snapshots = [c.y.clone() for c in cases]
+        for trial in range(2):
+            g.replay()
+            torch.cuda.synchronize()
+            for c, expected in zip(cases, snapshots):
+                assert torch.equal(c.y.view(torch.int16), expected.view(torch.int16)), f"whole graph trial {trial + 2}: not bitwise deterministic"
+        print(f"[moe] whole graph same inputs x3: bitwise identical ({len(cases)} inputs)", flush=True)
     meds = []
     for _ in range(args.rounds):
         st, en = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
@@ -513,6 +552,8 @@ stages = [
     ("gemm2", lambda c: c.stage_gemm2()),
     ("reduce", lambda c: c.stage_reduce()),
 ]
+if args.chain == "mid":
+    stages = [(name, f) for name, f in stages if name != "tile_map"]
 if args.tail != "none":
     stages.append((f"tail {args.tail}", lambda c: c.stage_tail()))
 tot = 0.0
