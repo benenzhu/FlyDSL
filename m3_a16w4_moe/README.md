@@ -18,8 +18,9 @@ keeping bf16 activations (no fp4 activation quant, so accuracy matches productio
 ## What is here
 
 - `vllm_ops.py`: `import_ops("moe_a16w4_decode")` / `import_ops("moe_a4w4_prefill")`.
-- `bench_m3.py`: decode chain bench (sort -> gemm1 -> gemm2), production tiles by default
-  (`moe_a16w4_decode._gemm1_cfg` / `GEMM2_CFG`), swigluoai reference, 100 inputs per graph;
+- `bench_m3.py`: decode chain bench (sort -> gemm1 -> gemm2) on the production tiles (fixed inside
+  the vLLM kernels: `gemm1.py` LARGE_M_TOKENS, `gemm2.py` KSPLIT_SMALL_M_TOKENS), swigluoai
+  reference, 100 inputs per graph;
   `--sort aiter|decode|decode-wave|pairs|mxfp4`, `--stages`, `--loop N` for rocprofv3.
 - `test_sort_decode.py`: the sort against aiter `moe_sorting` (same contract) + timing.
 - `sort_decode_wave.py`: lab-only sort variant (wave prefix scan; the mid-batch chain in

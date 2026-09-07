@@ -8,7 +8,7 @@ Runs inside the production vLLM image. The kernels are the vLLM ones
   ->  gemm1 (gate/up + swigluaoi, bf16 out)  ->  gemm2 (down, routing-weighted atomic add)
 Inputs are generated exactly like m3-compare/scripts/bench_moe_m4.py (same seed -> same
 weights and routing); every captured call has its own input (weights come from HBM like real
-decode). Default tiles are the production ones (``moe_a16w4_decode._gemm1_cfg`` / ``GEMM2_CFG``).
+decode). The tiles are the production ones, fixed inside the kernels (gemm1.py / gemm2.py).
 
   PYTHONPATH=/flydsl python3 /flydsl/m3_a16w4_moe/bench_m3.py --tokens 32 --sort decode
 """
@@ -27,17 +27,7 @@ p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--tile-m", type=int, default=16, help="sort block / gemm m-block rows (the kernels are built for 16)")
-p.add_argument("--g1-tile-n", type=int, default=0, help="gemm1 columns per workgroup (32/64/128/256); 0 = production config for this M")
-p.add_argument("--g1-kw", type=int, default=0, help="gemm1 K-waves (1: four N-waves, 2: 2 N x 2 K); 0 = production")
-p.add_argument("--g1-kb", type=int, default=0, help="gemm1 128-K tiles per A batch through LDS; 0 = production")
-p.add_argument("--g1-pf", type=int, default=0, help="gemm1 W tiles in flight; 0 = production")
-p.add_argument("--g1-b-nt", type=int, default=-1, help="gemm1 W load cache modifier; -1 = production")
-p.add_argument("--g1-wpe", type=int, default=-1, help="gemm1 waves_per_eu attr; -1 = production, 0 = unset")
-p.add_argument("--g2-tile-n", type=int, default=0, help="0 = production")
-p.add_argument("--g2-tile-k", type=int, default=0, help="0 = production")
-p.add_argument("--g2-b-nt", type=int, default=-1, help="-1 = production")
-p.add_argument("--g2-wpe", type=int, default=0)
-p.add_argument("--g2-ksplit", type=int, default=0, help="gemm2 split-K across CTAs; 0 = production (3 up to 64 tokens, else 1)")
+# gemm1 / gemm2 tiles are fixed in the vLLM kernels (gemm1.py LARGE_M_TOKENS, gemm2.py KSPLIT_SMALL_M_TOKENS)
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
 p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs", "decode", "decode-wave"],
                help="aiter: opus moe_sorting; mxfp4: aiter#3832 single-CTA sort + zero-init; decode: the vLLM "
@@ -122,21 +112,8 @@ inter_sorted = torch.empty((max_sorted, I), dtype=torch.bfloat16, device=dev)
 last_sort = None
 
 assert BM == 16, "the vLLM decode kernels are built for 16-row m-blocks"
-cfg1, cfg2 = dec._gemm1_cfg(M), dict(dec.GEMM2_CFG)
-if M > dec.GEMM2_KSPLIT_SMALL_M:
-    cfg2["ksplit"] = 1
-g1_kw = dict(
-    tile_n=args.g1_tile_n or cfg1["tile_n"], k_waves=args.g1_kw or cfg1["k_waves"],
-    k_batch=args.g1_kb or cfg1["k_batch"], prefetch=args.g1_pf or cfg1["prefetch"],
-    b_nt=cfg1["b_nt"] if args.g1_b_nt < 0 else args.g1_b_nt,
-    waves_per_eu=cfg1.get("waves_per_eu") if args.g1_wpe < 0 else (args.g1_wpe or None),
-    alpha=ALPHA, swiglu_limit=LIMIT, w_layout=args.w_layout,
-)
-g2_kw = dict(
-    tile_n=args.g2_tile_n or cfg2["tile_n"], tile_k=args.g2_tile_k or cfg2["tile_k"],
-    b_nt=cfg2["b_nt"] if args.g2_b_nt < 0 else args.g2_b_nt, waves_per_eu=args.g2_wpe or None,
-    ksplit=args.g2_ksplit or cfg2["ksplit"],
-)
+g1_kw = dict(alpha=ALPHA, swiglu_limit=LIMIT, w_layout=args.w_layout)
+g2_kw = {}
 
 
 def run(inp=None):
@@ -253,8 +230,8 @@ def check_ref(out, ref, label):
     assert torch.isfinite(out).all() and score >= 0.9999, f"{label}: numerical check failed"
 
 
-tag = (f"g1 tn{g1_kw['tile_n']} kw{g1_kw['k_waves']} kb{g1_kw['k_batch']} pf{g1_kw['prefetch']} nt{g1_kw['b_nt']} "
-       f"wpe{g1_kw['waves_per_eu']} | g2 tn{g2_kw['tile_n']} tk{g2_kw['tile_k']} nt{g2_kw['b_nt']} ks{g2_kw['ksplit']} "
+large_m, small_m = M > dec.gemm1.LARGE_M_TOKENS, M <= dec.gemm2.KSPLIT_SMALL_M_TOKENS
+tag = (f"g1 {'tn64 kw1 wpe3' if large_m else 'tn32 kw2'} kb2 pf3 nt2 | g2 tn256 tk256 nt2 ks{3 if small_m else 1} "
        f"| {args.w_layout} sort={args.sort} stages={args.stages}")
 t0 = time.time()
 out = run()
