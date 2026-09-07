@@ -38,6 +38,7 @@ p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
 p.add_argument("--no-check", action="store_true", help="timing-only diagnostics: do not assert on the reference cosines")
 p.add_argument("--mid-g1", choices=["alds"], default="alds", help="mid chain gemm1 (gemm1_mid_alds.py; the other variants were dead ends, see MIDM_NOTES.md)")
 p.add_argument("--mid-g2", choices=["atomic-alds"], default="atomic-alds", help="mid chain gemm2 (gemm2_mid_atomic_alds.py)")
+p.add_argument("--loop-prod", action="store_true", help="with --loop: iterate aiter's chain instead of ours")
 p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations for rocprofv3, after setup")
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
@@ -344,7 +345,7 @@ print(
 )
 if args.loop:
     for i in range(args.loop):
-        cases[i % len(cases)].mine()
+        (cases[i % len(cases)].prod if args.loop_prod else cases[i % len(cases)].mine)()
     torch.cuda.synchronize()
     raise SystemExit(0)
 
