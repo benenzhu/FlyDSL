@@ -37,6 +37,7 @@ p.add_argument("--bm", type=int, choices=[0, 32, 64, 128, 256], default=0,
 p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
 p.add_argument("--mid-g1", choices=["base", "agpr", "agpr-wide", "agpr-wide-splitring"], default="base")
+p.add_argument("--mid-g2", choices=["base", "persist", "atomic"], default="base")
 p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations for rocprofv3, after setup")
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
@@ -44,6 +45,8 @@ p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--check-tokens", type=int, default=64)
 p.add_argument("--check-determinism", action="store_true", help="optional bitwise diagnostic; compare reference cosine by default")
 p.add_argument("--diagnose-weight-power", action="store_true", help="compare aiter against a squared-route-weight reference and exit before timing")
+p.add_argument("--prod-shuffled", action="store_true", help="mark the already-preshuffled aiter weight views with is_shuffled=True")
+p.add_argument("--diagnose-aiter-fp8", action="store_true", help="capture aiter's fp8 partials, decode/reduce in torch, and exit before timing")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--no-prod", action="store_true")
 p.add_argument("--tail", choices=["none", "residual", "prod"], default="none",
@@ -71,6 +74,8 @@ from m3_a4w4_moe.gemm1_mid_agpr_wide import compile_moe_gemm1_mid as compile_g1_
 from m3_a4w4_moe.gemm1_mid_agpr_wide_splitring import compile_moe_gemm1_mid as compile_g1_agpr_wide_splitring  # noqa: E402
 from m3_a4w4_moe.gemm2_mid import compile_moe_gemm2_mid  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_fp8 import compile_moe_gemm2_mid as compile_moe_gemm2_mid_fp8  # noqa: E402
+from m3_a4w4_moe.gemm2_mid_persist import compile_moe_gemm2_mid_persist  # noqa: E402
+from m3_a4w4_moe.gemm2_mid_atomic import compile_moe_gemm2_mid as compile_moe_gemm2_mid_atomic  # noqa: E402
 from m3_a16w4_moe.sort_decode_wave import compile_decode_sort, _ptr, _max_tokens_bucket  # noqa: E402
 
 import aiter  # noqa: E402,F401
@@ -153,7 +158,13 @@ mid_g1_builder = {"base": compile_moe_gemm1_mid, "agpr": compile_g1_agpr,
 launch1 = (mid_g1_builder(H=H, I=I, E=E, BLOCK_M=BM) if args.chain == "mid"
            else compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM))
 if args.chain == "mid":
-    g2_builder = compile_moe_gemm2_mid_fp8 if args.out == "fp8" else compile_moe_gemm2_mid
+    if args.mid_g2 == "atomic":
+        g2_builder = compile_moe_gemm2_mid_atomic
+    elif args.mid_g2 == "persist":
+        assert args.out == "fp8"
+        g2_builder = compile_moe_gemm2_mid_persist
+    else:
+        g2_builder = compile_moe_gemm2_mid_fp8 if args.out == "fp8" else compile_moe_gemm2_mid
     launch2 = g2_builder(H=H, I=I, E=E, topk=K, BLOCK_M=BM)
 else:
     launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out, sort_block_m=BM)
@@ -251,7 +262,7 @@ class Case:
         return (
             self.h_q.view(-1),
             u8(w2_k).contiguous().view(-1),
-            self.out.view(-1),
+            (self.y if args.chain == "mid" and args.mid_g2 == "atomic" else self.out).view(-1),
             self.h_s,
             u8(w2_sk).contiguous().view(-1),
             self.out_s.view(-1),
@@ -276,6 +287,8 @@ class Case:
 
     def stage_reduce(self, compile_first=False):
         global fnr
+        if args.chain == "mid" and args.mid_g2 == "atomic":
+            return
         if args.out == "bf16":
             # production's topk reduce (fp32 sum of the bf16 rows -> bf16)
             _run_moe_reduction(self.out.view(M, K, H), self.y, M, K, H)
@@ -308,10 +321,14 @@ class Case:
         return y
 
     def _prod(self):
+        pw1, pw2 = w13_k.view(fp4), w2_k.view(fp4)
+        if args.prod_shuffled:
+            pw1.is_shuffled = True
+            pw2.is_shuffled = True
         return fused_moe(
             self.x,
-            w13_k.view(fp4),
-            w2_k.view(fp4),
+            pw1,
+            pw2,
             self.topk_w,
             self.topk_ids,
             quant_type=QuantType.per_1x32,
@@ -330,7 +347,7 @@ c0 = cases[0]
 nv = int(c0.bufs.num_valid_ids[0].item())
 print(
     f"[moe] M={M} topk={K} E={E}: sorted rows valid {nv} / alloc {c0.num_m_blocks * BM}, setup x{len(cases)} "
-    f"{time.time() - t0:.1f}s chain={args.chain} mid_g1={args.mid_g1} out={args.out}",
+    f"{time.time() - t0:.1f}s chain={args.chain} mid_g1={args.mid_g1} mid_g2={args.mid_g2} out={args.out}",
     flush=True,
 )
 if args.loop:
@@ -343,7 +360,38 @@ if args.loop:
 y_mine = c0.mine().clone()
 torch.cuda.synchronize()
 if not args.no_prod:
-    y_prod = c0.prod().clone()
+    if args.diagnose_aiter_fp8:
+        import aiter.ops.flydsl.moe_kernels as _mk
+        import inspect
+        _orig_reduce = _mk._run_moe_reduction
+        _captured_fp8 = {}
+
+        def _capture_reduce(*a, **kw):
+            bound = inspect.signature(_orig_reduce).bind(*a, **kw)
+            bound.apply_defaults()
+            if bound.arguments["is_fp8"]:
+                _captured_fp8.update(bound.arguments)
+            return _orig_reduce(*a, **kw)
+
+        _mk._run_moe_reduction = _capture_reduce
+        try:
+            y_prod = c0.prod().clone()
+        finally:
+            _mk._run_moe_reduction = _orig_reduce
+        assert _captured_fp8, "aiter did not call the fp8 reduction path"
+        target = _captured_fp8["target"]
+        blk = _captured_fp8["fp8_scale_blk"] or 32
+        payload = target[:, :H].contiguous().view(torch.float8_e4m3fn).float()
+        scales = target[:, H:H + H // blk].contiguous()
+        sf = fp4_utils.e8m0_to_f32(scales.reshape(-1)).view(M * K, H // blk, 1)
+        decoded = (payload.view(M * K, H // blk, blk) * sf).view(M, K, H)
+        tw = _captured_fp8["topk_weights"]
+        if tw is not None:
+            decoded = decoded * tw.float().view(M, K, 1)
+        y_redecoded = decoded.sum(dim=1).to(torch.bfloat16)
+        print(f"[moe] captured aiter fp8 target={tuple(target.shape)} scale_blk={blk} weights_in_reduce={tw is not None}", flush=True)
+    else:
+        y_prod = c0.prod().clone()
     torch.cuda.synchronize()
 # determinism: the same inputs again must give the same bits (a race shows up here)
 for rep in range(2 if args.check_determinism else 0):
@@ -352,7 +400,7 @@ for rep in range(2 if args.check_determinism else 0):
     d = (y2.view(torch.int16) != y_mine.view(torch.int16)).any(dim=1)
     print(f"[moe] determinism: mine run {rep + 2} vs run 1: rows differing {int(d.sum())}/{M}", flush=True)
     assert not d.any(), "non-atomic chain is not bitwise deterministic"
-if not args.no_prod:
+if not args.no_prod and args.check_determinism:
     y2 = c0.prod().clone()
     torch.cuda.synchronize()
     d = (y2.view(torch.int16) != y_prod.view(torch.int16)).any(dim=1)
@@ -459,7 +507,7 @@ if args.check_tokens > 0:
     xs = u8(xs).view(M, H // 32)
     toks = torch.randperm(M, device=dev)[: args.check_tokens].tolist()
     w13d, w2d = {}, {}
-    cm, cp, cp_squared = [], [], []
+    cm, cp, cp_squared, cp_unweighted, cp_decoded = [], [], [], [], []
     sim = {k: [] for k in ("bf16", "mx32", "mx8", "plain", "plain_w", "row")}
 
     def _e4m3(v):
@@ -478,6 +526,7 @@ if args.check_tokens > 0:
         xd = _dequant(xq[t : t + 1], xs[t : t + 1], H).view(H)
         out = torch.zeros(H, dtype=torch.float32, device=dev)
         out_squared = torch.zeros_like(out)
+        out_unweighted = torch.zeros_like(out)
         for j in range(K):
             e = int(c0.topk_ids[t, j])
             if e not in w13d:
@@ -492,6 +541,7 @@ if args.check_tokens > 0:
             out += wj * ye
             if args.diagnose_weight_power:
                 out_squared += wj * wj * ye
+                out_unweighted += ye
             if args.sim_fp8_formats:
                 acc = sim.setdefault("_acc", {})
                 acc.setdefault("bf16", torch.zeros_like(out)).add_((ye * wj).to(torch.bfloat16).float())
@@ -507,8 +557,11 @@ if args.check_tokens > 0:
         cm.append(_cos(y_mine[t], out))
         if not args.no_prod:
             cp.append(_cos(y_prod[t], out))
+            if args.diagnose_aiter_fp8:
+                cp_decoded.append(_cos(y_redecoded[t], out))
             if args.diagnose_weight_power:
                 cp_squared.append(_cos(y_prod[t], out_squared))
+                cp_unweighted.append(_cos(y_prod[t], out_unweighted))
     msg = f"[moe] cos vs fp32 reference on {len(toks)} tokens: mine min {min(cm):.5f} mean {statistics.mean(cm):.5f}"
     if cp:
         msg += f"; prod min {min(cp):.5f} mean {statistics.mean(cp):.5f}"
@@ -518,6 +571,10 @@ if args.check_tokens > 0:
         assert statistics.mean(cm) >= statistics.mean(cp) - 0.002, "mean cosine materially worse than aiter"
     if args.diagnose_weight_power:
         print(f"[moe] aiter cosine vs squared-route-weight reference: min {min(cp_squared):.5f} mean {statistics.mean(cp_squared):.5f}", flush=True)
+        print(f"[moe] aiter cosine vs unweighted reference: min {min(cp_unweighted):.5f} mean {statistics.mean(cp_unweighted):.5f}", flush=True)
+        raise SystemExit(0)
+    if args.diagnose_aiter_fp8:
+        print(f"[moe] torch-decoded aiter partials: vs aiter output cos {_cos(y_redecoded, y_prod):.8f}; vs reference min {min(cp_decoded):.5f} mean {statistics.mean(cp_decoded):.5f}", flush=True)
         raise SystemExit(0)
     if cp:
         assert min(cp) >= 0.97, "aiter comparison path fails its independent reference"
@@ -576,6 +633,8 @@ stages = [
 ]
 if args.chain == "mid":
     stages = [(name, f) for name, f in stages if name != "tile_map"]
+    if args.mid_g2 == "atomic":
+        stages = [(name, f) for name, f in stages if name != "reduce"]
 if args.tail != "none":
     stages.append((f"tail {args.tail}", lambda c: c.stage_tail()))
 tot = 0.0

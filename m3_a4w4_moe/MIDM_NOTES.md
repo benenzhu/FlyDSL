@@ -3,6 +3,9 @@
 The new chain is opt-in (`bench_moe_a4w4 --chain mid --bm 32`). It is correct
 at the tested M512 shape but **does not yet beat aiter**. No vLLM integration.
 
+Latest handoff: checkpoint 3 below contains the atomic G2 result and the
+validated M2048 aiter FP8 producer repair. All speed targets remain open.
+
 ## Files and layout
 
 - `gemm1_mid.py`: BM32/64, TN128, four N waves, direct VGPR fp4 prefetch;
@@ -106,3 +109,90 @@ The `sys_trace` finalizer left one sleeping profiler Python process with a
 CUDA context. Its exact PID/command was verified and the process was cleaned
 up with TERM then KILL (no pattern kills). Subsequent GPU selection reported
 zero process VRAM and an idle device. Ordinary benchmark defaults are unchanged.
+
+## Checkpoint 3: atomic G2 and verified aiter FP8 producer repair
+
+User requested a handoff on 2026-09-07. No new performance scan was started
+while closing this checkpoint. All whole-chain timings below include
+`--tail prod`, 100 independent input/routing sets per graph, five rounds.
+The 138.6 us weight-read floor excludes the tail, as does the station's
+aiter table; do not mix those timing scopes.
+
+| Configuration | M | Ours, median [range] us | Aiter, median [range] us |
+|---|---|---|---|
+| Wide split-ring AGPR G1, persistent FP8 G2, BM32 | 512 | 242.4 [242.3,242.4] | 212.9 [212.9,213.0] |
+| Wide split-ring AGPR G1, atomic G2, BM32 | 512 | 222.4 [222.3,222.4] | 213.0 [212.9,213.1] |
+| TN128 AGPR G1, atomic G2, BM64 | 1024 | 304.4 [304.4,304.5] | 242.6 [242.6,242.6] |
+
+`gemm2_mid_persist.py` holds A across six output tiles. It passes reference
+checks but is slower. `gemm2_mid_atomic.py` uses the existing packed-BF16
+atomic epilogue and sort's output zeroing. There is no FP8 partial/reduce
+on this path, even when the benchmark prints `out=fp8`; `--mid-g2 atomic`
+takes precedence. M512 G2 is 69.4 [69.4,69.5] us, and its chain eliminates
+the separate ~8 us reduction. Reference cosine min/mean is
+0.98883/0.99023 vs aiter 0.98876/0.99021. M1024 is 0.98818/0.99015 vs
+0.98820/0.99014. The best M512 candidate still loses to aiter by 4.4%.
+
+Logs under `m3-compare/work/moe_midm/`:
+`chain_mid_g2persist_m512.log`, `chain_mid_atomic_m512.log`,
+`chain_mid_bm64_atomic_m1024.log`.
+
+### M2048 aiter accuracy: producer bug, not reduction or routing weights
+
+The active path is `moe_kernels.compile_flydsl_moe_stage2` ->
+`mixed_moe_gemm_2stage.py` -> `mixed_moe_gemm_2stage_common.py`.
+The separate `mxmoe_dispatcher` / `_flydsl_v2_stage2_wrapper` path is not
+active in this benchmark. The captured buffer is `[10240, 6912]`: each row
+has 6144 FP8 values plus 768 E8M0 scales (groups of 8); routing weights are
+already applied by G2. `MXFP4_G2_KSTATIC=0/1` and `is_shuffled=True` did not
+repair this path. Squared or omitted routing weights were also ruled out.
+
+At TN128, `e_vec = min(body_tile_n // 32, 8)` selected four values per
+thread. FP8 `store_pair` wrote the scale at `col_g0 // 8`, so two independently
+quantized groups of four overwrote the same scale byte. The repair is
+`e_vec=8` for `need_fp8_out`, together with
+`cshuffle_nlane=min(32, body_tile_n // e_vec)` (16 at TN128).
+Changing only e_vec fails the c-shuffle layout constraint.
+
+| M2048 case | Independent-reference cosine min / mean |
+|---|---|
+| Our FP8-partial chain | 0.98787 / 0.98979 |
+| Aiter FP8 before repair | 0.89509 / 0.90107 |
+| Aiter FP8 disabled | 0.98822 / 0.99014 |
+| Aiter FP8 after two-part repair | 0.98787 / 0.98980 |
+
+Independent Torch decoding/reduction of aiter's partials gives cosine
+~1.000000 against its output, both before and after repair. This isolates
+the error to the producer. The repaired run completed successfully in
+`aiter_fp8_fixed_diag.log`; it exits before timing. **No accepted M2048
+timing with the repaired aiter baseline exists yet.** Repair validation is
+limited to this M2048 configuration, not a general aiter regression suite.
+
+The patch is checked in as `aiter_fp8_group8.patch`. It is already applied
+only to container `m3cmp_new1` at
+`/usr/local/lib/python3.12/dist-packages/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py`.
+Host `~/aiter` remains clean on its unrelated `ar-rms-2stage-pull` branch.
+Container file SHA256:
+`dd85d82f3fedccf1ccd0a367b588b0ca7663147b1eb3fa064d5616eeff31b875`.
+Original and candidate copies are in
+`m3-compare/work/moe_midm/aiter_fp8_fix/{before,after}.py`.
+Record patched/unpatched aiter explicitly in any later timing table.
+
+### Unfinished G1 prototype
+
+`gemm1_mid_k2.py` changes G1 to two N waves x two K waves, TN128, AGPR C,
+with one LDS exchange to combine K halves. Its goal is to halve repeated
+A reads relative to the four-N-wave TN128 variant. The initial GPU compile
+failed because local `ir` shadowed the imported IR module. The import is
+now `_ir`; **only Python syntax was checked after this edit**. GPU compile,
+cosine and performance remain unvalidated. Do not select it in vLLM.
+
+First command for the next agent (not rerun during handoff):
+
+```bash
+docker exec -w /flydsl -e HIP_VISIBLE_DEVICES=1 -e PYTHONPATH=/flydsl \
+  -e FLYDSL_RUNTIME_ENABLE_CACHE=0 -e AITER_FLYDSL_STAGE2_FP8=1 \
+  m3cmp_new1 python3 -m m3_a4w4_moe.bench_gemm1 \
+  --tokens 512 --bm 32 --kernel mid-k2 --prefetch 2 \
+  --copies 100 --rounds 5 --check-rows 256
+```

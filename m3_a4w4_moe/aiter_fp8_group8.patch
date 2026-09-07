@@ -1,0 +1,10 @@
+--- a/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py
++++ b/aiter/ops/flydsl/kernels/mixed_moe_gemm_2stage_common.py
+@@ -5349 +5349,4 @@
+-                e_vec = 2 if accumulate else min(body_tile_n // 32, 8)
++                # FP8 route-out stores exactly one scale per 8 columns. A
++                # smaller vector quantizes independent groups into the same
++                # scale byte (TN128 previously used e_vec=4).
++                e_vec = 8 if need_fp8_out else (2 if accumulate else min(body_tile_n // 32, 8))
+@@ -5354,0 +5358 @@
++                    cshuffle_nlane=min(32, body_tile_n // e_vec) if need_fp8_out else 32,

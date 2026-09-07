@@ -3,6 +3,11 @@
 This is work in progress, **not a validated fast path**. The production kernel
 and the benchmark's default implementation remain `gemm1.py`.
 
+Handoff, 2026-09-07: small-M speed targets remain unmet. Checkpoint 4 below
+records the latest acceptance rule: cosine parity is required; bitwise
+repetition is optional. Earlier bitwise requirements describe historical runs.
+Resume context is in `m3-compare/MOE_MIDM_HANDOFF.md`.
+
 ## Validation infrastructure
 
 `bench_m3.py --stages 2` now validates gate/up + swiglu against the bf16

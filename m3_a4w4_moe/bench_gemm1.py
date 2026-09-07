@@ -39,7 +39,7 @@ p.add_argument("--fake-dense", choices=["rows", "gather"], default=None,
                     "rows (pure kernel overhead vs the dense kernel); 'gather' = expert 0 everywhere but the real "
                     "gathered rows (isolates the A gather from expert switching); disables the check")
 p.add_argument("--wgm", type=int, default=4, help="m-tiles per XCD group in the block remap")
-p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist", "mid", "mid-soffset", "mid-splitring", "mid-agpr", "mid-agpr-wide", "mid-agpr-wide-splitring", "mid-agpr-rotate"], default="2x2",
+p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist", "mid", "mid-soffset", "mid-splitring", "mid-agpr", "mid-agpr-wide", "mid-agpr-wide-splitring", "mid-agpr-rotate", "mid-k2"], default="2x2",
                help="2x2 = gemm1.py (4-wave 2x2 quadrants); 1x4 = gemm1_1x4.py (Kimi v36 port, BM128 only); "
                     "persist = gemm1_persist.py (2x2, one CTA per CU, cross-block pipelined); "
                     "s3 = gemm1_s3.py (2x2, 3-stage LDS ring, DMA three K-steps ahead, BM128)")
@@ -61,6 +61,7 @@ from m3_a4w4_moe.gemm1_mid_agpr import compile_moe_gemm1_mid as compile_moe_gemm
 from m3_a4w4_moe.gemm1_mid_agpr_wide import compile_moe_gemm1_mid as compile_moe_gemm1_mid_agpr_wide  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_agpr_wide_splitring import compile_moe_gemm1_mid as compile_moe_gemm1_mid_agpr_wide_splitring  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_agpr_rotate import compile_moe_gemm1_mid as compile_moe_gemm1_mid_agpr_rotate  # noqa: E402
+from m3_a4w4_moe.gemm1_mid_k2 import compile_moe_gemm1_mid as compile_moe_gemm1_mid_k2  # noqa: E402
 
 import aiter  # noqa: E402,F401
 from aiter import dtypes  # noqa: E402
@@ -225,12 +226,12 @@ if args.kernel == "1x4":
     def call(case):
         launch_1x4(*case.args_1x4())
 else:
-    if args.kernel in ("mid", "mid-soffset", "mid-splitring", "mid-agpr", "mid-agpr-wide", "mid-agpr-wide-splitring", "mid-agpr-rotate"):
+    if args.kernel in ("mid", "mid-soffset", "mid-splitring", "mid-agpr", "mid-agpr-wide", "mid-agpr-wide-splitring", "mid-agpr-rotate", "mid-k2"):
         builder = {"mid": compile_moe_gemm1_mid, "mid-soffset": compile_moe_gemm1_mid_soffset,
                    "mid-splitring": compile_moe_gemm1_mid_splitring, "mid-agpr": compile_moe_gemm1_mid_agpr,
                    "mid-agpr-wide": compile_moe_gemm1_mid_agpr_wide,
                    "mid-agpr-wide-splitring": compile_moe_gemm1_mid_agpr_wide_splitring,
-                   "mid-agpr-rotate": compile_moe_gemm1_mid_agpr_rotate}[args.kernel]
+                   "mid-agpr-rotate": compile_moe_gemm1_mid_agpr_rotate, "mid-k2": compile_moe_gemm1_mid_k2}[args.kernel]
         launch = builder(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch)
     elif args.kernel == "persist":
         assert args.order == "expert"
