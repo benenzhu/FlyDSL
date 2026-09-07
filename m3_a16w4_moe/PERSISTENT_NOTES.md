@@ -47,3 +47,17 @@ accumulation must be isolated when investigating such discrepancies.
 Resume with the station's decode command plus `--stages 2 --g1-impl persist`.
 Container `/work` currently maps to `m3-compare/work/moe_bench`, while the
 host-side station logs are under `m3-compare/work/moe_midm`.
+
+## Checkpoint 2: M32 correctness passes; performance does not improve yet
+
+The scale hazard is fixed by deduplicating tied wait operands and forwarding
+ready scale SSA values to adjacent tiles. FlyDSL numeric/vector wrappers
+overload equality and formatting: bookkeeping must explicitly use MLIR value
+identity, not DSL `==` or `str(value)`.
+
+M32: reference cosine ~1.0, eager x3 and graph x3 bitwise equal. Sort + gemm1
+is 75.55 us [73.61, 75.57], five rounds x 100 different inputs per graph,
+versus the original 71.45 us [69.82, 71.51]. There is **no speedup** yet.
+ISA still serializes the next descriptor's vector loads at every item start.
+Next: issue row look-ahead under the current item's K loop and use a scalar
+expert-id load. Other M values still need validation.

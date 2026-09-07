@@ -39,16 +39,21 @@ def _wait_values(vals, count):
     # The scale dwords are shared by adjacent tiles. Repeating an input in
     # tied asm outputs makes register allocation COPY it before the wait,
     # reading an unfinished load. Pin each SSA value once, then alias outputs.
-    unique, indices = [], []
+    unique, indices, keys = [], [], {}
     for v in vals:
-        if v not in unique:
+        # DSL values overload equality and string formatting. The inherited
+        # MLIR hash/identity comparison still identifies the underlying SSA.
+        key = hash(v)
+        if key not in keys:
+            keys[key] = len(unique)
             unique.append(v)
-        indices.append(unique.index(v))
+        assert ir.Value.__eq__(unique[keys[key]], v)
+        indices.append(keys[key])
     types = [v.type for v in unique]
-    ty = ir.Type.parse("!llvm.struct<(" + ", ".join(str(t) for t in types) + ")>")
+    ty = types[0] if len(types) == 1 else ir.Type.parse("!llvm.struct<(" + ", ".join(str(t) for t in types) + ")>")
     constraints = ",".join(["=v"] * len(unique) + [str(i) for i in range(len(unique))])
     res = llvm.inline_asm(ty, unique, f"s_waitcnt vmcnt({count})", constraints, has_side_effects=True)
-    pinned = [llvm.extractvalue(t, res, [i]) for i, t in enumerate(types)]
+    pinned = [res] if len(types) == 1 else [llvm.extractvalue(t, res, [i]) for i, t in enumerate(types)]
     return [pinned[i] for i in indices]
 
 
@@ -63,7 +68,7 @@ def _replace_shared_scales(ring, before, ready):
     """Trace-time SSA bookkeeping, outside the kernel's AST loop rewriter."""
     for queued in ring:
         for s in (8, 9):
-            if _raw(queued[s]) == _raw(before[s]):
+            if ir.Value.__eq__(_raw(queued[s]), _raw(before[s])):
                 queued[s] = ready[s]
 
 
