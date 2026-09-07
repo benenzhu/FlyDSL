@@ -19,7 +19,6 @@ p.add_argument("--hidden", type=int, default=6144)
 p.add_argument("--inter", type=int, default=768)
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
-p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--seed", type=int, default=0)
 args = p.parse_args()
 
@@ -145,8 +144,8 @@ ppos = torch.full((M * K,), -1, dtype=torch.long, device=dev)
 ppos[(ptok * K + pslot)[pvalid]] = torch.nonzero(pvalid).flatten()
 
 # ---- mine: sort.py -> production quant -> gemm1.py ----
-bufs = SortBuffers.allocate(M, E, K, BM, args.sort_ctas, dev)
-launch_sort = compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.sort_ctas)
+bufs = SortBuffers.allocate(M, E, K, BM, dev)
+launch_sort = compile_moe_sort(E=E, topk=K, block_m=BM)
 launch_sort(*bufs.launch_args(topk_ids, topk_w, M))
 a_q, a_s = fused_dynamic_mx_quant_moe_sort(x, bufs.sorted_ids, bufs.num_valid_ids, token_num=M, topk=K, block_size=BM)
 num_m_blocks = bufs.max_sorted // BM

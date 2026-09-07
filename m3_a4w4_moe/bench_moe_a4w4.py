@@ -34,7 +34,6 @@ p.add_argument("--bm", type=int, choices=[0, 32, 64, 128, 256], default=0,
                help="sort block size = gemm1 tile rows (256 = half the W13 bytes per FLOP, 2x the padding; gemm2 stays "
                     "128-row tiles and skips all-padding tiles). 0 = auto: 256 from 16384 tokens up (chain 16384: 1059 vs "
                     "1090 us, 32768: 1929 vs 2020; 8192: 637 vs 614, 4096: 428 vs 402 -> 128 there)")
-p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
 p.add_argument("--no-check", action="store_true", help="timing-only diagnostics: do not assert on the reference cosines")
 p.add_argument("--mid-g1", choices=["alds"], default="alds", help="mid chain gemm1 (gemm1_mid_alds.py; the other variants were dead ends, see MIDM_NOTES.md)")
@@ -151,7 +150,7 @@ def build_tile_map(sorted_eids, num_valid, num_m_blocks):
 
 
 launch_sort = (compile_decode_sort(E=E, topk=K, block_m=BM, H=H, max_tokens=_max_tokens_bucket(M))
-               if args.chain == "mid" else compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.sort_ctas))
+               if args.chain == "mid" else compile_moe_sort(E=E, topk=K, block_m=BM))
 launch_tm = None if args.chain == "mid" else compile_tile_map(I=I, BM=BM)
 fn_tm = None
 mid_g1_builder = {"alds": compile_g1_alds}[args.mid_g1]
@@ -170,7 +169,7 @@ class Case:
     def __init__(self):
         global fn1, fn2, fnr
         self.x, self.topk_ids, self.topk_w = make_input()
-        self.bufs = SortBuffers.allocate(M, E, K, BM, args.sort_ctas, dev)
+        self.bufs = SortBuffers.allocate(M, E, K, BM, dev)
         self.num_m_blocks = self.bufs.max_sorted // BM
         rows = self.num_m_blocks * BM
         self.num_m_blocks2 = self.num_m_blocks if args.chain == "mid" else rows // 128
@@ -234,7 +233,7 @@ class Case:
 
     def args_tm(self):
         b = self.bufs
-        return (b.sorted_expert_ids, b.num_valid_ids, self.tile_map, self.num_m_blocks, self.grid1, torch.cuda.current_stream())
+        return (b.sorted_expert_ids, b.num_valid_ids, self.tile_map, self.grid1, torch.cuda.current_stream())
 
     def stage_tile_map(self, compile_first=False):
         global fn_tm

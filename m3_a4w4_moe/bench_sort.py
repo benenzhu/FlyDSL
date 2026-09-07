@@ -8,8 +8,7 @@ the production sorter) vs the FlyDSL 3-stage sorter in ``sort.py``.
 
 Checks the 3-stage output against aiter's (same padded row count, same
 expert per block, every (token, slot) pair placed once inside its expert's
-rows with its weight, padding rows carry the ``n_tokens`` sentinel, reverse
-map consistent), then times both in a HIP graph of ``copies`` calls, each
+rows with its weight, padding rows carry the ``n_tokens`` sentinel), then times both in a HIP graph of ``copies`` calls, each
 with its own routing."""
 
 import argparse
@@ -27,8 +26,6 @@ p.add_argument("--bm", type=int, default=128)
 p.add_argument("--experts", type=int, default=129)
 p.add_argument("--topk", type=int, default=5)
 p.add_argument("--hidden", type=int, default=6144)
-p.add_argument("--ctas", type=int, default=32, help="CTAs of the count / place kernels")
-p.add_argument("--threads", type=int, default=1024)
 p.add_argument("--copies", type=int, default=8)
 p.add_argument("--reps", type=int, default=20)
 p.add_argument("--rounds", type=int, default=5)
@@ -61,7 +58,7 @@ def make_routing():
 class Case:
     def __init__(self):
         self.topk_ids, self.topk_w = make_routing()
-        self.bufs = SortBuffers.allocate(M, E, K, BM, args.ctas, dev)
+        self.bufs = SortBuffers.allocate(M, E, K, BM, dev)
 
     def ref(self):
         return moe_sorting(self.topk_ids, self.topk_w, E, args.hidden, torch.bfloat16, block_size=BM)
@@ -70,7 +67,7 @@ class Case:
         launch(*self.bufs.launch_args(self.topk_ids, self.topk_w, M))
 
 
-launch = compile_moe_sort(E=E, topk=K, block_m=BM, sort_ctas=args.ctas, threads=args.threads)
+launch = compile_moe_sort(E=E, topk=K, block_m=BM)
 cases = [Case() for _ in range(max(1, args.copies))]
 t0 = time.time()
 cases[0].mine()
@@ -120,19 +117,6 @@ def check(c: Case):
     if not torch.equal(w[valid], c.topk_w[tok[valid], slot[valid]]) or not bool((w[~valid] == 0).all()):
         print("  sorted_weights differ")
         ok = False
-    mi = b.m_indices[:nv_m].long()
-    if not torch.equal(mi, torch.where(valid, tok, torch.full_like(tok, M))):
-        print("  m_indices differ")
-        ok = False
-    rev = b.reverse_sorted.long()
-    if not torch.equal(b.sorted_ids[rev].long(), (torch.arange(M * K, device=dev) // K) | ((torch.arange(M * K, device=dev) % K) << 24)):
-        print("  reverse_sorted inconsistent")
-        ok = False
-    cnt = torch.bincount(c.topk_ids.long().reshape(-1), minlength=E)
-    padded = (cnt + BM - 1) // BM * BM
-    if not torch.equal(b.masked_m.long(), padded):
-        print("  masked_m differ")
-        ok = False
     return ok, nv_m
 
 
@@ -173,6 +157,6 @@ us_ref = time_graph(lambda c: c.ref())
 us_mine = time_graph(lambda c: c.mine())
 print(
     f"[sort] tokens={M} BM={BM} per call: aiter moe_sorting(opus) {us_ref[0]:.1f} us ({us_ref[1]:.1f}..{us_ref[2]:.1f}); "
-    f"3-stage FlyDSL ctas={args.ctas} threads={args.threads} {us_mine[0]:.1f} us ({us_mine[1]:.1f}..{us_mine[2]:.1f})",
+    f"3-stage FlyDSL {us_mine[0]:.1f} us ({us_mine[1]:.1f}..{us_mine[2]:.1f})",
     flush=True,
 )
