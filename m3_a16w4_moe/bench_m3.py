@@ -34,7 +34,10 @@ p.add_argument("--g1-a-direct", type=int, default=0, help="1: A straight global-
 p.add_argument("--g1-pf", type=int, default=1, help="K tiles in flight ahead of compute (a_direct only)")
 p.add_argument("--g1-a4", type=int, default=0, help="gemm1: <=4-row blocks stage A through LDS, one load per lane per 128 K")
 p.add_argument("--g1-ss", type=int, default=0, help="1: share W-scale dwords across tiles of one 256-K group")
-p.add_argument("--g1-impl", choices=["base", "persist", "persist-lookahead", "persist-fused-reduce", "persist-interleave", "agpr", "agpr-ring"], default="base")
+p.add_argument("--g1-impl", choices=["base", "persist", "persist-lookahead", "persist-fused-reduce", "persist-interleave", "agpr", "agpr-ring", "nw"], default="base")
+p.add_argument("--g1-kb", type=int, default=4, help="nw: 128-K tiles per A batch through LDS")
+p.add_argument("--g2-impl", choices=["base", "nw"], default="base")
+p.add_argument("--g2-nb", type=int, default=4, help="gemm2 nw: n-blocks per workgroup")
 p.add_argument("--g1-ctas", type=int, default=512, help="persistent gemm1 CTA count")
 p.add_argument("--g2-tile-n", type=int, default=256)
 p.add_argument("--g2-tile-k", type=int, default=256)
@@ -75,10 +78,18 @@ from aiter.utility import fp4_utils  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from m3_a16w4_moe.host import a16w4_gemm1, a16w4_gemm2  # noqa: E402
-if args.g1_impl != "base":
+if args.g1_impl == "nw":
+    from functools import partial
+    from m3_a16w4_moe.gemm1_nw import a16w4_gemm1_nw
+    a16w4_gemm1 = partial(a16w4_gemm1_nw, k_batch=args.g1_kb)
+elif args.g1_impl != "base":
     from functools import partial
     from m3_a16w4_moe.host_persist import a16w4_gemm1_persist
     a16w4_gemm1 = partial(a16w4_gemm1_persist, n_ctas=args.g1_ctas, kernel_variant=args.g1_impl)
+if args.g2_impl == "nw":
+    from functools import partial
+    from m3_a16w4_moe.gemm2_nw import a16w4_gemm2_nw
+    a16w4_gemm2 = partial(a16w4_gemm2_nw, nb=args.g2_nb)
 
 torch.manual_seed(args.seed)
 dev = "cuda"
@@ -263,7 +274,7 @@ def check_ref(out, ref, label):
 tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct} pf{args.g1_pf} ss{args.g1_ss} a4{args.g1_a4}"
        f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} ad{args.g2_a_direct} pf{args.g2_pf} ks{args.g2_ksplit} pm{args.g2_pad_mask} ho{args.g2_hoist} ss{args.g2_ss} | {args.w_layout} sort={args.sort}")
 t0 = time.time()
-tag += f" g1_impl={args.g1_impl} ctas={args.g1_ctas} stages={args.stages}"
+tag += f" g1_impl={args.g1_impl} kb={args.g1_kb} g2_impl={args.g2_impl} nb={args.g2_nb} ctas={args.g1_ctas} stages={args.stages}"
 out = run()
 torch.cuda.synchronize()
 print(f"[a16w4-flydsl] first call (JIT) {time.time() - t0:.1f}s  {tag}", flush=True)
