@@ -39,6 +39,11 @@ from .utils import (  # noqa: F401
 
 # experiment knob: cache-policy bits (0x1 sc0, 0x2 nt, 0x10 sc1) on the bf16 intermediate store
 _D1_STORE_CPOL = int(os.environ.get("M3_D1_STORE_CPOL", "0"), 0)
+# timing-only diagnostics (wrong results), a_direct path: FAKE_A = every block reads rows 0..BM-1
+# (A always L2-hot), FAKE_W = every block reads expert 0, NO_A = A fragments are constants (no A loads).
+_D1_FAKE_A = int(os.environ.get("M3_D1_FAKE_A", "0"))
+_D1_FAKE_W = int(os.environ.get("M3_D1_FAKE_W", "0"))
+_D1_NO_A = int(os.environ.get("M3_D1_NO_A", "0"))
 
 
 def _silu_mul_batch(gs, us):
@@ -427,6 +432,9 @@ def _gemm1_body_a16w4(
             row = []
             for ku in range_constexpr(k_unroll):
                 gbyte = a_row_base_bytes[mi] + base_k_bytes + _a_col_bytes_for_ku(ku)
+                if const_expr(_D1_NO_A):
+                    row.append(fx.Vector.filled(4, ku + mi + 1, fx.Int32).bitcast(fx.BFloat16))
+                    continue
                 r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
                 fx.copy(a_dir_atom, fx.slice(x_dma_tiles4, (None, gbyte // fx.Int32(16))), r)
                 row.append(fx.Vector(fx.memref_load_vec(r)).bitcast(fx.BFloat16))  # v8bf16
@@ -1091,6 +1099,8 @@ def compile_gemm1_a16w4_port(
                         llvm.StoreOp(_raw(fx.Int32(0)), _gep1(_zb, fx.Int32(iv) * fx.Int32(4)))
             else:
                 pre_e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, _mb)))
+                if const_expr(_D1_FAKE_W):
+                    pre_e = rocdl.readfirstlane(T.i32, _raw(fx.Int32(0)))
 
                 def _mind_at(row):
                     return fx.Int32(_global_i32_at(arg_mind, _bxm + row))
@@ -1101,6 +1111,8 @@ def compile_gemm1_a16w4_port(
                 _mind_at(fx.Int32(mi * 16) + _l16) & fx.Int32(0x00FFFFFF)
                 for mi in range_constexpr(BM // 16)
             ]
+            if const_expr(_D1_FAKE_A):
+                pre_arow = [fx.Int32(mi * 16) + _l16 for mi in range_constexpr(BM // 16)]
             pre_ep = [
                 [
                     _mind_at(fx.Int32(mi * 16) + _ld16 * fx.Int32(4) + fx.Int32(ii))

@@ -17,6 +17,11 @@ from m3_a16w4_moe.gemm2 import _atomic_bf16_epilog
 
 # experiment knob: cache policy bits for the W loads (2 = nt, as the decode kernel uses). Default 0.
 _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "0"), 0)
+# timing-only diagnostics (wrong results): FAKE_W = every block reads expert 0, NO_A = constant A operands,
+# NO_EPI = skip the atomic epilogue (one plain store per lane keeps the MFMAs alive).
+_G2_FAKE_W = int(os.environ.get("M3_MID_G2_FAKE_W", "0"))
+_G2_NO_A = int(os.environ.get("M3_MID_G2_NO_A", "0"))
+_G2_NO_EPI = int(os.environ.get("M3_MID_G2_NO_EPI", "0"))
 
 
 def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3):
@@ -47,6 +52,8 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
         if mb * fx.Int32(BM) < valid_rows:
             er = bop.create_buffer_resource(eids, max_size=False, num_records_bytes=nblocks * 4)
             expert = fx.Int32(bop.buffer_load(er, mb, vec_width=1, dtype=fx.Int32, is_scalar=True))
+            if const_expr(_G2_FAKE_W):
+                expert = fx.Int32(0)
             ir = bop.create_buffer_resource(ids, max_size=False, num_records_bytes=nblocks * BM * 4)
             rr = bop.create_buffer_resource(weights, max_size=False, num_records_bytes=nblocks * BM * 4)
             ar = bop.create_buffer_resource(A, max_size=False, num_records_bytes=nblocks * BM * (I // 2))
@@ -63,7 +70,10 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
             ep_weights = [fx.Float32(bop.buffer_load(rr, mbase + fx.Int32(mr * 8) + m_lane, vec_width=1, dtype=fx.Float32)) for mr in range_constexpr(BM // 8)]
 
             def load_tile(kt, prev):
-                aa = [bop.buffer_load(ar, ((mbase + fx.Int32(mi * 16) + l16) * fx.Int32(I // 2) + fx.Int32(kt * 64) + q16 * fx.Int32(16)) // fx.Int32(4), vec_width=4, dtype=fx.Int32) for mi in range_constexpr(MR)]
+                if const_expr(_G2_NO_A):
+                    aa = [fx.Vector.filled(4, kt + mi + 1, fx.Int32) for mi in range_constexpr(MR)]
+                else:
+                    aa = [bop.buffer_load(ar, ((mbase + fx.Int32(mi * 16) + l16) * fx.Int32(I // 2) + fx.Int32(kt * 64) + q16 * fx.Int32(16)) // fx.Int32(4), vec_width=4, dtype=fx.Int32) for mi in range_constexpr(MR)]
                 bb = []
                 for ni in range_constexpr(NI):
                     nblk = expert * fx.Int32(H // 16) + nbase // fx.Int32(16) + fx.Int32(ni)
@@ -93,7 +103,12 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
                                 ni % 2 + 2 * (kt % 2), fx.as_ir_value(sb[ni // 2]),
                             ],
                         ))
-            _atomic_bf16_epilog(
+            if const_expr(_G2_NO_EPI):
+                for mi in range_constexpr(MR):
+                    for ni in range_constexpr(NI):
+                        bop.buffer_store(acc[mi][ni], orsrc, (wave * fx.Int32(64) + lane) * fx.Int32(16), offset_is_bytes=True)
+            else:
+              _atomic_bf16_epilog(
                 fx.Int32(fx.ptrtoint(smem)), acc,
                 fx.Int64(fx.ptrtoint(fx.get_iter(O))),
                 fx.Int64(fx.ptrtoint(fx.get_iter(ids))),

@@ -46,6 +46,7 @@ p.add_argument("--layout", choices=["aiter", "kmajor"], default="aiter")
 p.add_argument("--depth", type=int, default=2)
 p.add_argument("--with-a", action="store_true")
 p.add_argument("--path", choices=["dma", "vgpr"], default="dma", help="LDS-DMA (gemm1) or global->VGPR loads")
+p.add_argument("--cpol", default="", help="cache policy word for the loads (e.g. nt)")
 p.add_argument("--copies", type=int, default=8)
 p.add_argument("--reps", type=int, default=20)
 p.add_argument("--rounds", type=int, default=5)
@@ -142,7 +143,7 @@ def compile_stream():
                 B0 = expert * (2 * I * K_BYTES) + tile_j * (256 * K_BYTES)
                 B1 = B0 + 128 * 128
             b_rsrc = _buffer_ops.create_buffer_resource(W13, max_size=False, num_records_bytes=E * (2 * I) * K_BYTES)
-            b_g2s = G2SLoaderAsm(b_rsrc, offs_b, N_TILES_B, wave_id)
+            b_g2s = G2SLoaderAsm(b_rsrc, offs_b, N_TILES_B, wave_id, cpol=args.cpol)
             b_g2s.set_wave_base(base_ptr)
             b_dst0 = _Buf(base_ptr, 0)
             b_dst1 = _Buf(base_ptr, 16 * 1024)
@@ -158,8 +159,8 @@ def compile_stream():
                     return offs
 
                 a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
-                a0_g2s = G2SLoaderAsm(a_rsrc, _a_offs(0), N_TILES_A, wave_id)
-                a1_g2s = G2SLoaderAsm(a_rsrc, _a_offs(1), N_TILES_A, wave_id)
+                a0_g2s = G2SLoaderAsm(a_rsrc, _a_offs(0), N_TILES_A, wave_id, cpol=args.cpol)
+                a1_g2s = G2SLoaderAsm(a_rsrc, _a_offs(1), N_TILES_A, wave_id, cpol=args.cpol)
                 a0_g2s.set_wave_base(base_ptr)
                 a1_g2s.set_wave_base(base_ptr)
                 a_dst0 = _Buf(base_ptr, 32 * 1024)
@@ -304,7 +305,7 @@ blocks = sum(c.nv // BM for c in cases) / len(cases)
 w_bytes = blocks * NB_N * 2 * 128 * K_BYTES  # every block streams its 256-row slab once (L2 dedups)
 a_bytes = blocks * NB_N * BM * K_BYTES if args.with_a else 0
 print(
-    f"[wstream] tokens={M} BM={BM} layout={args.layout} path={args.path} depth={DEPTH} with_a={args.with_a}: "
+    f"[wstream] tokens={M} BM={BM} layout={args.layout} path={args.path} cpol={args.cpol!r} depth={DEPTH} with_a={args.with_a}: "
     f"median {us:.1f} us (range {meds[0]:.1f}..{meds[-1]:.1f}); issued W {w_bytes / 1e6:.0f} MB + A {a_bytes / 1e6:.0f} MB "
     f"-> {(w_bytes + a_bytes) / us / 1e6:.2f} TB/s issued (setup {time.time() - t0:.1f}s)",
     flush=True,

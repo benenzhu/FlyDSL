@@ -36,7 +36,8 @@ p.add_argument("--bm", type=int, choices=[0, 32, 64, 128, 256], default=0,
                     "1090 us, 32768: 1929 vs 2020; 8192: 637 vs 614, 4096: 428 vs 402 -> 128 there)")
 p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
-p.add_argument("--mid-g1", choices=["base", "agpr", "agpr-wide", "agpr-wide-splitring"], default="base")
+p.add_argument("--no-check", action="store_true", help="timing-only diagnostics: do not assert on the reference cosines")
+p.add_argument("--mid-g1", choices=["base", "agpr", "agpr-wide", "agpr-wide-splitring", "alds"], default="base")
 p.add_argument("--mid-g2", choices=["base", "persist", "atomic"], default="base")
 p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations for rocprofv3, after setup")
 p.add_argument("--copies", type=int, default=4)
@@ -72,6 +73,7 @@ from m3_a4w4_moe.gemm1_mid import compile_moe_gemm1_mid  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_agpr import compile_moe_gemm1_mid as compile_g1_agpr  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_agpr_wide import compile_moe_gemm1_mid as compile_g1_agpr_wide  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_agpr_wide_splitring import compile_moe_gemm1_mid as compile_g1_agpr_wide_splitring  # noqa: E402
+from m3_a4w4_moe.gemm1_mid_alds import compile_moe_gemm1_mid as compile_g1_alds  # noqa: E402
 from m3_a4w4_moe.gemm2_mid import compile_moe_gemm2_mid  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_fp8 import compile_moe_gemm2_mid as compile_moe_gemm2_mid_fp8  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_persist import compile_moe_gemm2_mid_persist  # noqa: E402
@@ -154,7 +156,8 @@ launch_sort = (compile_decode_sort(E=E, topk=K, block_m=BM, H=H, max_tokens=_max
 launch_tm = None if args.chain == "mid" else compile_tile_map(I=I, BM=BM)
 fn_tm = None
 mid_g1_builder = {"base": compile_moe_gemm1_mid, "agpr": compile_g1_agpr,
-                  "agpr-wide": compile_g1_agpr_wide, "agpr-wide-splitring": compile_g1_agpr_wide_splitring}[args.mid_g1]
+                  "agpr-wide": compile_g1_agpr_wide, "agpr-wide-splitring": compile_g1_agpr_wide_splitring,
+                  "alds": compile_g1_alds}[args.mid_g1]
 launch1 = (mid_g1_builder(H=H, I=I, E=E, BLOCK_M=BM) if args.chain == "mid"
            else compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM))
 if args.chain == "mid":
@@ -566,7 +569,7 @@ if args.check_tokens > 0:
     if cp:
         msg += f"; prod min {min(cp):.5f} mean {statistics.mean(cp):.5f}"
     print(msg, flush=True)
-    assert min(cm) >= 0.97, "whole-chain mismatch vs fp32 reference"
+    assert args.no_check or min(cm) >= 0.97, "whole-chain mismatch vs fp32 reference"
     if cp:
         assert statistics.mean(cm) >= statistics.mean(cp) - 0.002, "mean cosine materially worse than aiter"
     if args.diagnose_weight_power:
@@ -577,7 +580,7 @@ if args.check_tokens > 0:
         print(f"[moe] torch-decoded aiter partials: vs aiter output cos {_cos(y_redecoded, y_prod):.8f}; vs reference min {min(cp_decoded):.5f} mean {statistics.mean(cp_decoded):.5f}", flush=True)
         raise SystemExit(0)
     if cp:
-        assert min(cp) >= 0.97, "aiter comparison path fails its independent reference"
+        assert args.no_check or min(cp) >= 0.97, "aiter comparison path fails its independent reference"
     if args.sim_fp8_formats:
         print(
             "[moe] fp8 format sim (cos of the bf16 final sum vs fp32 ref, min / mean): "
