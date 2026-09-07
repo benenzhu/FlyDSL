@@ -34,6 +34,8 @@ p.add_argument("--g1-a-direct", type=int, default=0, help="1: A straight global-
 p.add_argument("--g1-pf", type=int, default=1, help="K tiles in flight ahead of compute (a_direct only)")
 p.add_argument("--g1-a4", type=int, default=0, help="gemm1: <=4-row blocks stage A through LDS, one load per lane per 128 K")
 p.add_argument("--g1-ss", type=int, default=0, help="1: share W-scale dwords across tiles of one 256-K group")
+p.add_argument("--g1-impl", choices=["base", "persist"], default="base")
+p.add_argument("--g1-ctas", type=int, default=512, help="persistent gemm1 CTA count")
 p.add_argument("--g2-tile-n", type=int, default=256)
 p.add_argument("--g2-tile-k", type=int, default=256)
 p.add_argument("--g2-b-nt", type=int, default=0)
@@ -56,7 +58,7 @@ p.add_argument("--loop", type=int, default=0, help="run N eager iterations and e
 p.add_argument("--graph-copies", type=int, default=100,
                help="calls captured per graph, each with its OWN x / routing (different experts -> weights come "
                     "from HBM like real decode, and the per-graph launch cost is amortised as in vLLM's model graph)")
-p.add_argument("--stages", type=int, default=3, help="1: sort only, 2: sort+gemm1, 3: full chain (timing breakdown; skips the check)")
+p.add_argument("--stages", type=int, default=3, choices=[1, 2, 3], help="1: sort only, 2: sort+gemm1, 3: full chain")
 args = p.parse_args()
 
 import torch  # noqa: E402
@@ -70,6 +72,10 @@ from aiter.utility import fp4_utils  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from m3_a16w4_moe.host import a16w4_gemm1, a16w4_gemm2  # noqa: E402
+if args.g1_impl == "persist":
+    from functools import partial
+    from m3_a16w4_moe.host_persist import a16w4_gemm1_persist
+    a16w4_gemm1 = partial(a16w4_gemm1_persist, n_ctas=args.g1_ctas)
 
 torch.manual_seed(args.seed)
 dev = "cuda"
@@ -120,6 +126,7 @@ x, topk_ids, topk_w = inputs[0]  # call 0 == the old single-input bench (same se
 # sorted rows upper bound (aiter pads every expert to a BM multiple)
 max_sorted = M * K + E * BM - K
 inter_sorted = torch.empty((max_sorted, I), dtype=torch.bfloat16, device=dev)
+last_sort = None
 
 g1_kw = dict(
     tile_m=BM, tile_n=args.g1_tile_n, tile_k=args.g1_tile_k, k_wave=args.k_wave,
@@ -137,6 +144,7 @@ g2_kw = dict(
 
 
 def run(inp=None):
+    global last_sort
     x, topk_ids, topk_w = inputs[0] if inp is None else inp
     if args.sort == "pairs":
         # no sort kernel: gemm1/gemm2 derive expert + rows from the routing pairs
@@ -168,6 +176,7 @@ def run(inp=None):
         sorted_ids, sorted_w, sorted_eids, num_valid, out = moe_sorting(
             topk_ids, topk_w, E, H, torch.bfloat16, block_size=BM
         )
+    last_sort = (sorted_ids, num_valid)
     if args.stages < 2:
         return out
     a16w4_gemm1(
@@ -176,7 +185,7 @@ def run(inp=None):
         n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, topk=K, **g1_kw,
     )
     if args.stages < 3:
-        return out
+        return inter_sorted
     a16w4_gemm2(
         inter_sorted_bf16=inter_sorted, w2_u8=w2_k, w2_scale_u8=w2_sk, sorted_expert_ids=sorted_eids,
         num_valid_ids=num_valid, sorted_token_ids=sorted_ids, sorted_weights=sorted_w, out_bf16=out,
@@ -194,18 +203,22 @@ def deq(q, s, n_cols):
 
 def reference(inp=None):
     x, topk_ids, topk_w = inputs[0] if inp is None else inp
-    out = torch.zeros((M, H), dtype=torch.float32, device=dev)
+    shape = (M, K, I) if args.stages == 2 else (M, H)
+    out = torch.zeros(shape, dtype=torch.float32, device=dev)
     xf = x.float()
     for t in range(M):
         for j in range(K):
             e = int(topk_ids[t, j])
             w1e = deq(w1_q[e], w1_s.view(E, 2 * I, -1)[e], H)  # (2I, H)
-            w2e = deq(w2_q[e], w2_s.view(E, H, -1)[e], I)      # (H, I)
             h = xf[t] @ w1e.T
             g, u = h[:I], h[I:]
             g = g.clamp(max=LIMIT)
             u = u.clamp(-LIMIT, LIMIT)
             a = g * torch.sigmoid(ALPHA * g) * (u + 1.0)
+            if args.stages == 2:
+                out[t, j] = a.to(torch.bfloat16).float()
+                continue
+            w2e = deq(w2_q[e], w2_s.view(E, H, -1)[e], I)      # (H, I)
             # kernel rounds the stage-1 intermediate to bf16 before gemm2
             out[t] += float(topk_w[t, j]) * (a.to(torch.bfloat16).float() @ w2e.T)
     return out
@@ -216,9 +229,38 @@ def cos(a, b):
     return float((a @ b) / (a.norm() * b.norm() + 1e-12))
 
 
+def snapshot(out, sort_state=None):
+    """Canonical gemm1 output: ignore unwritten padding, preserve every routed row.
+
+    Called outside the timed graph. Scatter by token/slot so the check does not
+    depend on an implementation's ordering of rows within each expert.
+    """
+    if args.stages != 2:
+        return out.clone()
+    if args.sort == "pairs":
+        raise ValueError("stage-2 validation currently requires a sorted chain")
+    ids, num_valid = last_sort if sort_state is None else sort_state
+    ids = ids[:int(num_valid.flatten()[0].item())]
+    tokens, slots = ids & 0x00FFFFFF, ids >> 24
+    valid = tokens < M
+    dest = (tokens[valid].long() * K + slots[valid].long())
+    assert dest.numel() == M * K and dest.unique().numel() == M * K, "routing coverage"
+    result = torch.empty((M * K, I), dtype=torch.bfloat16, device=dev)
+    result[dest] = inter_sorted[:ids.numel()][valid]
+    return result.view(M, K, I)
+
+
+def check_ref(out, ref, label):
+    score = cos(out, ref)
+    err = (out.float() - ref.float()).abs().max().item()
+    print(f"[a16w4-flydsl] {label}: cos {score:.8f} max|d| {err:.4f}", flush=True)
+    assert torch.isfinite(out).all() and score >= 0.9999, f"{label}: numerical check failed"
+
+
 tag = (f"g1 bm{BM} tn{args.g1_tile_n} tk{args.g1_tile_k} kw{args.k_wave} nt{args.g1_b_nt} xcd{args.g1_xcd} ad{args.g1_a_direct} pf{args.g1_pf} ss{args.g1_ss} a4{args.g1_a4}"
        f" | g2 tn{args.g2_tile_n} tk{args.g2_tile_k} nt{args.g2_b_nt} xcd{args.g2_xcd} ad{args.g2_a_direct} pf{args.g2_pf} ks{args.g2_ksplit} pm{args.g2_pad_mask} ho{args.g2_hoist} ss{args.g2_ss} | {args.w_layout} sort={args.sort}")
 t0 = time.time()
+tag += f" g1_impl={args.g1_impl} ctas={args.g1_ctas} stages={args.stages}"
 out = run()
 torch.cuda.synchronize()
 print(f"[a16w4-flydsl] first call (JIT) {time.time() - t0:.1f}s  {tag}", flush=True)
@@ -229,13 +271,16 @@ if args.loop:
     torch.cuda.synchronize()
     sys.exit(0)
 
-if args.stages < 3:
+if args.stages == 1:
     args.no_check = True
 if not args.no_check:
+    out = snapshot(out)
     ref = reference()
-    err = (out.float() - ref).abs().max().item()
-    print(f"[a16w4-flydsl] cos vs swigluoai ref {cos(out, ref):.5f}  max|d| {err:.4f}  ref max {ref.abs().max().item():.3f}",
-          flush=True)
+    check_ref(out, ref, "swigluoai reference")
+    for trial in range(2):
+        again = snapshot(run())
+        assert torch.equal(out.view(torch.int16), again.view(torch.int16)), f"eager trial {trial + 2}: not bitwise deterministic"
+    print("[a16w4-flydsl] eager same input x3: bitwise identical", flush=True)
 
 # ---- HIP-graph replay timing (how vLLM runs it) ----
 s = torch.cuda.Stream()
@@ -250,11 +295,17 @@ with torch.cuda.graph(g):
 g.replay()
 torch.cuda.synchronize()
 if not args.no_check:
-    # call 0 against the eager run (same input); the last call against its own reference
-    msg = f"[a16w4-flydsl] graph replay cos vs eager {cos(outs_g[0], out):.5f}"
-    if len(inputs) > 1:
-        msg += f" | last call cos vs ref {cos(outs_g[-1], reference(inputs[-1])):.5f}"
-    print(msg)
+    # Gemm1 scratch is shared by all calls; after replay it contains the LAST
+    # input. Snapshot outside capture so validation adds no work to timing.
+    graph_sort = last_sort
+    graph_out = snapshot(outs_g[-1], graph_sort)
+    graph_ref = reference(inputs[-1]) if len(inputs) > 1 else ref
+    check_ref(graph_out, graph_ref, "graph last-input reference")
+    for trial in range(2):
+        g.replay()
+        again = snapshot(outs_g[-1], graph_sort)
+        assert torch.equal(graph_out.view(torch.int16), again.view(torch.int16)), f"graph trial {trial + 2}: not bitwise deterministic"
+    print("[a16w4-flydsl] graph same input x3: bitwise identical", flush=True)
 meds = []
 for r in range(args.rounds):
     for _ in range(20):

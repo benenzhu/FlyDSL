@@ -1,0 +1,49 @@
+# Persistent decode experiment — checkpoint 1
+
+This is work in progress, **not a validated fast path**. The production kernel
+and the benchmark's default implementation remain `gemm1.py`.
+
+## Validation infrastructure
+
+`bench_m3.py --stages 2` now validates gate/up + swiglu against the bf16
+reference. It canonicalizes outputs by `(token, topk slot)`, checks routing
+coverage, excludes unwritten padding, and checks three eager executions and
+three graph replays bitwise. Validation is outside the timed graph.
+
+The existing kernel passed at M=32: cosine approximately 1.0, three runs
+bitwise equal in both modes. Sort + gemm1 measured 71.45 us [69.82, 71.51]
+over five rounds, 100 different input/routing sets per graph. This is a
+validation baseline, not a performance improvement or a full-layer time.
+
+## New kernel status
+
+`gemm1_persist.py` + `host_persist.py`, selected with `--g1-impl persist`,
+implement BM16/TN32/TK128, four K waves and a CTA-strided item list. The last
+K steps prefetch the next item's first steps before reduction/activation.
+
+The first compilable version failed the numeric check (NaNs); no performance
+result is accepted. ISA inspection found register copies of shared scale
+dwords before the explicit wait. The current checkpoint deduplicates wait
+operands and forwards ready scale values; this repair still needs validation.
+Do not integrate this experiment into vLLM until checks and timing pass.
+
+The user explicitly accepts rounding variation from bf16 atomic addition.
+This does not waive deterministic gemm1 checks or justify attributing an
+unexplained discrepancy to atomics. Gemm2's contributions before atomic
+accumulation must be isolated when investigating such discrepancies.
+
+## References
+
+- `m3-compare/STATION_MOE_MIDM.md`, especially sections 2–5. Prior conclusions
+  in section 3 are inputs, not experiments to repeat.
+- Existing `gemm1.py`: weight addressing, scale sharing, slice-K reduction,
+  and swigluoai math.
+- `m3_a4w4_moe/gemm2_persist.py`: item loop and explicit wait conventions.
+- ROCm/aiter PR #3832, merged 2026-07-09; reviewed head
+  `aa65f59a10c38face177e08c86d0069ed5f930cd`. Small BM a4w4 layouts are useful
+  references for the later mid-batch chain. Its LDS aliasing bug illustrates
+  why one cosine pass cannot establish freedom from timing-dependent races.
+
+Resume with the station's decode command plus `--stages 2 --g1-impl persist`.
+Container `/work` currently maps to `m3-compare/work/moe_bench`, while the
+host-side station logs are under `m3-compare/work/moe_midm`.
