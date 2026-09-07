@@ -14,6 +14,7 @@ Timing: HIP graph of ``--copies`` launches with different inputs, replayed
 """
 
 import argparse
+import os
 import statistics
 import time
 
@@ -291,6 +292,7 @@ if args.check_rows > 0 and not args.fake_dense:
     rows_all = torch.nonzero(real).flatten()
     sel = rows_all[torch.randperm(rows_all.numel(), device=dev)[: args.check_rows]].sort().values
     w1_deq_cache = {}
+    bad_rows = []
 
     def w1_deq(e):
         if e not in w1_deq_cache:
@@ -348,6 +350,13 @@ if args.check_rows > 0 and not args.fake_dense:
         cos_all.append(float((h_k @ h_ref) / (h_k.norm() * h_ref.norm() + 1e-12)))
         qr = q_ref.reshape(-1)
         cos_quant.append(float((h_k @ qr) / (h_k.norm() * qr.norm() + 1e-12)))
+        if os.environ.get("M3_G1_DUMP_BAD") and cos_quant[-1] < 0.9999 and len(bad_rows) < 40:
+            # which K-tiles explain the error: contribution of each 128-K slice to (h_k - h_ref) via the reference
+            wd = w1_deq(e)
+            per_kt = [float(((xd[kk * 128:(kk + 1) * 128] @ wd[:, kk * 128:(kk + 1) * 128].T)[:I]).abs().sum()) for kk in range(H // 128)]
+            bad_rows.append((int(r), int(r) // BM, int(r) % BM, round(cos_quant[-1], 5)))
+    if bad_rows:
+        print(f"[gemm1] bad rows (sorted row, m-block, row-in-block, cos): {bad_rows}", flush=True)
     print(
         f"[gemm1] check {len(sel)} rows: scale bytes mismatched {n_bad_s}/{n_tot // 32}, "
         f"fp4 values mismatched {n_bad_q}/{n_tot} ({n_bad_q / n_tot:.2%}); cos vs float ref "

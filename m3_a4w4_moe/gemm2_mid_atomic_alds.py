@@ -26,6 +26,10 @@ from m3_a16w4_moe.gemm2 import _atomic_bf16_epilog
 from m3_a16w4_moe.utils import s_waitcnt_lgkm0
 
 _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "2"), 0)
+# pair mode: workgroups (mb, nb) and (mb+1, nb) get block ids p and p+8, i.e. the same XCD in the same
+# dispatch round, so when the two m-blocks belong to one expert the second one finds W in that
+# XCD's L2 (a BM-row sort then costs one W read per expert up to 2*BM rows). Default 0.
+_MID_PAIR = int(os.environ.get("M3_MID_PAIR", "0"))
 _G2_FAKE_W = int(os.environ.get("M3_MID_G2_FAKE_W", "0"))
 
 
@@ -61,7 +65,12 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
         l16, q16 = lane % fx.Int32(16), lane // fx.Int32(16)
         nr = bop.create_buffer_resource(nvalid, max_size=False, num_records_bytes=4)
         valid_rows = fx.Int32(bop.buffer_load(nr, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True))
-        mb, nb = pid // fx.Int32(H // BN), pid % fx.Int32(H // BN)
+        if const_expr(_MID_PAIR):
+            g, r = pid // fx.Int32(16), pid % fx.Int32(16)
+            item = g * fx.Int32(8) + r % fx.Int32(8)
+            mb, nb = (item // fx.Int32(H // BN)) * fx.Int32(2) + r // fx.Int32(8), item % fx.Int32(H // BN)
+        else:
+            mb, nb = pid // fx.Int32(H // BN), pid % fx.Int32(H // BN)
         if mb * fx.Int32(BM) < valid_rows:
             er = bop.create_buffer_resource(eids, max_size=False, num_records_bytes=nblocks * 4)
             expert = fx.Int32(bop.buffer_load(er, mb, vec_width=1, dtype=fx.Int32, is_scalar=True))
@@ -153,7 +162,7 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
         nblocks: fx.Int32, grid: fx.Int32, stream: fx.Stream,
     ):
         kernel(A, W, O, AS, WS, ids, eids, weights, nvalid, ntok, nblocks).launch(
-            grid=(nblocks * (H // BN), 1, 1), block=(256, 1, 1), stream=stream,
+            grid=(((nblocks + fx.Int32(1)) // fx.Int32(2)) * fx.Int32(2 * (H // BN)) if _MID_PAIR else nblocks * (H // BN), 1, 1), block=(256, 1, 1), stream=stream,
         )
 
     return launch

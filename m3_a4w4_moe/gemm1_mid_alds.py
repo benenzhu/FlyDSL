@@ -40,6 +40,13 @@ from .gemm1 import (
 
 _MID_FAKE_W = int(os.environ.get("M3_MID_FAKE_W", "0"))
 _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "2"), 0)
+# pair mode: workgroups (mb, nb) and (mb+1, nb) get block ids p and p+8, i.e. the same XCD in the same
+# dispatch round, so when the two m-blocks belong to one expert the second one finds W in that
+# XCD's L2 (a BM-row sort then costs one W read per expert up to 2*BM rows). Default 0.
+_MID_PAIR = int(os.environ.get("M3_MID_PAIR", "0"))
+# race probe: 1 = extra barrier before the LDS write of a batch, 2 = inline-asm barrier with a memory
+# clobber (compiler fence) instead of gpu.barrier(). Default 0.
+_ALDS_BAR = int(os.environ.get("M3_ALDS_BAR", "0"))
 
 
 def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=256):
@@ -78,7 +85,12 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
         l16, q16 = lane % fx.Int32(16), lane // fx.Int32(16)
         nr = bop.create_buffer_resource(nvalid, max_size=False, num_records_bytes=4)
         valid_rows = fx.Int32(bop.buffer_load(nr, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True))
-        mb, nb = pid // fx.Int32(I // BN), pid % fx.Int32(I // BN)
+        if const_expr(_MID_PAIR):
+            g, r = pid // fx.Int32(16), pid % fx.Int32(16)
+            item = g * fx.Int32(8) + r % fx.Int32(8)
+            mb, nb = (item // fx.Int32(I // BN)) * fx.Int32(2) + r // fx.Int32(8), item % fx.Int32(I // BN)
+        else:
+            mb, nb = pid // fx.Int32(I // BN), pid % fx.Int32(I // BN)
         if mb * fx.Int32(BM) < valid_rows:
             er = bop.create_buffer_resource(eids, max_size=False, num_records_bytes=nblocks * 4)
             expert = fx.Int32(bop.buffer_load(er, mb, vec_width=1, dtype=fx.Int32, is_scalar=True))
@@ -107,12 +119,22 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
             def load_a_batch(b):
                 return [bop.buffer_load(ar, ld_gbyte[j], vec_width=4, dtype=fx.Int32, soffset_bytes=fx.Int32(b * ROWB)) for j in range_constexpr(NLD)]
 
+            def _bar():
+                if const_expr(_ALDS_BAR == 2):
+                    _asm_void([], "s_waitcnt lgkmcnt(0)\ns_barrier", "", "~{memory}")
+                else:
+                    s_waitcnt_lgkm0()
+                    gpu.barrier()
+
             def stage_a_batch(regs, slot):
+                if const_expr(_ALDS_BAR == 1):
+                    _bar()
+                if const_expr(_ALDS_BAR == 3):
+                    rocdl.s_waitcnt(0x0F70)   # vmcnt(0): probe whether the batch loads are really complete here
                 for j in range_constexpr(NLD):
                     ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(fx.Int32(slot * SLOT) + ld_lbyte[j]), elem_type=T.i8)
                     llvm.StoreOp(fx.as_ir_value(regs[j]), ptr, alignment=16)
-                s_waitcnt_lgkm0()
-                gpu.barrier()
+                _bar()
 
             rd_base = [fx.Int32(mi * 16) * fx.Int32(RS) + l16 * fx.Int32(RS) + q16 * fx.Int32(16) for mi in range_constexpr(MR)]
 
@@ -158,10 +180,12 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
             stage_a_batch(abuf, 0)
             abuf = None
             for kt in range_constexpr(KT):
-                if const_expr(kt % KB == 0 and kt + KB < KT):
+                if const_expr(kt % KB == 0 and kt + KB < KT and _ALDS_BAR != 6):
                     abuf = load_a_batch(kt // KB + 1)      # before this iteration's W loads
                 if const_expr(kt + prefetch < KT):
                     ring.append(load_b_tile(kt + prefetch, ring[-1]))
+                if const_expr(kt % KB == 0 and kt + KB < KT and _ALDS_BAR == 6):
+                    abuf = load_a_batch(kt // KB + 1)      # probe: after the W loads instead
                 if const_expr(kt + 1 < KT):
                     sring.append(load_a_scale(kt + 1, sring[-1]))
                 bb, sb = ring.pop(0)
@@ -213,7 +237,7 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
         tile_map: fx.Tensor, grid: fx.Int32, stream: fx.Stream,
     ):
         kernel(A, W, O, AS, WS, OS, ids, eids, nvalid, ntok, nblocks, asbytes).launch(
-            grid=(nblocks * (I // BN), 1, 1), block=(256, 1, 1), stream=stream,
+            grid=(((nblocks + fx.Int32(1)) // fx.Int32(2)) * fx.Int32(2 * (I // BN)) if _MID_PAIR else nblocks * (I // BN), 1, 1), block=(256, 1, 1), stream=stream,
         )
 
     return launch
