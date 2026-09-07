@@ -61,6 +61,11 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
     NI = BN // 4 // 16
     MR = BM // 16
     assert 1 <= prefetch < KT
+    # Open issue (2026-09-07): BM64 + TN256 + prefetch 2 (k_batch 4 or 8) fails the quantized-reference
+    # check on a few of rows 0..15 of every m-block (cos ~0.998); prefetch 1, 3, 4, k_batch 2, BM32,
+    # TN128 and TN384 all pass. Every hypothesis probed so far (barriers, vmcnt, load order, register
+    # liveness, wait states) leaves it unchanged, so the combination is refused until the cause is known.
+    assert not (BM == 64 and BN == 256 and prefetch == 2 and KB >= 4), "BM64/TN256/prefetch 2: known-bad, see comment"
     ROWB = KB * 64                 # bytes of one row per batch
     CH = ROWB // 16                # 16 B chunks per row per batch
     ROWS_PER_LD = 64 // CH         # rows covered by one dwordx4 wave load
