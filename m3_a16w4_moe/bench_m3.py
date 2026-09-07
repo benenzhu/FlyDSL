@@ -34,7 +34,7 @@ p.add_argument("--g1-a-direct", type=int, default=0, help="1: A straight global-
 p.add_argument("--g1-pf", type=int, default=1, help="K tiles in flight ahead of compute (a_direct only)")
 p.add_argument("--g1-a4", type=int, default=0, help="gemm1: <=4-row blocks stage A through LDS, one load per lane per 128 K")
 p.add_argument("--g1-ss", type=int, default=0, help="1: share W-scale dwords across tiles of one 256-K group")
-p.add_argument("--g1-impl", choices=["base", "persist"], default="base")
+p.add_argument("--g1-impl", choices=["base", "persist", "persist-lookahead", "persist-fused-reduce", "persist-interleave"], default="base")
 p.add_argument("--g1-ctas", type=int, default=512, help="persistent gemm1 CTA count")
 p.add_argument("--g2-tile-n", type=int, default=256)
 p.add_argument("--g2-tile-k", type=int, default=256)
@@ -48,7 +48,7 @@ p.add_argument("--g2-pad-mask", type=int, default=0, help="gemm2: OOB-mask paddi
 p.add_argument("--g2-ss", type=int, default=0, help="gemm2: share scale dwords across 128-K halves / 16-col halves")
 p.add_argument("--g2-hoist", type=int, default=-1, help="gemm2 prologue hoist: -1 = follow a_direct, 0/1 force")
 p.add_argument("--w-layout", default="standard", choices=["standard", "guinterleave"])
-p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs", "decode"],
+p.add_argument("--sort", default="aiter", choices=["aiter", "mxfp4", "pairs", "decode", "decode-wave"],
                help="aiter: opus moe_sorting (production); mxfp4: aiter#3832 single-CTA sort + zero-init (BM=16)")
 p.add_argument("--reps", type=int, default=10)
 p.add_argument("--rounds", type=int, default=5)
@@ -66,16 +66,18 @@ import aiter  # noqa: E402
 from aiter import dtypes  # noqa: E402
 from aiter.fused_moe import moe_sorting, _adaptive_moe_sort  # noqa: E402
 from m3_a16w4_moe.sort_decode import moe_sort_decode  # noqa: E402
+if args.sort == "decode-wave":
+    from m3_a16w4_moe.sort_decode_wave import moe_sort_decode
 from aiter.ops.quant import per_1x32_f4_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight, shuffle_weight_a16w4, shuffle_scale_a16w4  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from m3_a16w4_moe.host import a16w4_gemm1, a16w4_gemm2  # noqa: E402
-if args.g1_impl == "persist":
+if args.g1_impl != "base":
     from functools import partial
     from m3_a16w4_moe.host_persist import a16w4_gemm1_persist
-    a16w4_gemm1 = partial(a16w4_gemm1_persist, n_ctas=args.g1_ctas)
+    a16w4_gemm1 = partial(a16w4_gemm1_persist, n_ctas=args.g1_ctas, kernel_variant=args.g1_impl)
 
 torch.manual_seed(args.seed)
 dev = "cuda"
@@ -163,7 +165,7 @@ def run(inp=None):
             n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, pairs=True, topk=K, topk_ids=topk_ids, topk_weights=topk_w, **g2_kw,
         )
         return out
-    if args.sort == "decode":
+    if args.sort in ("decode", "decode-wave"):
         # our one-kernel sort + zero (sort_decode.py): block 0 sorts, the other blocks zero `out`
         sorted_ids, sorted_w, sorted_eids, num_valid, out = moe_sort_decode(topk_ids, topk_w, E, H, BM)
     elif args.sort == "mxfp4":

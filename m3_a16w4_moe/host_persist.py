@@ -5,10 +5,16 @@ import functools
 import torch
 
 from .gemm1_persist import compile_gemm1_persist
+from .gemm1_persist_lookahead import compile_gemm1_persist as compile_gemm1_lookahead
+from .gemm1_persist_fused_reduce import compile_gemm1_persist as compile_gemm1_fused_reduce
+from .gemm1_persist_interleave import compile_gemm1_persist as compile_gemm1_interleave
 from .host import _run_compiled
 
 
 get_gemm1_persist = functools.cache(compile_gemm1_persist)
+get_gemm1_lookahead = functools.cache(compile_gemm1_lookahead)
+get_gemm1_fused_reduce = functools.cache(compile_gemm1_fused_reduce)
+get_gemm1_interleave = functools.cache(compile_gemm1_interleave)
 
 
 def a16w4_gemm1_persist(
@@ -18,11 +24,15 @@ def a16w4_gemm1_persist(
     b_nt=2, xcd_swizzle=0, waves_per_eu=None, act="swigluoai",
     alpha=1.702, swiglu_limit=7.0, w_layout="standard", a_direct=True,
     prefetch=3, scale_share=True, a_rows4=False, n_ctas=512, stream=None,
+    kernel_variant="persist",
 ):
     assert k_wave == 4 and a_direct and scale_share and not a_rows4
     assert xcd_swizzle == 0 and waves_per_eu is None and act == "swigluoai"
     assert n_ctas > 0
-    launch = get_gemm1_persist(
+    builder = {"persist": get_gemm1_persist, "persist-lookahead": get_gemm1_lookahead,
+               "persist-fused-reduce": get_gemm1_fused_reduce,
+               "persist-interleave": get_gemm1_interleave}[kernel_variant]
+    launch = builder(
         D_HIDDEN=D_HIDDEN, D_INTER=D_INTER, NE=NE, TOPK=topk,
         BM=tile_m, TILE_N=tile_n, TILE_K=tile_k, prefetch=prefetch,
         b_cache_mod=b_nt, w_layout=w_layout,
