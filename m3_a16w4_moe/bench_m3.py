@@ -136,8 +136,11 @@ def run(inp=None):
             n_tokens=M, NE=E, D_HIDDEN=H, D_INTER=I, inline_sort=True, topk=K, topk_ids=topk_ids, topk_weights=topk_w, **g2_kw,
         )
         return out
-    if args.sort in ("decode", "decode-wave"):
-        # our one-kernel sort + zero (sort_decode.py): block 0 sorts, the other blocks zero `out`
+    if args.sort == "decode":
+        # the vLLM one-kernel sort + zero: block 0 sorts, the other blocks zero `out`
+        out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+        sorted_ids, sorted_w, sorted_eids, num_valid = moe_sort_decode(topk_ids, topk_w, E, H, BM, out)
+    elif args.sort == "decode-wave":
         sorted_ids, sorted_w, sorted_eids, num_valid, out = moe_sort_decode(topk_ids, topk_w, E, H, BM)
     elif args.sort == "mxfp4":
         # aiter#3832 moe_sort_quant with kSkipQuant: block 0 sorts (LDS counters), the other

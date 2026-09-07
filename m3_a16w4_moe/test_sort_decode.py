@@ -1,6 +1,6 @@
 """Check sort_decode against aiter ``moe_sorting`` (same contract) and time it alone.
 Usage: python m3_a16w4_moe/test_sort_decode.py [--module sort_decode] [--tokens 4 32 256 ...]"""
-import argparse, importlib, time, torch
+import argparse, importlib, torch
 
 p = argparse.ArgumentParser()
 p.add_argument("--module", default="sort_decode", choices=["sort_decode", "sort_decode_wave"],
@@ -48,12 +48,22 @@ def canon(sorted_ids, sorted_w, eids, nvalid, M):
     return {k: sorted(v) for k, v in per.items()}, n
 
 
+
+
+def run_sort(i, w):
+    """(sorted_ids, sorted_w, sorted_eids, num_valid, out) for either module."""
+    if args.module == "sort_decode":  # vLLM: `out` is passed in and zeroed
+        out = torch.empty((i.shape[0], H), dtype=torch.bfloat16, device=dev)
+        return (*mod.moe_sort_decode(i, w, E, H, BM, out), out)
+    return mod.moe_sort_decode(i, w, E, H, BM)
+
+
 ok = True
 for M in args.tokens:
     for t in range(args.trials):
         ids, w = routing(M)
         ref = moe_sorting(ids, w, E, H, torch.bfloat16, block_size=BM)
-        got = mod.moe_sort_decode(ids, w, E, H, BM)
+        got = run_sort(ids, w)
         torch.cuda.synchronize()
         cr, nr = canon(ref[0], ref[1], ref[2], ref[3], M)
         cg, ng = canon(got[0], got[1], got[2], got[3], M)
@@ -71,7 +81,7 @@ for M in args.tokens:
 if ok:
     for M in args.tokens[-3:]:
         ins = [routing(M) for _ in range(100)]
-        for f, name in ((lambda i, w: mod.moe_sort_decode(i, w, E, H, BM), args.module), (lambda i, w: moe_sorting(i, w, E, H, torch.bfloat16, block_size=BM), "aiter")):
+        for f, name in ((run_sort, args.module), (lambda i, w: moe_sorting(i, w, E, H, torch.bfloat16, block_size=BM), "aiter")):
             s = torch.cuda.Stream()
             with torch.cuda.stream(s):
                 for i, w in ins[:2]:
