@@ -269,7 +269,8 @@ class _BScaleGather:
     the n-tile's 256 rows for one K-step, 2 ``buffer_load_dword ... lds`` per
     wave (wave w fetches row-groups 2w, 2w+1 into slot bytes [2w*256, +512))."""
 
-    def __init__(self, rsrc, lane_id, wave_id, region_base_i32):
+    def __init__(self, rsrc, lane_id, wave_id, region_base_i32, cpol=""):
+        self._cpol = f" {cpol}" if cpol else ""
         self.rsrc = fx.as_ir_value(rsrc)
         self.voff = [fx.as_ir_value((wave_id * 2 + q) * fx.Int32(768) + lane_id * fx.Int32(4)) for q in range(2)]
         wave_u = fx.Int32(_rocdl.readfirstlane(_T.i32, fx.as_ir_value(wave_id)))
@@ -280,9 +281,9 @@ class _BScaleGather:
         soff = _uniform_i32(soff_bytes)
         asm = (
             "s_mov_b32 m0, $0\n"
-            "buffer_load_dword $1, $2, $3 offen lds\n"
+            f"buffer_load_dword $1, $2, $3 offen{self._cpol} lds\n"
             "s_add_u32 m0, 256, m0\n"
-            "buffer_load_dword $4, $2, $3 offen lds"
+            f"buffer_load_dword $4, $2, $3 offen{self._cpol} lds"
         )
         _asm_void([m0, self.voff[0], self.rsrc, soff, self.voff[1]], asm, "s,v,s,s,v", "~{scc}")
 
@@ -295,6 +296,11 @@ _NO_STORE = os.environ.get("M3_G2_NO_STORE", "0") == "1"  # timing experiments o
 # combining), so they keep the default policy. Env overrides are for experiments only.
 _STORE_CPOL = int(os.environ.get("M3_G2_STORE_CPOL", "0x2"), 0)
 _STORE_CPOL_SC = int(os.environ.get("M3_G2_STORE_CPOL_SC", "0"), 0)
+# Load-side cache-policy words for experiments ("nt", "sc1", ...): fp4 intermediate
+# rows (A), W2 slabs (W), and the e8m0 scale gathers (SC). Default = none.
+_G2_LOAD_CPOL_A = os.environ.get("M3_G2_LOAD_CPOL_A", "")
+_G2_LOAD_CPOL_W = os.environ.get("M3_G2_LOAD_CPOL_W", "")
+_G2_LOAD_CPOL_SC = os.environ.get("M3_G2_LOAD_CPOL_SC", "")
 
 
 def compile_moe_gemm2(
@@ -507,19 +513,19 @@ def compile_moe_gemm2(
                     )
                 return offs
 
-            a0_g2s = G2SLoaderAsm(a_rsrc, _a_offsets(0), N_TILES_A, wave_id)
-            a1_g2s = G2SLoaderAsm(a_rsrc, _a_offsets(1), N_TILES_A, wave_id)
-            b0_g2s = G2SLoaderAsm(b_rsrc, _b_offsets(0), NB, wave_id)
-            b1_g2s = G2SLoaderAsm(b_rsrc, _b_offsets(1), NB, wave_id)
+            a0_g2s = G2SLoaderAsm(a_rsrc, _a_offsets(0), N_TILES_A, wave_id, cpol=_G2_LOAD_CPOL_A)
+            a1_g2s = G2SLoaderAsm(a_rsrc, _a_offsets(1), N_TILES_A, wave_id, cpol=_G2_LOAD_CPOL_A)
+            b0_g2s = G2SLoaderAsm(b_rsrc, _b_offsets(0), NB, wave_id, cpol=_G2_LOAD_CPOL_W)
+            b1_g2s = G2SLoaderAsm(b_rsrc, _b_offsets(1), NB, wave_id, cpol=_G2_LOAD_CPOL_W)
             for ld in (a0_g2s, a1_g2s, b0_g2s, b1_g2s):
                 ld.set_wave_base(_base_ptr)
             # A scales: 4 x 1 KB = the 3 KB of this m-tile's 4 row groups (+1 KB spill, harmless)
             as_g2s = G2SLoaderAsm(
-                as_rsrc, [(m_base // 32) * fx.Int32(SC_BLOCKS_PER_G * 256) + wave_id * 1024 + lane_id * 16], 1, wave_id
+                as_rsrc, [(m_base // 32) * fx.Int32(SC_BLOCKS_PER_G * 256) + wave_id * 1024 + lane_id * 16], 1, wave_id, cpol=_G2_LOAD_CPOL_SC
             )
             as_g2s.set_wave_base(_sc_ptr)
             sc_base_i32 = fx.Int32(fx.ptrtoint(_sc_ptr))
-            bsg = _BScaleGather(bs_rsrc, lane_id, wave_id, sc_base_i32 + fx.Int32(B_SC_OFF))
+            bsg = _BScaleGather(bs_rsrc, lane_id, wave_id, sc_base_i32 + fx.Int32(B_SC_OFF), cpol=_G2_LOAD_CPOL_SC)
 
             a_s2r = S2RLoaderFp4(wave_i, N_TILES_A)
             b_s2r = S2RLoaderFp4(wave_j, NB)

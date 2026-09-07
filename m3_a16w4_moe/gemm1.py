@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -34,6 +36,9 @@ from .utils import (  # noqa: F401
     decode_pairs_table,
     wave_count,
 )
+
+# experiment knob: cache-policy bits (0x1 sc0, 0x2 nt, 0x10 sc1) on the bf16 intermediate store
+_D1_STORE_CPOL = int(os.environ.get("M3_D1_STORE_CPOL", "0"), 0)
 
 
 def _silu_mul_batch(gs, us):
@@ -899,7 +904,7 @@ def _gemm1_body_a16w4(
                         y = _silu_mul_batch([g], [u])[0]
                 yb = y.to(fx.BFloat16)
                 out_idx = sorted_row * inter_i32 + col_g_list[ni]
-                buffer_ops.buffer_store(yb, out_rsrc, _raw(out_idx), mask=valid)
+                buffer_ops.buffer_store(yb, out_rsrc, _raw(out_idx), mask=valid, cache_modifier=_D1_STORE_CPOL)
 
 
 def gemm1_a16w4_grid(BM, *, INTER, TILE_N, max_m_blocks):

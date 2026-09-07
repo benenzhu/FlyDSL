@@ -41,6 +41,12 @@ p.add_argument("--rounds", type=int, default=5)
 p.add_argument("--check-tokens", type=int, default=64)
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--no-prod", action="store_true")
+p.add_argument("--tail", choices=["none", "residual", "prod"], default="none",
+               help="append the layer's downstream consumer to BOTH chains so a cache-policy change is charged "
+                    "where the model would pay it: 'residual' = res += y (one streaming read of the [M, H] output); "
+                    "'prod' = what the M3 decoder layer runs after the MoE: the TP all-reduce (quick reduce reads y "
+                    "once and writes the reduced tensor; single-GPU stand-in = one copy) followed by vLLM's Triton "
+                    "gemma_fused_add_rmsnorm (residual add + GemmaRMSNorm, vllm/models/minimax_m3/amd/ops/gemma_rmsnorm.py)")
 p.add_argument("--out", choices=["bf16", "fp8"], default="fp8" if os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1" else "bf16",
                help="gemm2 output mode; default follows aiter's AITER_FLYDSL_STAGE2_FP8 switch")
 p.add_argument("--sim-fp8-formats", action="store_true",
@@ -60,6 +66,10 @@ from aiter import ActivationType, QuantType, dtypes  # noqa: E402
 from aiter.fused_moe import fused_moe  # noqa: E402
 from aiter.ops.flydsl.moe_common import GateMode  # noqa: E402
 from aiter.ops.flydsl.moe_kernels import _run_moe_reduction  # noqa: E402
+if args.tail == "prod":
+    from vllm.models.minimax_m3.amd.ops.gemma_rmsnorm import (  # noqa: E402
+        gemma_fused_add_rmsnorm as _gemma_fused_add_rmsnorm,
+    )
 from aiter.ops.quant import fused_dynamic_mx_quant_moe_sort, per_1x32_f4_quant  # noqa: E402
 from aiter.ops.shuffle import shuffle_weight  # noqa: E402
 from aiter.utility import fp4_utils  # noqa: E402
@@ -144,6 +154,10 @@ class Case:
         self.out = torch.zeros((M * K, H), dtype=torch.uint8 if args.out == "fp8" else torch.bfloat16, device=dev)
         self.out_s = torch.zeros((M * K, H // 32), dtype=torch.uint8, device=dev)
         self.y = torch.zeros((M, H), dtype=torch.bfloat16, device=dev)
+        self.res = torch.randn((M, H), dtype=torch.bfloat16, device=dev)  # --tail residual
+        if args.tail == "prod":
+            self.ar_buf = torch.empty((M, H), dtype=torch.bfloat16, device=dev)  # all-reduce stand-in target
+            self.norm_w = torch.zeros((H,), dtype=torch.bfloat16, device=dev)  # Gemma: scale = 1 + w
         self.grid2 = gemm2_grid(self.num_m_blocks2, args.n_split)
         self.grid1 = tile_map_grid(self.num_m_blocks, I)
         self.tile_map = torch.empty((self.grid1 + 1,), dtype=torch.int32, device=dev)
@@ -242,6 +256,14 @@ class Case:
             fnr = flyc.compile(launch_r, *self.argsr())
         fnr(*self.argsr())
 
+    def stage_tail(self, y=None):
+        y = self.y if y is None else y
+        if args.tail == "residual":
+            self.res.add_(y)
+        elif args.tail == "prod":
+            yr = self.ar_buf.copy_(y)  # all-reduce stand-in: read y once, write the reduced tensor
+            self.norm_out, self.res_out = _gemma_fused_add_rmsnorm(yr, self.res, self.norm_w, 1e-6)
+
     def mine(self):
         self.stage_sort()
         self.stage_quant()
@@ -249,9 +271,15 @@ class Case:
         self.stage_gemm1()
         self.stage_gemm2()
         self.stage_reduce()
+        self.stage_tail()
         return self.y
 
     def prod(self):
+        y = self._prod()
+        self.stage_tail(y)
+        return y
+
+    def _prod(self):
         return fused_moe(
             self.x,
             w13_k.view(fp4),
@@ -485,6 +513,8 @@ stages = [
     ("gemm2", lambda c: c.stage_gemm2()),
     ("reduce", lambda c: c.stage_reduce()),
 ]
+if args.tail != "none":
+    stages.append((f"tail {args.tail}", lambda c: c.stage_tail()))
 tot = 0.0
 for name, f in stages:
     tot += time_graph(f, name)

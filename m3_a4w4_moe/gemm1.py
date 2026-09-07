@@ -42,6 +42,8 @@ Layouts (all bytes):
   OUT_sc   [pad32(num_m_blocks*BLOCK_M), I/32]  sorted rows, e8m0-shuffled
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir as _ir
@@ -55,6 +57,15 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.kernels import buffer_ops as _buffer_ops  # the copy shipped in the vLLM image
 
 _N_WAVES = 4
+
+# Cache-policy experiment knobs (gfx950 ``sc0`` / ``sc1`` / ``nt`` bits). Loads take the
+# modifier words appended to the DMA instruction ("nt", "sc1", "sc0 sc1", ...); stores
+# take the numeric aux bits (0x1 sc0, 0x2 nt, 0x10 sc1). Defaults = current behaviour.
+_G1_LOAD_CPOL_A = os.environ.get("M3_G1_LOAD_CPOL_A", "")
+_G1_LOAD_CPOL_W = os.environ.get("M3_G1_LOAD_CPOL_W", "")
+_G1_LOAD_CPOL_SC = os.environ.get("M3_G1_LOAD_CPOL_SC", "")
+_G1_STORE_CPOL = int(os.environ.get("M3_G1_STORE_CPOL", "0"), 0)
+_G1_STORE_CPOL_SC = int(os.environ.get("M3_G1_STORE_CPOL_SC", "0"), 0)
 
 
 def divmod(a, b):
@@ -121,11 +132,12 @@ class G2SLoaderAsm:
     """global -> LDS, 16 B per lane per step; ``gl_offsets[step]`` is the
     loop-invariant per-lane byte offset, the K-step goes in soffset."""
 
-    def __init__(self, rsrc, gl_offsets, n_load_steps, wave_id):
+    def __init__(self, rsrc, gl_offsets, n_load_steps, wave_id, cpol=""):
         self.rsrc = fx.as_ir_value(rsrc)
         self.gl_offsets = gl_offsets
         self.n_load_steps = n_load_steps
         self.wave_id = wave_id
+        self._cpol = f" {cpol}" if cpol else ""  # cache-policy words after ``lds``
 
     @property
     def _step_stride(self):
@@ -153,10 +165,10 @@ class G2SLoaderAsm:
         # (e.g. a loop-exit compare) across this asm and branch on garbage.
         if step == 0:
             m0 = self._lds_base_sgpr(lds_dst)
-            asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
+            asm = f"s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen{self._cpol} lds"
             _asm_void([m0, voff, self.rsrc, soff], asm, "s,v,s,s", "~{scc}")
         else:
-            asm = f"s_add_u32 m0, {stride}, m0\nbuffer_load_dwordx4 $0, $1, $2 offen lds"
+            asm = f"s_add_u32 m0, {stride}, m0\nbuffer_load_dwordx4 $0, $1, $2 offen{self._cpol} lds"
             _asm_void([voff, self.rsrc, soff], asm, "v,s,s", "~{scc}")
 
     def load(self, lds_dst, k_offset):
@@ -424,7 +436,9 @@ class ScaleGatherMoE:
         a_half_groups,
         b_wave_groups,
         b_half_groups,
+        cpol="",
     ):
+        self._cpol = f" {cpol}" if cpol else ""
         self.row_i32 = (K // 256) * 64  # i32 per 32-row group (32 rows x K/32 bytes)
         self.wave_id = wave_id
         # aiter's buffer_ops returns the raw ROCDL resource (!llvm.ptr<8>) directly
@@ -463,7 +477,7 @@ class ScaleGatherMoE:
         i32_off = grp * fx.Int32(self.row_i32) + fx.Int32(kstep) * fx.Int32(64) + self._in16 * fx.Int32(4)
         voff = fx.as_ir_value(i32_off * fx.Int32(4))  # bytes
         addr = fx.Int32(self._wave_base_s) + fx.Int32(slot) * fx.Int32(_SCALE_SLOT_BYTES)
-        asm = "s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen lds"
+        asm = f"s_mov_b32 m0, $0\nbuffer_load_dwordx4 $1, $2, $3 offen{self._cpol} lds"
         _asm_void([fx.as_ir_value(addr), voff, self._rsrc, self._soff0], asm, "s,v,s,s", "~{m0}")
 
 
@@ -788,6 +802,7 @@ def compile_moe_gemm1(
                 A_HALF_GROUPS,
                 B_WAVE_GROUPS,
                 B_HALF_GROUPS,
+                cpol=_G1_LOAD_CPOL_SC,
             )
             scale_gather.set_wave_base(m_base, b_row0)
             a_scale_ld = ScaleLoaderLDS(N_TILES_A, lane_id, wave_i, _scale_base_ptr, _SCALE_A_REGION)
@@ -801,9 +816,9 @@ def compile_moe_gemm1(
 
             a_rsrc = _buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=n_tokens * K_BYTES)
             b_rsrc = _buffer_ops.create_buffer_resource(W13, max_size=False, num_records_bytes=E * (2 * I) * K_BYTES)
-            a0_g2s = G2SLoaderAsm(a_rsrc, gl_off_a0, N_TILES_A, wave_id)
-            a1_g2s = G2SLoaderAsm(a_rsrc, gl_off_a1, N_TILES_A, wave_id)
-            b_g2s = G2SLoaderAsm(b_rsrc, gl_off_b, N_TILES_B, wave_id)
+            a0_g2s = G2SLoaderAsm(a_rsrc, gl_off_a0, N_TILES_A, wave_id, cpol=_G1_LOAD_CPOL_A)
+            a1_g2s = G2SLoaderAsm(a_rsrc, gl_off_a1, N_TILES_A, wave_id, cpol=_G1_LOAD_CPOL_A)
+            b_g2s = G2SLoaderAsm(b_rsrc, gl_off_b, N_TILES_B, wave_id, cpol=_G1_LOAD_CPOL_W)
             a0_g2s.set_wave_base(_base_ptr)
             a1_g2s.set_wave_base(_base_ptr)
             b_g2s.set_wave_base(_base_ptr)
@@ -1103,14 +1118,18 @@ def compile_moe_gemm1(
                         row = base_row + ti * 16 + r16
                         # after the swap lane group g holds tile (2p + g%2), cols (g//2)*8 .. +8
                         col = col_base + (2 * p + (g % 2)) * 16 + (g // 2) * 8
-                        _buffer_ops.buffer_store(dword, out_rsrc, row * I_BYTES + col // 2, offset_is_bytes=True)
+                        _buffer_ops.buffer_store(
+                            dword, out_rsrc, row * I_BYTES + col // 2, offset_is_bytes=True, cache_modifier=_G1_STORE_CPOL
+                        )
                     # scales: rows ti (h=0) and ti+1 (h=1) of the same 32-row group -> i16
                     for tp in range_constexpr(N_TILES_A // 2):
                         row32 = (base_row // 32) + tp
                         blk = row32 * OUT_SC_BLOCKS_PER_ROW32 + colgrp // 8
                         pair = e8m0_of_ti[2 * tp] | (e8m0_of_ti[2 * tp + 1] << 8)
                         pair16 = _arith.TruncIOp(_T.i16, fx.as_ir_value(pair)).result
-                        _buffer_ops.buffer_store(pair16, osc_rsrc, blk * 256 + sc_in_block, offset_is_bytes=True)
+                        _buffer_ops.buffer_store(
+                            pair16, osc_rsrc, blk * 256 + sc_in_block, offset_is_bytes=True, cache_modifier=_G1_STORE_CPOL_SC
+                        )
 
             row_r0 = m_base + wave_i * (N_TILES_A * 16)
             row_r1 = row_r0 + LDS_BLOCK_M
