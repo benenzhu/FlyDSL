@@ -5,12 +5,18 @@ Uses the existing decode packed-bf16 atomic epilogue. Sort must zero [M,H].
 There is no partial buffer, fp8 quantization or separate topk reduction.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from aiter.ops.flydsl.kernels import buffer_ops as bop
 from m3_a16w4_moe.gemm2 import _atomic_bf16_epilog
+
+
+# experiment knob: cache policy bits for the W loads (2 = nt, as the decode kernel uses). Default 0.
+_MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "0"), 0)
 
 
 def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3):
@@ -62,7 +68,7 @@ def compile_moe_gemm2_mid(*, H, I, E, topk=5, BLOCK_M=32, TILE_N=256, prefetch=3
                 for ni in range_constexpr(NI):
                     nblk = expert * fx.Int32(H // 16) + nbase // fx.Int32(16) + fx.Int32(ni)
                     off = nblk * fx.Int32(I * 8) + fx.Int32(kt * 1024) + q16 * fx.Int32(256) + l16 * fx.Int32(16)
-                    bb.append(bop.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32))
+                    bb.append(bop.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32, cache_modifier=_MID_W_CPOL))
                 if const_expr(kt % 2 == 0):
                     sa = [bop.buffer_load(asr, (mbase // fx.Int32(32) + fx.Int32(mp)) * fx.Int32(I // 256 * 64) + fx.Int32(kt // 2 * 64) + q16 * fx.Int32(16) + l16, vec_width=1, dtype=fx.Int32) for mp in range_constexpr(MR // 2)]
                     sb = [bop.buffer_load(wsr, (expert * fx.Int32(H // 32) + nbase // fx.Int32(32) + fx.Int32(np)) * fx.Int32(I // 256 * 64) + fx.Int32(kt // 2 * 64) + q16 * fx.Int32(16) + l16, vec_width=1, dtype=fx.Int32) for np in range_constexpr(NI // 2)]

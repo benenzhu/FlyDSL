@@ -7,6 +7,8 @@ FP4 MFMA operands are swapped to put one output row in lanes L,L^16,L^32,L^48,
 so the existing per-32-column quantization epilogue can be reused.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
@@ -17,6 +19,10 @@ from .gemm1 import (
     _e8m0_roundup_fp4, _as_f32, _cvt_pk_fp4, _permlane16_swap,
     Mfma16x16x128Fp4, _asm_void,
 )
+
+
+# experiment knob: cache policy bits for the W loads (2 = nt, as the decode kernel uses). Default 0.
+_MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "0"), 0)
 
 
 def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
@@ -61,7 +67,7 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
                     for ni in range_constexpr(2):
                         nblk = expert * fx.Int32(2 * I // 16) + nbase // fx.Int32(16) + fx.Int32(gu * I // 16 + ni)
                         off = q16 * fx.Int32(256) + l16 * fx.Int32(16)
-                        slab.append(bop.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32,
+                        slab.append(bop.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32, cache_modifier=_MID_W_CPOL,
                                                     soffset_bytes=nblk * fx.Int32(H * 8) + fx.Int32(kt * 1024)))
                     bb.append(slab)
                 if const_expr(kt % 2 == 0):

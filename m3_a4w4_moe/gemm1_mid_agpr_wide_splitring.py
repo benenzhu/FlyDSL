@@ -7,6 +7,8 @@ FP4 MFMA operands are swapped to put one output row in lanes L,L^16,L^32,L^48,
 so the existing per-32-column quantization epilogue can be reused.
 """
 
+import os
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
@@ -17,6 +19,20 @@ from .gemm1 import (
     _e8m0_roundup_fp4, _as_f32, _cvt_pk_fp4, _permlane16_swap,
     Mfma16x16x128Fp4, _asm_void,
 )
+
+
+# experiment knob: 1 = give each XCD a contiguous range of work items, so the n-blocks of one
+# m-block (which re-read the same A rows) share that XCD's L2 instead of being dealt round-robin
+# over the 8 XCDs. Default 0 = unchanged.
+_MID_XCD = int(os.environ.get("M3_MID_XCD", "0"))
+# timing-only diagnostics (wrong results): FAKE_A = every block reads rows 0..BM-1 (A always L2-hot),
+# FAKE_W = every block reads expert 0 (W13 always cache-hot). Default 0.
+_MID_FAKE_A = int(os.environ.get("M3_MID_FAKE_A", "0"))
+_MID_FAKE_W = int(os.environ.get("M3_MID_FAKE_W", "0"))
+# NO_A = do not issue the A loads at all (constant operands): isolates the cost of the A gather instructions.
+_MID_NO_A = int(os.environ.get("M3_MID_NO_A", "0"))
+# experiment knob: cache policy bits for the W loads (2 = nt, as the decode kernel uses). Default 0.
+_MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "0"), 0)
 
 
 def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
@@ -40,10 +56,17 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
         l16, q16 = lane % fx.Int32(16), lane // fx.Int32(16)
         nr = bop.create_buffer_resource(nvalid, max_size=False, num_records_bytes=4)
         valid_rows = fx.Int32(bop.buffer_load(nr, fx.Int32(0), vec_width=1, dtype=fx.Int32, is_scalar=True))
+        if const_expr(_MID_XCD):
+            nwg = nblocks * fx.Int32(I // BN)
+            xc, intra = pid % fx.Int32(8), pid // fx.Int32(8)
+            xq, xr = nwg // fx.Int32(8), nwg % fx.Int32(8)
+            pid = xc * xq + fx.Int32(fx.arith.select(xc < xr, xc, xr)) + intra
         mb, nb = pid // fx.Int32(I // BN), pid % fx.Int32(I // BN)
         if mb * fx.Int32(BM) < valid_rows:
             er = bop.create_buffer_resource(eids, max_size=False, num_records_bytes=nblocks * 4)
             expert = fx.Int32(bop.buffer_load(er, mb, vec_width=1, dtype=fx.Int32, is_scalar=True))
+            if const_expr(_MID_FAKE_W):
+                expert = fx.Int32(0)
             ir = bop.create_buffer_resource(ids, max_size=False, num_records_bytes=nblocks * BM * 4)
             ar = bop.create_buffer_resource(A, max_size=False, num_records_bytes=ntok * (H // 2))
             wr = bop.create_buffer_resource(W, max_size=False, num_records_bytes=E * 2 * I * H // 2)
@@ -54,6 +77,8 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
             mbase = mb * fx.Int32(BM)
             nbase = nb * fx.Int32(BN) + wave * fx.Int32(NI * 16)
             tokens = [fx.Int32(bop.buffer_load(ir, mbase + fx.Int32(mi * 16) + l16, vec_width=1, dtype=fx.Int32)) & fx.Int32(0xFFFFFF) for mi in range_constexpr(MR)]
+            if const_expr(_MID_FAKE_A):
+                tokens = [fx.Int32(mi * 16) + l16 for mi in range_constexpr(MR)]
 
             def load_b_tile(kt, prev):
                 bb = []
@@ -62,7 +87,7 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
                     for ni in range_constexpr(NI):
                         nblk = expert * fx.Int32(2 * I // 16) + nbase // fx.Int32(16) + fx.Int32(gu * I // 16 + ni)
                         off = q16 * fx.Int32(256) + l16 * fx.Int32(16)
-                        slab.append(bop.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32,
+                        slab.append(bop.buffer_load(wr, off // fx.Int32(4), vec_width=4, dtype=fx.Int32, cache_modifier=_MID_W_CPOL,
                                                     soffset_bytes=nblk * fx.Int32(H * 8) + fx.Int32(kt * 1024)))
                     bb.append(slab)
                 if const_expr(kt % 2 == 0):
@@ -73,7 +98,10 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
                 return bb, sb
 
             def load_a_tile(kt, prev):
-                aa = [bop.buffer_load(ar, (tokens[mi] * fx.Int32(H // 2) + q16 * fx.Int32(16)) // fx.Int32(4), vec_width=4, dtype=fx.Int32, soffset_bytes=fx.Int32(kt * 64)) for mi in range_constexpr(MR)]
+                if const_expr(_MID_NO_A):
+                    aa = [fx.Vector.filled(4, kt + mi + 1, fx.Int32) for mi in range_constexpr(MR)]
+                else:
+                    aa = [bop.buffer_load(ar, (tokens[mi] * fx.Int32(H // 2) + q16 * fx.Int32(16)) // fx.Int32(4), vec_width=4, dtype=fx.Int32, soffset_bytes=fx.Int32(kt * 64)) for mi in range_constexpr(MR)]
                 if const_expr(kt % 2 == 0):
                     sa = [bop.buffer_load(asr, q16 * fx.Int32(16) + l16, vec_width=1, dtype=fx.Int32,
                                          soffset_bytes=((mbase // fx.Int32(32) + fx.Int32(mp)) * fx.Int32(H // 256 * 64) + fx.Int32(kt // 2 * 64)) * fx.Int32(4)) for mp in range_constexpr(MR // 2)]
