@@ -32,6 +32,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from m3_a16w4_moe.utils import s_waitcnt_lgkm0
+from m3_a16w4_moe.gemm1_agpr_ring import _pin_accumulators
 from .gemm1 import (
     _buffer_ops as bop, _swiglu_oai, _quant_prep_fp4, _fmax,
     _e8m0_roundup_fp4, _as_f32, _cvt_pk_fp4, _permlane16_swap,
@@ -44,8 +45,11 @@ _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "2"), 0)
 # dispatch round, so when the two m-blocks belong to one expert the second one finds W in that
 # XCD's L2 (a BM-row sort then costs one W read per expert up to 2*BM rows). Default 0.
 _MID_PAIR = int(os.environ.get("M3_MID_PAIR", "0"))
-# race probe: 1 = extra barrier before the LDS write of a batch, 2 = inline-asm barrier with a memory
-# clobber (compiler fence) instead of gpu.barrier(). Default 0.
+# probes used while hunting the prefetch-2/BM64 mismatch (kept for reference, default 0): 1 extra barrier
+# before the LDS write; 3 vmcnt(0) before the write; 6 batch loads after the W loads; 7 keep the previous
+# A fragments live; 8 s_nop x64 after each MFMA block; 9 pipelined ds_read; 10 every wave writes the whole
+# batch; 11/12 vmcnt(0)(+lgkmcnt(0)) before each MFMA block. None of them mattered: the cause was the
+# accumulator read fence (see the epilogue).
 _ALDS_BAR = int(os.environ.get("M3_ALDS_BAR", "0"))
 
 
@@ -61,11 +65,6 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
     NI = BN // 4 // 16
     MR = BM // 16
     assert 1 <= prefetch < KT
-    # Open issue (2026-09-07): BM64 + TN256 + prefetch 2 (k_batch 4 or 8) fails the quantized-reference
-    # check on a few of rows 0..15 of every m-block (cos ~0.998); prefetch 1, 3, 4, k_batch 2, BM32,
-    # TN128 and TN384 all pass. Every hypothesis probed so far (barriers, vmcnt, load order, register
-    # liveness, wait states) leaves it unchanged, so the combination is refused until the cause is known.
-    assert not (BM == 64 and BN == 256 and prefetch == 2 and KB >= 4), "BM64/TN256/prefetch 2: known-bad, see comment"
     ROWB = KB * 64                 # bytes of one row per batch
     CH = ROWB // 16                # 16 B chunks per row per batch
     ROWS_PER_LD = 64 // CH         # rows covered by one dwordx4 wave load
@@ -120,14 +119,19 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
             # A batch staging: this wave's rows are wave*RPW + j*ROWS_PER_LD + lane//CH (j < NLD),
             # 16 B chunk lane%CH of the batch's ROWB bytes. Padding rows carry a token >= ntok and
             # read as 0 through the OOB-clamped resource.
-            ld_row = [wave * fx.Int32(RPW) + fx.Int32(j * ROWS_PER_LD) + lane // fx.Int32(CH) for j in range_constexpr(NLD)]
+            if const_expr(_ALDS_BAR == 10):
+                NLD_ = BM // ROWS_PER_LD
+                ld_row = [fx.Int32(j * ROWS_PER_LD) + lane // fx.Int32(CH) for j in range_constexpr(NLD_)]
+            else:
+                NLD_ = NLD
+                ld_row = [wave * fx.Int32(RPW) + fx.Int32(j * ROWS_PER_LD) + lane // fx.Int32(CH) for j in range_constexpr(NLD)]
             ld_chunk = (lane % fx.Int32(CH)) * fx.Int32(16)
-            ld_tok = [fx.Int32(bop.buffer_load(ir, mbase + ld_row[j], vec_width=1, dtype=fx.Int32)) & fx.Int32(0xFFFFFF) for j in range_constexpr(NLD)]
-            ld_gbyte = [(ld_tok[j] * fx.Int32(H // 2) + ld_chunk) // fx.Int32(4) for j in range_constexpr(NLD)]
-            ld_lbyte = [ld_row[j] * fx.Int32(RS) + ld_chunk for j in range_constexpr(NLD)]
+            ld_tok = [fx.Int32(bop.buffer_load(ir, mbase + ld_row[j], vec_width=1, dtype=fx.Int32)) & fx.Int32(0xFFFFFF) for j in range_constexpr(NLD_)]
+            ld_gbyte = [(ld_tok[j] * fx.Int32(H // 2) + ld_chunk) // fx.Int32(4) for j in range_constexpr(NLD_)]
+            ld_lbyte = [ld_row[j] * fx.Int32(RS) + ld_chunk for j in range_constexpr(NLD_)]
 
             def load_a_batch(b):
-                return [bop.buffer_load(ar, ld_gbyte[j], vec_width=4, dtype=fx.Int32, soffset_bytes=fx.Int32(b * ROWB)) for j in range_constexpr(NLD)]
+                return [bop.buffer_load(ar, ld_gbyte[j], vec_width=4, dtype=fx.Int32, soffset_bytes=fx.Int32(b * ROWB)) for j in range_constexpr(NLD_)]
 
             def _bar():
                 if const_expr(_ALDS_BAR == 2):
@@ -141,7 +145,7 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
                     _bar()
                 if const_expr(_ALDS_BAR == 3):
                     rocdl.s_waitcnt(0x0F70)   # vmcnt(0): probe whether the batch loads are really complete here
-                for j in range_constexpr(NLD):
+                for j in range_constexpr(NLD_):
                     ptr = bop.get_element_ptr(lds, byte_offset=fx.as_ir_value(fx.Int32(slot * SLOT) + ld_lbyte[j]), elem_type=T.i8)
                     llvm.StoreOp(fx.as_ir_value(regs[j]), ptr, alignment=16)
                 _bar()
@@ -190,6 +194,7 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
             stage_a_batch(abuf, 0)
             abuf = None
             aa_prev = None
+            aa_next = None
             for kt in range_constexpr(KT):
                 if const_expr(kt % KB == 0 and kt + KB < KT and _ALDS_BAR != 6):
                     abuf = load_a_batch(kt // KB + 1)      # before this iteration's W loads
@@ -201,7 +206,15 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
                     sring.append(load_a_scale(kt + 1, sring[-1]))
                 bb, sb = ring.pop(0)
                 sa = sring.pop(0)
-                aa = read_a_tile(kt)
+                if const_expr(_ALDS_BAR == 9):
+                    aa = aa_next if aa_next is not None else read_a_tile(kt)
+                    aa_next = read_a_tile(kt + 1) if (kt % KB != KB - 1 and kt + 1 < KT) else None
+                else:
+                    aa = read_a_tile(kt)
+                if const_expr(_ALDS_BAR == 11):
+                    rocdl.s_waitcnt(0x0070)   # probe: vmcnt(0) lgkmcnt(0) before every MFMA block
+                if const_expr(_ALDS_BAR == 12):
+                    rocdl.s_waitcnt(0x0F70)   # probe: vmcnt(0) only
                 for mi in range_constexpr(MR):
                     for ni in range_constexpr(NI):
                         for gu in range_constexpr(2):
@@ -219,7 +232,16 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=
                     stage_a_batch(abuf, (kt // KB + 1) % 2)   # this batch's reads are done (MFMAs above)
                     abuf = None
 
-            _asm_void([], "s_nop 15\ns_nop 15", "")
+            # Root cause of the prefetch-2/BM64 mismatch (2026-09-07): the epilogue's v_accvgpr_read copies
+            # depend only on the asm MFMA outputs, so the scheduler hoisted them above a dependency-free
+            # "s_nop" fence, right behind the last MFMAs (the compiler cannot see the XDL-write ->
+            # accvgpr-read hazard inside inline asm). Route every accumulator through an asm that outputs
+            # it again (tied "=a"/"0") with the wait states inside: reads now depend on the fence.
+            flat = _pin_accumulators([acc[mi][ni][gu] for mi in range_constexpr(MR) for ni in range_constexpr(NI) for gu in range_constexpr(2)])
+            for mi in range_constexpr(MR):
+                for ni in range_constexpr(NI):
+                    for gu in range_constexpr(2):
+                        acc[mi][ni][gu] = fx.Vector(flat[(mi * NI + ni) * 2 + gu])
             for np in range_constexpr(NI // 2):
                 exps = []
                 for mi in range_constexpr(MR):

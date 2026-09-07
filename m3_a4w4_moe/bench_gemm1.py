@@ -352,9 +352,32 @@ if args.check_rows > 0 and not args.fake_dense:
         cos_quant.append(float((h_k @ qr) / (h_k.norm() * qr.norm() + 1e-12)))
         if os.environ.get("M3_G1_DUMP_BAD") and cos_quant[-1] < 0.9999 and len(bad_rows) < 40:
             # which K-tiles explain the error: contribution of each 128-K slice to (h_k - h_ref) via the reference
+            # where exactly: mismatching columns (col, kernel value, reference value), and the per-32-col
+            # group scale bytes that differ (group, kernel, reference). The A data was shown to be correct
+            # (no stale-chunk hypothesis beats the plain reference), so the defect is in the epilogue.
+            qr = q_ref.view(I)
+            bad_cols = torch.nonzero(h_k != qr).flatten().tolist()
+            cols = [(c, round(float(h_k[c]), 4), round(float(qr[c]), 4)) for c in bad_cols[:24]]
+            sdiff = [(g, int(s_k[g]), int(s_ref[g])) for g in range(I // 32) if int(s_k[g]) != int(s_ref[g])]
+            groups = sorted(set(c // 32 for c in bad_cols))
+            # hypothesis: the A scale of one 32-element K block was off by 2^e (stale / wrong byte of the
+            # scale dword). Recompute with block j scaled by 2^e and count exact mismatches (0 = confirmed).
+            NCH_ = H // 32
             wd = w1_deq(e)
-            per_kt = [float(((xd[kk * 128:(kk + 1) * 128] @ wd[:, kk * 128:(kk + 1) * 128].T)[:I]).abs().sum()) for kk in range(H // 128)]
-            bad_rows.append((int(r), int(r) // BM, int(r) % BM, round(cos_quant[-1], 5)))
+            Pc = torch.einsum("jk,njk->jn", xd.view(NCH_, 32), wd.view(2 * I, NCH_, 32))
+            tot = Pc.sum(0)
+            def _act(hh):
+                g = hh[:I].clamp(max=SWIGLU_LIMIT)
+                uu = hh[I:].clamp(-SWIGLU_LIMIT, SWIGLU_LIMIT)
+                return g * torch.sigmoid(SWIGLU_ALPHA * g) * (uu + 1.0)
+            def _nbad(hh):
+                return int((quant_ref(_act(hh))[0].reshape(-1) != h_k).sum())
+            shyp = [(len(bad_cols), -1, 0)]
+            for j in range(NCH_):
+                for ee in (-3, -2, -1, 1, 2, 3):
+                    shyp.append((_nbad(tot + Pc[j] * (2.0 ** ee - 1.0)), j, ee))
+            shyp.sort(key=lambda x: x[0])
+            bad_rows.append((int(r), int(r) // BM, int(r) % BM, round(cos_quant[-1], 5), len(bad_cols), groups, sdiff, shyp[:3]))
     if bad_rows:
         print(f"[gemm1] bad rows (sorted row, m-block, row-in-block, cos): {bad_rows}", flush=True)
     print(

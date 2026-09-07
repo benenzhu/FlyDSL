@@ -13,6 +13,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
+from m3_a16w4_moe.gemm1_agpr_ring import _pin_accumulators
 
 from .gemm1 import (
     _buffer_ops as bop, _swiglu_oai, _quant_prep_fp4, _fmax,
@@ -96,7 +97,14 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3):
                                 kt % 2, mi % 2, ni,
                             )
 
-            _asm_void([], "s_nop 15\ns_nop 15", "")
+            # accumulator fence with a data dependency (see gemm1_mid_alds.py): a free-floating s_nop lets the
+            # scheduler hoist the v_accvgpr_read copies right behind the last inline-asm MFMA.
+            _nm, _nn = len(acc), len(acc[0])
+            flat = _pin_accumulators([acc[mi][ni][gu] for mi in range_constexpr(_nm) for ni in range_constexpr(_nn) for gu in range_constexpr(2)])
+            for mi in range_constexpr(_nm):
+                for ni in range_constexpr(_nn):
+                    for gu in range_constexpr(2):
+                        acc[mi][ni][gu] = fx.Vector(flat[(mi * _nn + ni) * 2 + gu])
             exps = []
             for mi in range_constexpr(MR):
                 h = [_swiglu_oai(fx.Float32(fx.Vector(acc[mi][ni][0])[ii]), fx.Float32(fx.Vector(acc[mi][ni][1])[ii])) for ni in range_constexpr(2) for ii in range_constexpr(4)]
