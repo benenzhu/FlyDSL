@@ -42,9 +42,9 @@ _MID_FAKE_W = int(os.environ.get("M3_MID_FAKE_W", "0"))
 _MID_W_CPOL = int(os.environ.get("M3_MID_W_CPOL", "2"), 0)
 
 
-def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4):
-    assert BLOCK_M in (32, 64) and H % 256 == 0 and I % 128 == 0
-    BM, BN, KT, KB = BLOCK_M, 256, H // 128, k_batch
+def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4, TILE_N=256):
+    assert BLOCK_M in (32, 64) and H % 256 == 0 and I % 128 == 0 and TILE_N in (128, 256)
+    BM, BN, KT, KB = BLOCK_M, TILE_N, H // 128, k_batch
     assert I % BN == 0 and KT % KB == 0 and KB % 2 == 0
     NI = BN // 4 // 16
     MR = BM // 16
@@ -64,7 +64,7 @@ def compile_moe_gemm1_mid(*, H, I, E, BLOCK_M=32, prefetch=3, k_batch=4):
     class Shared:
         raw: fx.Array[fx.Uint8, LDS_BYTES, 16]
 
-    @flyc.kernel(name=f"gemm1_a4w4_mid_alds_h{H}_i{I}_e{E}_bm{BM}_pf{prefetch}_kb{KB}", known_block_size=[256, 1, 1])
+    @flyc.kernel(name=f"gemm1_a4w4_mid_alds_h{H}_i{I}_e{E}_bm{BM}_tn{BN}_pf{prefetch}_kb{KB}", known_block_size=[256, 1, 1])
     def kernel(
         A: fx.Tensor, W: fx.Tensor, O: fx.Tensor, AS: fx.Tensor,
         WS: fx.Tensor, OS: fx.Tensor, ids: fx.Tensor, eids: fx.Tensor,

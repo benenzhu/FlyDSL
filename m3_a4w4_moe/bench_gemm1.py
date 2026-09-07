@@ -45,6 +45,8 @@ p.add_argument("--kernel", choices=["2x2", "s3", "1x4", "persist", "mid", "mid-s
                     "s3 = gemm1_s3.py (2x2, 3-stage LDS ring, DMA three K-steps ahead, BM128)")
 p.add_argument("--ctas", type=int, default=256, help="persist: number of CTAs (multiple of 8)")
 p.add_argument("--prefetch", type=int, default=3, help="mid: K tiles prefetched in VGPRs")
+p.add_argument("--k-batch", type=int, default=4, help="mid-alds: K tiles per LDS-staged A batch")
+p.add_argument("--g1-tn", type=int, default=256, help="mid-alds: gate(+up) columns per workgroup (128 or 256)")
 p.add_argument("--order", choices=["expert", "xcd"], default="expert",
                help="block order: expert = host tile_map, n-slab-major per expert (default); xcd = dense-style WGM groups")
 args = p.parse_args()
@@ -234,7 +236,10 @@ else:
                    "mid-agpr-wide-splitring": compile_moe_gemm1_mid_agpr_wide_splitring,
                    "mid-agpr-rotate": compile_moe_gemm1_mid_agpr_rotate, "mid-k2": compile_moe_gemm1_mid_k2,
                    "mid-alds": compile_moe_gemm1_mid_alds}[args.kernel]
-        launch = builder(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch)
+        if args.kernel == "mid-alds":
+            launch = builder(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch, k_batch=args.k_batch, TILE_N=args.g1_tn)
+        else:
+            launch = builder(H=H, I=I, E=E, BLOCK_M=BM, prefetch=args.prefetch)
     elif args.kernel == "persist":
         assert args.order == "expert"
         launch = compile_moe_gemm1_persist(H=H, I=I, E=E, BLOCK_M=BM, n_cta=args.ctas)

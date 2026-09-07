@@ -38,7 +38,7 @@ p.add_argument("--sort-ctas", type=int, default=32)
 p.add_argument("--chain", choices=["prefill", "mid"], default="prefill")
 p.add_argument("--no-check", action="store_true", help="timing-only diagnostics: do not assert on the reference cosines")
 p.add_argument("--mid-g1", choices=["base", "agpr", "agpr-wide", "agpr-wide-splitring", "alds"], default="base")
-p.add_argument("--mid-g2", choices=["base", "persist", "atomic"], default="base")
+p.add_argument("--mid-g2", choices=["base", "persist", "atomic", "atomic-alds"], default="base")
 p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations for rocprofv3, after setup")
 p.add_argument("--copies", type=int, default=4)
 p.add_argument("--reps", type=int, default=10)
@@ -78,6 +78,7 @@ from m3_a4w4_moe.gemm2_mid import compile_moe_gemm2_mid  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_fp8 import compile_moe_gemm2_mid as compile_moe_gemm2_mid_fp8  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_persist import compile_moe_gemm2_mid_persist  # noqa: E402
 from m3_a4w4_moe.gemm2_mid_atomic import compile_moe_gemm2_mid as compile_moe_gemm2_mid_atomic  # noqa: E402
+from m3_a4w4_moe.gemm2_mid_atomic_alds import compile_moe_gemm2_mid as compile_moe_gemm2_mid_atomic_alds  # noqa: E402
 from m3_a16w4_moe.sort_decode_wave import compile_decode_sort, _ptr, _max_tokens_bucket  # noqa: E402
 
 import aiter  # noqa: E402,F401
@@ -161,7 +162,9 @@ mid_g1_builder = {"base": compile_moe_gemm1_mid, "agpr": compile_g1_agpr,
 launch1 = (mid_g1_builder(H=H, I=I, E=E, BLOCK_M=BM) if args.chain == "mid"
            else compile_moe_gemm1(H=H, I=I, E=E, BLOCK_M=BM))
 if args.chain == "mid":
-    if args.mid_g2 == "atomic":
+    if args.mid_g2 == "atomic-alds":
+        g2_builder = compile_moe_gemm2_mid_atomic_alds
+    elif args.mid_g2.startswith("atomic"):
         g2_builder = compile_moe_gemm2_mid_atomic
     elif args.mid_g2 == "persist":
         assert args.out == "fp8"
@@ -265,7 +268,7 @@ class Case:
         return (
             self.h_q.view(-1),
             u8(w2_k).contiguous().view(-1),
-            (self.y if args.chain == "mid" and args.mid_g2 == "atomic" else self.out).view(-1),
+            (self.y if args.chain == "mid" and args.mid_g2.startswith("atomic") else self.out).view(-1),
             self.h_s,
             u8(w2_sk).contiguous().view(-1),
             self.out_s.view(-1),
@@ -290,7 +293,7 @@ class Case:
 
     def stage_reduce(self, compile_first=False):
         global fnr
-        if args.chain == "mid" and args.mid_g2 == "atomic":
+        if args.chain == "mid" and args.mid_g2.startswith("atomic"):
             return
         if args.out == "bf16":
             # production's topk reduce (fp32 sum of the bf16 rows -> bf16)
@@ -636,7 +639,7 @@ stages = [
 ]
 if args.chain == "mid":
     stages = [(name, f) for name, f in stages if name != "tile_map"]
-    if args.mid_g2 == "atomic":
+    if args.mid_g2.startswith("atomic"):
         stages = [(name, f) for name, f in stages if name != "reduce"]
 if args.tail != "none":
     stages.append((f"tail {args.tail}", lambda c: c.stage_tail()))
