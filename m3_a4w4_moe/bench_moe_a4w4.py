@@ -50,6 +50,8 @@ p.add_argument("--prod-shuffled", action="store_true", help="mark the already-pr
 p.add_argument("--diagnose-aiter-fp8", action="store_true", help="capture aiter's fp8 partials, decode/reduce in torch, and exit before timing")
 p.add_argument("--seed", type=int, default=0)
 p.add_argument("--no-prod", action="store_true")
+p.add_argument("--reduce", choices=["aiter", "ours"], default="ours",
+               help="bf16 reduce: aiter's moe_reduction or moe_a4w4_prefill.reduce_bf16 (the package's)")
 p.add_argument("--tail", choices=["none", "residual", "prod"], default="none",
                help="append the layer's downstream consumer to BOTH chains so a cache-policy change is charged "
                     "where the model would pay it: 'residual' = res += y (one streaming read of the [M, H] output); "
@@ -73,6 +75,7 @@ from moe_a4w4_prefill.gemm1 import SWIGLU_ALPHA, SWIGLU_LIMIT, compile_moe_gemm1
 from moe_a4w4_prefill.gemm2 import compile_moe_gemm2, gemm2_grid  # noqa: E402
 from moe_a4w4_prefill.sort import SortBuffers, compile_moe_sort  # noqa: E402
 from moe_a4w4_prefill.tile_map import compile_tile_map, tile_map_grid  # noqa: E402
+from moe_a4w4_prefill.reduce_bf16 import compile_moe_reduce_bf16  # noqa: E402
 # lab-only kernels: fp8 route-out reduce, the mid-batch (512..1024 tokens) chain and its sort
 from m3_a4w4_moe.reduce_fp8 import compile_moe_reduce_fp8  # noqa: E402
 from m3_a4w4_moe.gemm1_mid_alds import compile_moe_gemm1_mid as compile_g1_alds  # noqa: E402
@@ -163,7 +166,8 @@ if args.chain == "mid":
 else:
     launch2 = compile_moe_gemm2(H=H, I=I, E=E, topk=K, n_split=args.n_split, out_dtype=args.out, sort_block_m=BM)
 launch_r = compile_moe_reduce_fp8(H=H, topk=K) if args.out == "fp8" else None
-fn1 = fn2 = fnr = None
+launch_r_bf16 = compile_moe_reduce_bf16(H=H, topk=K) if args.out == "bf16" and args.reduce == "ours" else None
+fn1 = fn2 = fnr = fnr_bf16 = None
 
 
 class Case:
@@ -283,8 +287,14 @@ class Case:
         if args.chain == "mid" and args.mid_g2.startswith("atomic"):
             return
         if args.out == "bf16":
-            # production's topk reduce (fp32 sum of the bf16 rows -> bf16)
-            _run_moe_reduction(self.out.view(M, K, H), self.y, M, K, H)
+            # topk reduce (fp32 sum of the bf16 rows -> bf16): production's or the package's
+            if args.reduce == "aiter":
+                _run_moe_reduction(self.out.view(M, K, H), self.y, M, K, H)
+                return
+            global fnr_bf16
+            if fnr_bf16 is None:
+                fnr_bf16 = flyc.compile(launch_r_bf16, self.out.view(-1), self.y.view(-1), M, torch.cuda.current_stream())
+            fnr_bf16(self.out.view(-1), self.y.view(-1), M, torch.cuda.current_stream())
             return
         if compile_first and fnr is None:
             fnr = flyc.compile(launch_r, *self.argsr())

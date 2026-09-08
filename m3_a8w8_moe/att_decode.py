@@ -9,7 +9,7 @@ import argparse
 
 import torch
 
-from m3_a8w8_moe.ref_mxfp8 import HIDDEN, make_weights, routing
+from m3_a8w8_moe.ref_mxfp8 import HIDDEN, aiter_mxfp8_moe, make_weights, routing
 from m3_a8w8_moe.test_chain import ours
 
 
@@ -17,6 +17,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--tokens", type=int, default=32)
     p.add_argument("--iters", type=int, default=4)
+    p.add_argument("--aiter", action="store_true", help="launch the aiter a8w8 chain instead of ours")
     a = p.parse_args()
     dev = torch.device("cuda")
     _, shuffled = make_weights(dev)
@@ -24,7 +25,7 @@ def main():
         torch.manual_seed(100 + i)
         x = torch.randn((a.tokens, HIDDEN), dtype=torch.bfloat16, device=dev)
         ids, w = routing(a.tokens, dev)
-        ours(x, shuffled, w, ids)
+        (aiter_mxfp8_moe if a.aiter else ours)(x, shuffled, w, ids)
         torch.cuda.synchronize()
     print("done", flush=True)
 
