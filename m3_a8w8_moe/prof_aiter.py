@@ -24,6 +24,7 @@ def main():
     p.add_argument("--tokens", type=int, nargs="+", default=[1, 32, 128])
     p.add_argument("--iters", type=int, default=5)
     p.add_argument("--ours", action="store_true", help="profile moe_a8w8_prefill.a8w8_prefill_moe instead")
+    p.add_argument("--ours-decode", action="store_true", help="profile moe_a8w8_decode.a16w8_decode_moe instead")
     a = p.parse_args()
     dev = torch.device("cuda")
     _, shuffled = make_weights(dev)
@@ -32,6 +33,10 @@ def main():
         from m3_a8w8_moe.test_prefill_chain import ours
 
         fn = lambda x, shuffled, w, ids: ours(x, shuffled, w, ids)  # noqa: E731
+    if a.ours_decode:
+        from m3_a8w8_moe.test_chain import ours as ours_dec
+
+        fn = lambda x, shuffled, w, ids: ours_dec(x, shuffled, w, ids)  # noqa: E731
     for m in a.tokens:
         inputs = []
         for i in range(a.iters + 2):

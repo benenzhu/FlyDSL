@@ -38,8 +38,8 @@ def main():
     p.add_argument("--copies", type=int, default=4)
     p.add_argument("--no-time", action="store_true")
     p.add_argument("--no-aiter", action="store_true")
-    p.add_argument("--out-mode", default="bf16", choices=["bf16", "atomic", "fp8"],
-                   help="gemm2 output mode: bf16 partials + aiter reduce, bf16 atomics, fp8 partials + reduce_fp8")
+    p.add_argument("--out-mode", default="bf16", choices=["bf16", "fp8"],
+                   help="gemm2 output mode: bf16 partials + aiter reduce, fp8 partials + reduce_fp8")
     a = p.parse_args()
     global OUT_MODE
     OUT_MODE = a.out_mode
@@ -54,8 +54,7 @@ def main():
         torch.cuda.synchronize()
         if not torch.equal(out, out2):
             bad = (out != out2).any(dim=1)
-            tag = "expected for atomics" if a.out_mode == "atomic" else "!!"
-            print(f"  {tag} run-to-run mismatch: {int(bad.sum())}/{m} tokens differ, cos(out, out2) {cos(out, out2):.5f}",
+            print(f"  !! run-to-run mismatch: {int(bad.sum())}/{m} tokens differ, cos(out, out2) {cos(out, out2):.5f}",
                   flush=True)
         ref_aiter = aiter_mxfp8_moe(x, shuffled, w, ids)
         torch.cuda.synchronize()
