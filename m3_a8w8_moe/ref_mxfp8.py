@@ -13,6 +13,8 @@ aiter's tuned table (``minimax_m3_mxfp8_tuned_fmoe.csv``, TP4 rows).
 import argparse
 import time
 
+import os
+
 import torch
 
 # MiniMax-M3 at TP4: hidden 6144, intermediate 3072/4, 128 routed + 1 fused shared.
@@ -54,6 +56,13 @@ def make_weights(device, seed=0):
 def routing(m: int, device):
     """4 distinct routed experts + the shared expert per token (aiter's fused
     shared expert: routed weights renormalized x2, shared weight 1)."""
+    if os.environ.get("M3_NO_SHARED") == "1":
+        # lab knob: 5 distinct routed experts, no shared one (every expert then has
+        # few rows: isolates the cost of the shared expert's weight re-reads)
+        routed = torch.stack([torch.randperm(NUM_ROUTED, device=device)[: TOPK + 1] for _ in range(m)])
+        w = torch.rand((m, TOPK + 1), device=device)
+        w = w / w.sum(dim=1, keepdim=True) * 3.0
+        return routed.to(torch.int32).contiguous(), w.to(torch.float32).contiguous()
     routed = torch.stack([torch.randperm(NUM_ROUTED, device=device)[:TOPK] for _ in range(m)])
     shared = torch.full((m, 1), NUM_ROUTED, device=device)
     topk_ids = torch.cat([routed, shared], dim=1).to(torch.int32)
