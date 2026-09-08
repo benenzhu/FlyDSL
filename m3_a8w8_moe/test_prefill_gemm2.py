@@ -29,8 +29,9 @@ def run_gemm2(bufs, h_q, h_s, nmb, shuffled, n_tokens, bm):
     partial = torch.full(((n_tokens + 1) * TOPK, HIDDEN), float("nan"), dtype=torch.bfloat16, device=h_q.device)
     nmb2 = (nmb * bm) // 128
     grid2 = gemm2_grid(nmb2, GEMM2_N_SPLIT)
-    _run_compiled(_get_gemm2(HIDDEN, INTER, NUM_EXPERTS, TOPK, bm), h_q.view(-1), w2.view(torch.uint8).view(-1),
-                  partial.view(-1), h_s, w2_s.view(torch.uint8).view(-1), bufs.sorted_ids, bufs.sorted_expert_ids,
+    dummy_sc = torch.empty((16,), dtype=torch.uint8, device=h_q.device)
+    _run_compiled(_get_gemm2(HIDDEN, INTER, NUM_EXPERTS, TOPK, bm, "bf16"), h_q.view(-1), w2.view(torch.uint8).view(-1),
+                  partial.view(-1), h_s, w2_s.view(torch.uint8).view(-1), dummy_sc, bufs.sorted_ids, bufs.sorted_expert_ids,
                   bufs.sorted_weights, bufs.num_valid_ids, n_tokens, nmb2, grid2, torch.cuda.current_stream())
     return partial[: n_tokens * TOPK]
 

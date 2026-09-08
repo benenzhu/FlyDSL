@@ -43,10 +43,11 @@ def main():
     nmb2 = (nmb * bm) // 128
     launch = compile_moe_gemm2(H=HIDDEN, I=INTER, E=NUM_EXPERTS, topk=TOPK, n_split=a.n_split, sort_block_m=bm)
     partial = torch.empty((m * TOPK, HIDDEN), dtype=torch.bfloat16, device=dev)
+    dummy_sc = torch.empty((16,), dtype=torch.uint8, device=dev)
     grid2 = gemm2_grid(nmb2, a.n_split)
     for _ in range(a.iters):
         _run_compiled(launch, h_q.view(-1), w2.view(torch.uint8).view(-1), partial.view(-1), h_s,
-                      w2_s.view(torch.uint8).view(-1), bufs.sorted_ids, bufs.sorted_expert_ids,
+                      w2_s.view(torch.uint8).view(-1), dummy_sc, bufs.sorted_ids, bufs.sorted_expert_ids,
                       bufs.sorted_weights, bufs.num_valid_ids, m, nmb2, grid2, torch.cuda.current_stream())
         torch.cuda.synchronize()
     print("done", flush=True)
