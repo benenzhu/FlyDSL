@@ -3,6 +3,7 @@
 torch.profiler in the lab container: which kernels, in what order, how long.
 
     python3 -m m3_a8w8_moe.prof_aiter --tokens 1 32 128
+    python3 -m m3_a8w8_moe.prof_aiter --ours --tokens 4096 8192     # our prefill chain
 """
 import argparse
 import collections
@@ -22,9 +23,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--tokens", type=int, nargs="+", default=[1, 32, 128])
     p.add_argument("--iters", type=int, default=5)
+    p.add_argument("--ours", action="store_true", help="profile moe_a8w8_prefill.a8w8_prefill_moe instead")
     a = p.parse_args()
     dev = torch.device("cuda")
     _, shuffled = make_weights(dev)
+    fn = aiter_mxfp8_moe
+    if a.ours:
+        from m3_a8w8_moe.test_prefill_chain import ours
+
+        fn = lambda x, shuffled, w, ids: ours(x, shuffled, w, ids)  # noqa: E731
     for m in a.tokens:
         inputs = []
         for i in range(a.iters + 2):
@@ -33,11 +40,11 @@ def main():
             ids, w = routing(m, dev)
             inputs.append((x, w, ids))
         for x, w, ids in inputs[:2]:
-            aiter_mxfp8_moe(x, shuffled, w, ids)
+            fn(x, shuffled, w, ids)
         torch.cuda.synchronize()
         with profile(activities=[ProfilerActivity.CUDA]) as prof:
             for x, w, ids in inputs[2:]:
-                aiter_mxfp8_moe(x, shuffled, w, ids)
+                fn(x, shuffled, w, ids)
             torch.cuda.synchronize()
         ev = sorted(
             (e for e in prof.events() if getattr(e, "device_type", None) is not None and "cuda" in str(e.device_type).lower()),
