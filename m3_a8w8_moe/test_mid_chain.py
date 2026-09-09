@@ -38,6 +38,7 @@ def main():
     p.add_argument("--copies", type=int, default=16)
     p.add_argument("--no-time", action="store_true")
     p.add_argument("--no-aiter", action="store_true")
+    p.add_argument("--loop", type=int, default=0, help="eager whole-chain iterations after the checks (for rocprofv3 / ATT)")
     a = p.parse_args()
     global BM
     BM = a.bm or None
@@ -71,6 +72,9 @@ def main():
         print(f"M={m} BM={bm}: ours vs float ref cos {c_ref:.5f} | ours vs aiter {c_ait:.5f} (worst token {worst:.5f}) "
               f"| aiter vs float ref {c_ait_ref:.5f} | max|ours-ref| {(out[toks].float() - ref).abs().max().item():.4f} "
               f"(ref max {ref.abs().max().item():.3f}) | nan {int(torch.isnan(out).sum())}", flush=True)
+        for _ in range(a.loop):
+            ours(x, shuffled, w, ids)
+        torch.cuda.synchronize()
         if a.no_time:
             continue
         inputs = []
