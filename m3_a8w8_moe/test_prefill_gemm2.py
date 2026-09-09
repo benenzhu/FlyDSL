@@ -18,7 +18,7 @@ import_ops("moe_a16w4_decode")
 import_ops("moe_a4w4_prefill")
 import_ops("moe_a8w8_prefill")
 from moe_a4w4_prefill import _run_compiled, block_m_for  # noqa: E402
-from moe_a8w8_prefill import GEMM2_N_SPLIT, _get_gemm2  # noqa: E402
+from moe_a8w8_prefill import _get_gemm2, gemm2_n_split_for  # noqa: E402
 from moe_a8w8_prefill.gemm2 import gemm2_grid  # noqa: E402
 
 TOPK = 5
@@ -28,9 +28,10 @@ def run_gemm2(bufs, h_q, h_s, nmb, shuffled, n_tokens, bm):
     w13, w2, w13_s, w2_s = shuffled
     partial = torch.full(((n_tokens + 1) * TOPK, HIDDEN), float("nan"), dtype=torch.bfloat16, device=h_q.device)
     nmb2 = (nmb * bm) // 128
-    grid2 = gemm2_grid(nmb2, GEMM2_N_SPLIT)
+    n_split = gemm2_n_split_for(n_tokens)
+    grid2 = gemm2_grid(nmb2, n_split)
     dummy_sc = torch.empty((16,), dtype=torch.uint8, device=h_q.device)
-    _run_compiled(_get_gemm2(HIDDEN, INTER, NUM_EXPERTS, TOPK, bm, "bf16"), h_q.view(-1), w2.view(torch.uint8).view(-1),
+    _run_compiled(_get_gemm2(HIDDEN, INTER, NUM_EXPERTS, TOPK, bm, n_split, "bf16"), h_q.view(-1), w2.view(torch.uint8).view(-1),
                   partial.view(-1), h_s, w2_s.view(torch.uint8).view(-1), dummy_sc, bufs.sorted_ids, bufs.sorted_expert_ids,
                   bufs.sorted_weights, bufs.num_valid_ids, n_tokens, nmb2, grid2, torch.cuda.current_stream())
     return partial[: n_tokens * TOPK]
